@@ -1,0 +1,8 @@
+[package]
+name = "ss-containers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-heap-model = { workspace = true }
+ss-support = { workspace = true }

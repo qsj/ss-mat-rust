@@ -1,0 +1,10 @@
+[package]
+name = "ss-heap-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-support = { workspace = true }
+hashbrown = { workspace = true }
+ahash = { workspace = true }
+thiserror = { workspace = true }

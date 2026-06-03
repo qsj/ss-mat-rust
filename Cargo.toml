@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hprof-parser",
+    "crates/heap-model",
+    "crates/support",
+    "crates/traversal",
+    "crates/containers",
+    "crates/stats",
+    "crates/report",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+ss-hprof-parser = { path = "crates/hprof-parser" }
+ss-heap-model = { path = "crates/heap-model" }
+ss-support = { path = "crates/support" }
+ss-traversal = { path = "crates/traversal" }
+ss-containers = { path = "crates/containers" }
+ss-stats = { path = "crates/stats" }
+ss-report = { path = "crates/report" }
+
+# External dependencies
+jvm-hprof = "0.1"
+memmap2 = "0.9"
+hashbrown = "0.15"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.3"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+ahash = "0.8"
+indexmap = "2"

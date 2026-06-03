@@ -1,0 +1,18 @@
+[package]
+name = "ss-mat"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ss-mat"
+path = "src/main.rs"
+
+[dependencies]
+ss-hprof-parser = { workspace = true }
+ss-heap-model = { workspace = true }
+ss-support = { workspace = true }
+ss-traversal = { workspace = true }
+ss-stats = { workspace = true }
+ss-report = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

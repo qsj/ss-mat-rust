@@ -1,0 +1,9 @@
+[package]
+name = "ss-support"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hashbrown = { workspace = true }
+parking_lot = { workspace = true }
+ahash = { workspace = true }

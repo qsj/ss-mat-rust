@@ -1,0 +1,9 @@
+[package]
+name = "ss-stats"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-heap-model = { workspace = true }
+ss-support = { workspace = true }
+hashbrown = { workspace = true }

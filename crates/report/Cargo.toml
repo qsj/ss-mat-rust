@@ -1,0 +1,10 @@
+[package]
+name = "ss-report"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-heap-model = { workspace = true }
+ss-support = { workspace = true }
+ss-stats = { workspace = true }
+chrono = "0.4"
