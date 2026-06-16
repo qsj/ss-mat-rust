@@ -2103,6 +2103,13 @@ impl MainReportGenerator {
                 &report.sample_obj_ids,
                 Some("Reference Chains for java.nio.DirectByteBuffers"),
             );
+
+            // Easy-to-fix advice panel, mirroring Java which renders the
+            // unreachable-DirectByteBuffer advice both in the MOST IMPORTANT
+            // ISSUES overview and again here in Section-18.
+            if let Some(panel) = self.render_direct_buffer_advice(total_heap) {
+                html.append_raw(&panel);
+            }
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No DirectByteBuffer instances found", ""]);
@@ -2710,6 +2717,25 @@ impl MainReportGenerator {
                 html.append_raw("</div></details>");
             }
         }
+    }
+
+    /// Render the unreachable-DirectByteBuffer easy-to-fix advice as a panel,
+    /// for embedding in Section-18 (mirrors Java, which shows this advice both
+    /// in the MOST IMPORTANT ISSUES overview and again inside Section-18).
+    /// Returns `None` when the advice does not fire.
+    fn render_direct_buffer_advice(&self, total_bytes: i64) -> Option<String> {
+        let problems = ProblemReportSet::from_stats(&self.stats, &self.heap);
+        let ctx = AdvisorContext {
+            stats: &self.stats,
+            heap: &self.heap,
+            problems: &problems,
+        };
+        let registry = AdvisorRegistry::new();
+        let advice = registry.run_all(&ctx).into_iter().find(|a| {
+            a.category == AdviceCategory::EasyToFix
+                && a.section_id == "Section-18"
+        })?;
+        Some(render_advice_panel(&advice, total_bytes))
     }
 
     /// Generate the "MOST IMPORTANT ISSUES" advisor summary section.
