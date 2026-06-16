@@ -79,11 +79,9 @@ fn render_field_value_with_strings(val: &FieldValue, rv: &ResolvedValues) -> Str
     match val {
         FieldValue::Reference(None) => "<t-s>null</t-s>".to_string(),
         FieldValue::Reference(Some(class_name)) => {
-            // FieldValue only carries the target's class name, not its address,
-            // so String-content resolution can't be done here precisely. Keep
-            // the class tag; known String values are surfaced via the per-object
-            // body rendering path instead.
-            format!("<t-c>{}</t-c>", class_name)
+            // No <t-c> tag for reference fields inside object bodies
+            // (matches Java's formatHeapObject line 173/181).
+            class_name.clone()
         }
         other => format_field_value_simple(other),
     }
@@ -91,10 +89,16 @@ fn render_field_value_with_strings(val: &FieldValue, rv: &ResolvedValues) -> Str
 
 /// Scalar-only formatting (no String resolution). Used where the caller has
 /// already decided the value is a primitive.
+///
+/// Per Java's `formatHeapObject` (DuplicateObjectFinder.java line 173/181),
+/// object-reference fields render their value's class name WITHOUT a `<t-c>`
+/// wrapper — only primitive values and `null` get tags. This keeps `<t_c>`
+/// counts close to Java's.
 fn format_field_value_simple(val: &FieldValue) -> String {
     match val {
         FieldValue::Reference(None) => "<t-s>null</t-s>".to_string(),
-        FieldValue::Reference(Some(c)) => format!("<t-c>{}</t-c>", c),
+        // Plain class display name, no <t-c> tag (matches Java line 173).
+        FieldValue::Reference(Some(c)) => c.clone(),
         FieldValue::Boolean(v) => format!("<t-s>{}</t-s>", v),
         FieldValue::Byte(v) => format!("<t-s>{}</t-s>", v),
         FieldValue::Char(v) => {
@@ -328,18 +332,21 @@ impl<'a> RefChainRenderer<'a> {
             let class_name = get_class_display(parent_obj.class_idx, self.heap);
             let edge_key = self.parent_edge[current as usize];
             let field_name = self.field_pool.get(edge_key);
+            // Match Java's chain rendering: each hop is the path label plus
+            // the parent object's decoded body, which carries the primitive
+            // field values as `<t-s>` tags. Per Java's FieldReferenceNode +
+            // formatHeapObject, the body is `(field : value, ...)` — reference
+            // fields render their value's class name WITHOUT a redundant
+            // `<t-c>` wrapper (matching Java line 173/181).
             let mut step = format!(
                 "&nwarr;<t-c>{}</t-c><t-f>.{}</t-f>",
                 class_name, field_name,
             );
-
-            // Append the parent object's decoded body when available, so
-            // primitive field values render as `<t-s>` tags.
             if let Some(rv) = self.resolved_values {
                 if let Some(dec) = rv.objects.get(&parent_obj.obj_id) {
                     let body = render_decoded_object_body(dec, parent_obj.obj_id, rv);
                     if !body.is_empty() {
-                        step.push_str(&format!("&nbsp;{}", body));
+                        step.push_str(&format!("&nbsp;<t-c>{}</t-c>{}", dec.class_name, body));
                     }
                 }
             }
