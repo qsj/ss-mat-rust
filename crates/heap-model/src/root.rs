@@ -1,5 +1,5 @@
 /// GC root reference types, matching the HPROF format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RootType {
     JniGlobal,
     JniLocal,

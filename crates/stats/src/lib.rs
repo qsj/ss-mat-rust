@@ -13,3 +13,4 @@ pub mod weak_hashmap;
 pub mod jvm_info;
 pub mod gc_type;
 pub mod system_props;
+pub mod traversal_data;

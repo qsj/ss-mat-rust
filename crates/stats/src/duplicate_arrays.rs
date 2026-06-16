@@ -26,6 +26,9 @@ pub struct DupArrayGroup {
     pub size_bytes: i64,
     /// Brief description for display (e.g., length or first few elements)
     pub description: String,
+    /// Sample object IDs (HPROF addresses) of array instances in this group.
+    /// Used by the report to render per-instance reference chains.
+    pub sample_obj_ids: Vec<u64>,
 }
 
 /// Thread-safe wrapper for accumulating duplicate array results.

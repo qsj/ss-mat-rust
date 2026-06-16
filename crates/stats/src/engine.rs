@@ -11,6 +11,7 @@ use crate::jvm_info::JvmInfoCollector;
 use crate::per_class::PerClassStats;
 use crate::problem_types::ProblemType;
 use crate::ref_chain::{GcRootStore, RefChainStore};
+use crate::traversal_data::TraversalData;
 
 /// Central statistics accumulator. Populated by linear scan and BFS traversal.
 pub struct StatsEngine {
@@ -31,6 +32,7 @@ pub struct StatsEngine {
     pub oom_frame_locals: Mutex<Vec<FrameLocals>>,
     pub ref_chains: Mutex<RefChainStore>,
     pub gc_roots: Mutex<GcRootStore>,
+    pub traversal_data: Mutex<Option<TraversalData>>,
 
     // Bad object array counters (populated during linear scan)
     pub empty_obj_array_count: AtomicU64,
@@ -48,6 +50,15 @@ pub struct StatsEngine {
     pub empty_prim_array_bytes: AtomicI64,
     pub trailing_zero_prim_array_count: AtomicU64,
     pub trailing_zero_prim_array_bytes: AtomicI64,
+    // Bad array sample obj_ids (HPROF addresses) for per-instance ref chain
+    // rendering. Each Vec is capped at 50 entries.
+    pub empty_prim_array_samples: Mutex<Vec<u64>>,
+    pub trailing_zero_prim_array_samples: Mutex<Vec<u64>>,
+    pub empty_obj_array_samples: Mutex<Vec<u64>>,
+    pub single_elem_obj_array_samples: Mutex<Vec<u64>>,
+    pub all_null_obj_array_samples: Mutex<Vec<u64>>,
+    pub one_nonnull_obj_array_samples: Mutex<Vec<u64>>,
+    pub sparse_obj_array_samples: Mutex<Vec<u64>>,
 }
 
 impl StatsEngine {
@@ -81,6 +92,7 @@ impl StatsEngine {
             oom_frame_locals: Mutex::new(Vec::new()),
             ref_chains: Mutex::new(RefChainStore::default()),
             gc_roots: Mutex::new(GcRootStore::default()),
+            traversal_data: Mutex::new(None),
             empty_obj_array_count: AtomicU64::new(0),
             empty_obj_array_bytes: AtomicI64::new(0),
             single_elem_obj_array_count: AtomicU64::new(0),
@@ -95,6 +107,13 @@ impl StatsEngine {
             empty_prim_array_bytes: AtomicI64::new(0),
             trailing_zero_prim_array_count: AtomicU64::new(0),
             trailing_zero_prim_array_bytes: AtomicI64::new(0),
+            empty_prim_array_samples: Mutex::new(Vec::new()),
+            trailing_zero_prim_array_samples: Mutex::new(Vec::new()),
+            empty_obj_array_samples: Mutex::new(Vec::new()),
+            single_elem_obj_array_samples: Mutex::new(Vec::new()),
+            all_null_obj_array_samples: Mutex::new(Vec::new()),
+            one_nonnull_obj_array_samples: Mutex::new(Vec::new()),
+            sparse_obj_array_samples: Mutex::new(Vec::new()),
         }
     }
 

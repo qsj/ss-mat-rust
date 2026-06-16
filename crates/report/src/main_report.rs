@@ -1,14 +1,21 @@
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use ss_heap_model::heap_dump::{FieldValue, HeapDump, LocalVarDetail};
 use ss_stats::engine::StatsEngine;
 use ss_stats::per_class::PerClassStats;
-use ss_stats::ref_chain::{ChainStep, ClassRefChains};
 
+use crate::advice::{
+    Advice, AdviceCategory, AdviceSeverity, AdvisorContext, AdvisorRegistry, ProblemReportSet,
+};
 use crate::html_builder::HtmlStringBuilder;
+use crate::ref_chain_render::{
+    render_class_ref_chains, render_humongous_ref_chains, render_tree_node,
+    ProblemObj, RefChainRenderInput, RefChainRenderer,
+};
 use crate::table_formatter::{
-    bigger_font, bold, calc_percent, format_bytes, format_count, format_count_short,
+    bigger_font, bold, calc_percent, format_bytes, format_count,
     format_percent, format_section_header, format_with_percent, severity_high, severity_low,
     severity_med,
 };
@@ -92,6 +99,10 @@ pub struct MainReportGenerator {
     stats: Arc<StatsEngine>,
     section_count: usize,
     dump_file_name: String,
+    /// Path to the HPROF file, used to re-parse field values for `<t-s>`
+    /// scalar rendering inside reference chains. `None` when not available
+    /// (value rendering is then skipped).
+    hprof_path: Option<PathBuf>,
 }
 
 impl MainReportGenerator {
@@ -101,7 +112,15 @@ impl MainReportGenerator {
             stats,
             section_count: 0,
             dump_file_name,
+            hprof_path: None,
         }
+    }
+
+    /// Set the HPROF file path so the generator can re-parse field values at
+    /// render time (enables `<t-s>` scalar tags inside reference chains).
+    pub fn with_hprof_path(mut self, hprof_path: impl Into<PathBuf>) -> Self {
+        self.hprof_path = Some(hprof_path.into());
+        self
     }
 
     fn next_section_id(&mut self) -> String {
@@ -111,6 +130,168 @@ impl MainReportGenerator {
 
     fn section_numbered_title(&self) -> String {
         format!("{}. ", self.section_count)
+    }
+
+    /// Render "Typical reference paths" for a class by looking up the existing
+    /// per-class `ref_chains` data. Returns empty HTML if no chains are
+    /// available for this class. Used by problem sections to expose the
+    /// common paths under which instances of the class live, without
+    /// requiring per-instance tracking in collectors.
+    fn render_class_ref_chain_panel(&self, class_name: &str, total_bytes: i64) -> String {
+        // Resolve class_idx by name. Class names in stats use '/' package
+        // separators; the caller passes either form.
+        let lookup = class_name.replace('.', "/");
+        let class_idx = match self.heap.class_by_name.get(lookup.as_str()) {
+            Some(&idx) => idx,
+            None => return String::new(),
+        };
+        let ref_chains = self.stats.ref_chains.lock().unwrap();
+        let chains = match ref_chains.chains.get(&class_idx) {
+            Some(c) => c.clone(),
+            None => return String::new(),
+        };
+        if chains.expensive_fields.is_empty() && chains.full_chains.is_empty() {
+            return String::new();
+        }
+        let mut html = String::with_capacity(2048);
+        html.push_str(&format!(
+            "<br><details><summary>Typical reference paths for <t-c>{}</t-c></summary><br>\n",
+            class_name.replace('/', ".")
+        ));
+        html.push_str(&render_class_ref_chains(&chains, total_bytes));
+        html.push_str("</details>\n");
+        html
+    }
+
+    /// Render per-instance reference chains for a list of problem object IDs.
+    /// Used by problem sections (8/14/15/18/...) where collectors have
+    /// captured sample_obj_ids of problem instances. Returns HTML string
+    /// directly (caller appends to `html`).
+    fn render_instance_ref_chains(
+        &self,
+        html: &mut HtmlStringBuilder,
+        title: &str,
+        size_bytes: i64,
+        total_bytes: i64,
+        sample_obj_ids: &[u64],
+        sec_sub_title: Option<&str>,
+    ) {
+        let mut buf = String::new();
+        self.render_instance_ref_chains_into(
+            &mut buf, title, size_bytes, total_bytes, sample_obj_ids, sec_sub_title,
+        );
+        if !buf.is_empty() {
+            html.append_raw(&buf);
+        }
+    }
+
+    /// Core implementation writing into a `String`. Returns without writing
+    /// when there is nothing to render (no samples / no matching objects).
+    fn render_instance_ref_chains_into(
+        &self,
+        out: &mut String,
+        title: &str,
+        size_bytes: i64,
+        total_bytes: i64,
+        sample_obj_ids: &[u64],
+        sec_sub_title: Option<&str>,
+    ) {
+        if sample_obj_ids.is_empty() {
+            return;
+        }
+
+        let guard = self.stats.traversal_data.lock().unwrap();
+        let data = match guard.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Build obj_id → obj_idx lookup map for the samples.
+        // Linear scan over a slice of N samples × M objects is acceptable
+        // for N≤20. For larger N, build a HashSet first.
+        let sample_set: std::collections::HashSet<u64> = sample_obj_ids.iter().cloned().collect();
+        let mut id_to_idx: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (idx, obj) in data.objects.iter().enumerate() {
+            if sample_set.contains(&obj.obj_id) {
+                id_to_idx.insert(obj.obj_id, idx as u32);
+                if id_to_idx.len() == sample_set.len() {
+                    break;
+                }
+            }
+        }
+
+        if id_to_idx.is_empty() {
+            return;
+        }
+
+        let gc_root_set = crate::ref_chain_render::build_gc_root_set(&data.root_of);
+
+        // Preserve caller's order; map each obj_id to ProblemObj.
+        let problem_objs: Vec<ProblemObj> = sample_obj_ids.iter()
+            .filter_map(|id| {
+                id_to_idx.get(id).map(|&idx| {
+                    let obj = &data.objects[idx as usize];
+                    let class_name = self.get_class_display(obj.class_idx);
+                    ProblemObj {
+                        obj_idx: idx,
+                        shallow_bytes: 0,
+                        display: format!("<t-c>{}</t-c>@0x{:x}", class_name, obj.obj_id),
+                    }
+                })
+            })
+            .take(20)
+            .collect();
+
+        if problem_objs.is_empty() {
+            return;
+        }
+
+        // Resolve per-object field VALUES for the problem objects and their
+        // chain ancestors, so primitive fields render as `<t-s>` tags.
+        // Walk parent[] from each problem object to collect ancestor obj_ids.
+        let mut chain_addrs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for prob in &problem_objs {
+            let mut cur = prob.obj_idx;
+            for _ in 0..60 {
+                if let Some(obj) = data.objects.get(cur as usize) {
+                    chain_addrs.insert(obj.obj_id);
+                }
+                match data.parent.get(cur as usize) {
+                    Some(&p) if p != u32::MAX => cur = p,
+                    _ => break,
+                }
+            }
+        }
+        let resolved = self.hprof_path.as_ref().and_then(|path| {
+            if chain_addrs.is_empty() {
+                None
+            } else {
+                Some(ss_traversal::resolve_field_values(&self.heap, path, &chain_addrs))
+            }
+        });
+
+        let renderer = crate::ref_chain_render::RefChainRenderer::new(
+            &self.heap,
+            &data.objects,
+            &data.parent,
+            &data.parent_edge,
+            &data.field_pool,
+            &gc_root_set,
+        );
+        let renderer = match &resolved {
+            Some(rv) => renderer.with_resolved_values(rv),
+            None => renderer,
+        };
+
+        let input = RefChainRenderInput {
+            title: title.to_string(),
+            size_bytes,
+            total_bytes,
+            problem_objs: &problem_objs,
+            max_objs_to_render: 20,
+            sec_sub_title: sec_sub_title.map(|s| s.to_string()),
+        };
+        out.push_str(&renderer.render_problem_list(input));
     }
 
     /// Generate the full HTML report.
@@ -514,7 +695,7 @@ impl MainReportGenerator {
 
         let ref_chains = self.stats.ref_chains.lock().unwrap();
 
-        for pc in classes.iter().take(500) {
+        for (class_rank, pc) in classes.iter().take(500).enumerate() {
             let inst = pc.instance_count.load(Relaxed) + pc.array_live_count.load(Relaxed) as u64;
             let shallow = pc.total_instance_bytes.load(Relaxed);
             let retained = pc.retained_size.load(Relaxed);
@@ -535,11 +716,45 @@ impl MainReportGenerator {
                 if !chains.expensive_fields.is_empty() || !chains.full_chains.is_empty() {
                     let chain_html = render_class_ref_chains(chains, total_bytes);
                     if !chain_html.is_empty() {
-                        html.append_span_row(
-                            &format!("<details><summary>Reference chains</summary>{}</details>", chain_html),
-                            5,
-                            false,
-                        );
+                        // Collect sample object ids so we can also render
+                        // per-instance chains with field values. To keep the
+                        // report size bounded (matching Java, which only
+                        // renders per-object chains for a few high-memory
+                        // classes), limit to the top 15 classes and 3 samples each.
+                        let mut sample_ids: Vec<u64> = Vec::new();
+                        if class_rank < 15 {
+                            for g in chains.full_chains.iter().chain(chains.expensive_fields.iter()) {
+                                for &id in g.sample_obj_ids.iter().take(3) {
+                                    if id != 0 {
+                                        sample_ids.push(id);
+                                    }
+                                    if sample_ids.len() >= 3 {
+                                        break;
+                                    }
+                                }
+                                if sample_ids.len() >= 3 {
+                                    break;
+                                }
+                            }
+                        }
+                        // Append per-instance chains (with decoded field values)
+                        // before the class-level chain panel.
+                        let mut combined = String::new();
+                        if !sample_ids.is_empty() {
+                            self.render_instance_ref_chains_into(
+                                &mut combined,
+                                "Per-instance reference chains",
+                                shallow,
+                                total_bytes,
+                                &sample_ids,
+                                None,
+                            );
+                        }
+                        combined.push_str(&format!(
+                            "<details><summary>Reference chains</summary>{}</details>",
+                            chain_html,
+                        ));
+                        html.append_span_row(&combined, 5, false);
                     }
                 }
             }
@@ -725,25 +940,33 @@ impl MainReportGenerator {
         if !class_data.is_empty() {
             class_data.sort_by(|a, b| b.2.cmp(&a.2));
             html.append_raw("<br>Details:<br>\n<div class=\"scroll-wrap\">\n");
-            html.begin_table(true, 0, &[
-                "#instances\ngarbage", "Shallow size garbage",
-                "#instances\nlive", "Shallow size live",
-                "Class name",
-            ]);
+            // Header row with tooltips (matching Java JXRay style).
+            html.append_raw("<table class=\"dt\" id=\"Table-3\">\n");
+            html.append_raw("<tr class=\"C_01\">");
+            html.append_raw("<th onclick=\"sortTable(3, 0)\">&nbsp<b>&nbsp<span title=\"Number of garbage (unreachable) instances of this class in the dump.\"># instances garbage&nbsp;&#8593;&#8595;&nbsp;<i-s>&#x24d8;</i-s></span>&nbsp</b></th>");
+            html.append_raw("<th onclick=\"sortTable(3, 1)\">&nbsp<b>&nbsp<span title=\"Shallow memory size of all garbage instances of this class.\">Shallow size garbage&nbsp;&#8593;&#8595;&nbsp;<i-s>&#x24d8;</i-s></span>&nbsp</b></th>");
+            html.append_raw("<th onclick=\"sortTable(3, 2)\">&nbsp<b>&nbsp<span title=\"Number of live (reachable) instances of this class.\"># instances live&nbsp;&#8593;&#8595;&nbsp;<i-s>&#x24d8;</i-s></span>&nbsp</b></th>");
+            html.append_raw("<th onclick=\"sortTable(3, 3)\">&nbsp<b>&nbsp<span title=\"Shallow memory size of all live instances of this class.\">Shallow size live&nbsp;&#8593;&#8595;&nbsp;<i-s>&#x24d8;</i-s></span>&nbsp</b></th>");
+            html.append_raw("<th class=\"TAL\"><b>&nbsp;Class name&nbsp;</b></th>");
+            html.append_raw("</tr>\n");
+
             let mut shown = 0;
             for (pc, garb_cnt, garb_bytes, live_cnt, live_bytes) in &class_data {
                 if shown >= 50 { break; }
                 if *garb_cnt == 0 && *garb_bytes == 0 { continue; }
-                html.append_table_row(&[
-                    &format_count(*garb_cnt as u64),
-                    &format_with_percent(*garb_bytes, total_bytes.max(1)),
-                    &format_count(*live_cnt as u64),
-                    &format_with_percent(*live_bytes, total_bytes.max(1)),
-                    &format_class_name(&pc.class_name),
-                ]);
+                let row_class = if shown % 2 == 0 { "C_02" } else { "C_03" };
+                html.append_raw(&format!(
+                    "<tr class=\"{}\"><td>&nbsp;{}</td><td>&nbsp;{}</td><td>&nbsp;{}</td><td>&nbsp;{}</td><td class=\"TAL\">&nbsp;{}</td></tr>\n",
+                    row_class,
+                    format_count(*garb_cnt as u64),
+                    format_with_percent(*garb_bytes, total_bytes.max(1)),
+                    format_count(*live_cnt as u64),
+                    format_with_percent(*live_bytes, total_bytes.max(1)),
+                    format_class_name(&pc.class_name),
+                ));
                 shown += 1;
             }
-            html.end_table();
+            html.append_raw("</table>\n");
             html.append_raw("</div>\n");
         }
     }
@@ -824,6 +1047,7 @@ impl MainReportGenerator {
     }
 
     fn section_finalization(&mut self, html: &mut HtmlStringBuilder) {
+        let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
         self.begin_section(html, "Objects Awaiting Finalization", false, "");
 
         // Look for java/lang/ref/Finalizer class
@@ -852,6 +1076,37 @@ impl MainReportGenerator {
                 "",
             ]);
             html.end_table();
+        }
+
+        // Typical reference paths for Finalizer/Finalizer$FinalizerNode classes.
+        let _ = html.append_raw(&self.render_class_ref_chain_panel("java.lang.ref.Finalizer", total_bytes));
+
+        // Per-instance ref chain for sample Finalizer instances.
+        if finalizer_count > 0 {
+            let sample_ids: Vec<u64> = {
+                let guard = self.stats.traversal_data.lock().unwrap();
+                if let Some(data) = guard.as_ref() {
+                    if let Some(&class_idx) = self.heap.class_by_name.get("java/lang/ref/Finalizer") {
+                        data.objects.iter()
+                            .filter(|o| o.class_idx == class_idx)
+                            .take(20)
+                            .map(|o| o.obj_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            self.render_instance_ref_chains(
+                html,
+                "Reference chains holding Finalizer queue instances",
+                finalizer_count as i64 * 64,
+                total_bytes,
+                &sample_ids,
+                None,
+            );
         }
     }
 
@@ -920,6 +1175,25 @@ impl MainReportGenerator {
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
         }
+
+        // Typical reference paths for java.lang.String (uses per-class ref_chains data).
+        let _ = html.append_raw(&self.render_class_ref_chain_panel("java.lang.String", total_bytes));
+
+        // Per-instance reference chains for sample duplicate string objects.
+        let mut sample_ids: Vec<u64> = Vec::new();
+        for g in report.top_groups.iter().take(10) {
+            for &id in g.sample_obj_ids.iter().take(2) {
+                sample_ids.push(id);
+            }
+        }
+        self.render_instance_ref_chains(
+            html,
+            "Per-instance reference chains for sample duplicate Strings",
+            report.wasted_bytes,
+            total_bytes,
+            &sample_ids,
+            Some("Reference Chains for Duplicate Strings"),
+        );
     }
 
     fn section_bad_collections(&mut self, html: &mut HtmlStringBuilder) {
@@ -1032,6 +1306,39 @@ impl MainReportGenerator {
                 requires container walker integration which is planned for a future release.\
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
+
+            // Per-instance ref chain for top collection class.
+            if let Some((top_name, _, _)) = entries.first() {
+                let lookup = top_name.replace('.', "/");
+                let _ = html.append_raw(&self.render_class_ref_chain_panel(top_name, total_bytes));
+
+                // Scan traversal_data for sample instances of the top collection class.
+                let sample_ids: Vec<u64> = {
+                    let guard = self.stats.traversal_data.lock().unwrap();
+                    if let Some(data) = guard.as_ref() {
+                        let key: &str = lookup.as_str();
+                        if let Some(&class_idx) = self.heap.class_by_name.get(key) {
+                            data.objects.iter()
+                                .filter(|o| o.class_idx == class_idx)
+                                .take(20)
+                                .map(|o| o.obj_id)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                };
+                self.render_instance_ref_chains(
+                    html,
+                    &format!("Per-instance reference chains for sample <t-c>{}</t-c> instances", top_name),
+                    total_collection_bytes,
+                    total_bytes,
+                    &sample_ids,
+                    Some("Reference Chains for Bad Collections"),
+                );
+            }
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No collection instances found", ""]);
@@ -1114,6 +1421,30 @@ impl MainReportGenerator {
                 pre-allocated collections that were never filled.\
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
+
+            // Per-instance ref chain for sample bad object arrays.
+            // Combine samples from all bad-array categories.
+            let mut sample_ids: Vec<u64> = Vec::new();
+            for cat in [
+                &self.stats.empty_obj_array_samples,
+                &self.stats.single_elem_obj_array_samples,
+                &self.stats.all_null_obj_array_samples,
+                &self.stats.one_nonnull_obj_array_samples,
+                &self.stats.sparse_obj_array_samples,
+            ] {
+                let v = cat.lock().unwrap();
+                for &id in v.iter().take(5) {
+                    sample_ids.push(id);
+                }
+            }
+            self.render_instance_ref_chains(
+                html,
+                "Per-instance reference chains for sample bad object arrays",
+                total_bad_bytes,
+                total_bytes,
+                &sample_ids,
+                Some("Reference Chains for Bad Object Arrays"),
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No bad object arrays found.", ""]);
@@ -1158,6 +1489,22 @@ impl MainReportGenerator {
             }
             html.end_table();
 
+            // Per-class breakdown: aggregate sample obj_ids by class_idx.
+            let per_class = self.aggregate_bad_prim_array_by_class();
+            if !per_class.is_empty() {
+                html.append_raw("<details><summary>Per-class breakdown</summary><div class=\"scroll-wrap\">");
+                html.begin_table(true, 0, &["Class name", "Sample count", "Extrapolated size"]);
+                for (name, count, bytes) in per_class.iter().take(50) {
+                    html.append_table_row(&[
+                        name,
+                        &format_count(*count),
+                        &format_bytes(*bytes),
+                    ]);
+                }
+                html.end_table();
+                html.append_raw("</div></details>");
+            }
+
             html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
             html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
                 Empty primitive arrays waste memory due to object headers. Use null references or shared empty arrays.<br>\
@@ -1166,6 +1513,26 @@ impl MainReportGenerator {
                 compress or sparse-encode the data.\
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
+
+            // Per-instance ref chain for sample bad primitive arrays.
+            let mut sample_ids: Vec<u64> = Vec::new();
+            for cat in [
+                &self.stats.empty_prim_array_samples,
+                &self.stats.trailing_zero_prim_array_samples,
+            ] {
+                let v = cat.lock().unwrap();
+                for &id in v.iter().take(5) {
+                    sample_ids.push(id);
+                }
+            }
+            self.render_instance_ref_chains(
+                html,
+                "Per-instance reference chains for sample bad primitive arrays",
+                total_bad_bytes,
+                total_bytes,
+                &sample_ids,
+                Some("Reference Chains for Bad Primitive Arrays"),
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No bad primitive arrays found.", ""]);
@@ -1229,6 +1596,41 @@ impl MainReportGenerator {
             }
             html.end_table();
             html.append_raw("</div></details>");
+
+            // Typical reference paths for the top boxed class.
+            if let Some((_, _, _, top_name)) = boxed_classes.first() {
+                let _ = html.append_raw(&self.render_class_ref_chain_panel(top_name, total_bytes));
+            }
+
+            // Per-instance ref chain for sample boxed number instances.
+            // Scan traversal_data for top boxed class instances.
+            if let Some((_, _, _, top_name)) = boxed_classes.first() {
+                let lookup = top_name.replace('.', "/");
+                let sample_ids: Vec<u64> = {
+                    let guard = self.stats.traversal_data.lock().unwrap();
+                    if let Some(data) = guard.as_ref() {
+                        if let Some(&class_idx) = self.heap.class_by_name.get(lookup.as_str()) {
+                            data.objects.iter()
+                                .filter(|o| o.class_idx == class_idx)
+                                .take(20)
+                                .map(|o| o.obj_id)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                };
+                self.render_instance_ref_chains(
+                    html,
+                    &format!("Per-instance reference chains for sample <t-c>{}</t-c> instances", top_name),
+                    total_overhead,
+                    total_bytes,
+                    &sample_ids,
+                    Some("Reference Chains for Boxed Numbers"),
+                );
+            }
         }
     }
 
@@ -1296,6 +1698,39 @@ impl MainReportGenerator {
                 <br>Note: Full duplicate object detection requires reference chain analysis which is planned for a future release.\
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
+
+            // Typical reference paths for the top candidate class.
+            if let Some((name, _, _, _)) = candidates.first() {
+                let display = name.replace('/', ".");
+                let _ = html.append_raw(&self.render_class_ref_chain_panel(&display, total_bytes));
+
+                // Per-instance ref chain for sample instances of the top candidate class.
+                let sample_ids: Vec<u64> = {
+                    let guard = self.stats.traversal_data.lock().unwrap();
+                    if let Some(data) = guard.as_ref() {
+                        let key: &str = name.as_ref();
+                        if let Some(&class_idx) = self.heap.class_by_name.get(key) {
+                            data.objects.iter()
+                                .filter(|o| o.class_idx == class_idx)
+                                .take(20)
+                                .map(|o| o.obj_id)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                };
+                self.render_instance_ref_chains(
+                    html,
+                    &format!("Per-instance reference chains for sample <t-c>{}</t-c> instances", display),
+                    candidates.iter().map(|(_, _, b, _)| *b).sum::<i64>(),
+                    total_bytes,
+                    &sample_ids,
+                    Some("Reference Chains for Duplicate Objects"),
+                );
+            }
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No high-count small-object classes detected.", ""]);
@@ -1343,7 +1778,28 @@ impl MainReportGenerator {
                 }
                 html.end_table();
                 html.append_raw("</div></details>");
+
+                // Typical reference paths for the top duplicate class.
+                if let Some(top) = per_class.first() {
+                    let _ = html.append_raw(&self.render_class_ref_chain_panel(&top.class_name, total_bytes));
+                }
             }
+
+            // Per-instance reference chains for sample duplicate arrays.
+            let mut sample_ids: Vec<u64> = Vec::new();
+            for g in report.top_groups.iter().take(10) {
+                for &id in g.sample_obj_ids.iter().take(2) {
+                    sample_ids.push(id);
+                }
+            }
+            self.render_instance_ref_chains(
+                html,
+                "Per-instance reference chains for sample duplicate primitive arrays",
+                report.wasted_bytes,
+                total_bytes,
+                &sample_ids,
+                Some("Reference Chains for Duplicate Primitive Arrays"),
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No duplicate primitive arrays detected", ""]);
@@ -1391,7 +1847,28 @@ impl MainReportGenerator {
                 }
                 html.end_table();
                 html.append_raw("</div></details>");
+
+                // Typical reference paths for the top duplicate class.
+                if let Some(top) = per_class.first() {
+                    let _ = html.append_raw(&self.render_class_ref_chain_panel(&top.class_name, total_bytes));
+                }
             }
+
+            // Per-instance reference chains for sample duplicate object arrays.
+            let mut sample_ids: Vec<u64> = Vec::new();
+            for g in report.top_groups.iter().take(10) {
+                for &id in g.sample_obj_ids.iter().take(2) {
+                    sample_ids.push(id);
+                }
+            }
+            self.render_instance_ref_chains(
+                html,
+                "Per-instance reference chains for sample duplicate object arrays",
+                report.wasted_bytes,
+                total_bytes,
+                &sample_ids,
+                None,
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No duplicate object arrays detected", ""]);
@@ -1400,16 +1877,113 @@ impl MainReportGenerator {
     }
 
     fn section_dup_lists(&mut self, html: &mut HtmlStringBuilder) {
+        let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
         self.begin_section(html, "Duplicate Lists", false, "");
-        html.begin_table(true, 5, &["", ""]);
+
+        // List-like classes we care about.
+        let list_classes = [
+            "java/util/ArrayList",
+            "java/util/LinkedList",
+            "java/util/Collections$UnmodifiableRandomAccessList",
+            "java/util/Collections$SingletonList",
+            "java/util/Arrays$ArrayList",
+        ];
+
+        let mut entries: Vec<(String, u64, i64)> = Vec::new();
+        for cls in list_classes {
+            if let Some(&idx) = self.heap.class_by_name.get(cls) {
+                if let Some(pc) = self.stats.get_per_class(idx) {
+                    let count = pc.instance_count.load(Relaxed);
+                    let bytes = pc.total_instance_bytes.load(Relaxed);
+                    if count > 0 {
+                        entries.push((pc.class_name.replace('/', "."), count, bytes));
+                    }
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            html.begin_table(true, 5, &["", ""]);
+            html.append_table_row(&["No list instances found in this heap dump.", ""]);
+            html.end_table();
+            return;
+        }
+
+        // Summary table
+        let total_count: u64 = entries.iter().map(|(_, c, _)| *c).sum();
+        let total_size: i64 = entries.iter().map(|(_, _, b)| *b).sum();
+        let pct = calc_percent(total_size, total_bytes);
+        let indicator = if pct >= 2.0 {
+            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_size)))
+        } else if pct >= 0.5 {
+            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_size)))
+        } else {
+            String::new()
+        };
+        let _ = indicator; // begin_section was already called without indicator
+
+        html.begin_table(true, 5, &["Total list objects", "Total size"]);
         html.append_table_row(&[
-            "Duplicate list analysis requires container walker integration",
-            "",
+            &format_count(total_count),
+            &format_with_percent(total_size, total_bytes),
         ]);
         html.end_table();
+
+        // Per-class breakdown
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        html.append_raw("<details><summary>Per-class breakdown</summary><div class=\"scroll-wrap\">");
+        html.begin_table(true, 0, &["# objects", "Size", "Class name"]);
+        for (name, count, bytes) in entries.iter().take(50) {
+            html.append_table_row(&[
+                &format_count(*count),
+                &format_with_percent(*bytes, total_bytes),
+                name,
+            ]);
+        }
+        html.end_table();
+        html.append_raw("</div></details>");
+
+        html.append_raw(&format!(
+            "<br><i>Note: Full duplicate list detection (lists with identical element sequences) \
+             requires container walker integration. The reference paths below show where the \
+             most-common list class lives.</i><br>"
+        ));
+
+        // Typical reference paths + per-instance chains for top list class.
+        if let Some((top_name, _, _)) = entries.first() {
+            let lookup = top_name.replace('.', "/");
+            let _ = html.append_raw(&self.render_class_ref_chain_panel(top_name, total_bytes));
+
+            // Per-instance ref chain for sample list instances.
+            let sample_ids: Vec<u64> = {
+                let guard = self.stats.traversal_data.lock().unwrap();
+                if let Some(data) = guard.as_ref() {
+                    if let Some(&class_idx) = self.heap.class_by_name.get(lookup.as_str()) {
+                        data.objects.iter()
+                            .filter(|o| o.class_idx == class_idx)
+                            .take(20)
+                            .map(|o| o.obj_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            self.render_instance_ref_chains(
+                html,
+                &format!("Per-instance reference chains for sample <t-c>{}</t-c> instances", top_name),
+                total_size,
+                total_bytes,
+                &sample_ids,
+                None,
+            );
+        }
     }
 
     fn section_weak_hashmaps(&mut self, html: &mut HtmlStringBuilder) {
+        let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
         self.begin_section(
             html,
             "WeakHashMaps with hard references from values to keys",
@@ -1418,8 +1992,9 @@ impl MainReportGenerator {
         );
 
         // Count WeakHashMap instances
-        let whm_count = self.heap.class_by_name.get("java/util/WeakHashMap")
-            .and_then(|&idx| self.stats.get_per_class(idx))
+        let whm_class_idx = self.heap.class_by_name.get("java/util/WeakHashMap").copied();
+        let whm_count = whm_class_idx
+            .and_then(|idx| self.stats.get_per_class(idx))
             .map(|pc| pc.instance_count.load(Relaxed))
             .unwrap_or(0);
 
@@ -1427,7 +2002,40 @@ impl MainReportGenerator {
             html.begin_table(true, 5, &["WeakHashMap instances", "Count"]);
             html.append_table_row(&["java.util.WeakHashMap", &format_count(whm_count)]);
             html.end_table();
-            html.append_raw("<br><i>Note: Detecting hard references from values to keys requires reference chain analysis.</i>");
+
+            html.append_raw(&format!(
+                "<br><i>A WeakHashMap holds its keys via WeakReference, so keys can be \
+                 garbage-collected when no longer strongly reachable. However, if a value \
+                 strongly references its key (directly or transitively), the key can never \
+                 be GC'd — effectively turning the WeakHashMap into a leaky HashMap.</i><br><br>"
+            ));
+
+            // Per-instance ref chain for sample WeakHashMap instances.
+            // Scan traversal_data for WeakHashMap instances.
+            let sample_ids: Vec<u64> = {
+                let guard = self.stats.traversal_data.lock().unwrap();
+                if let Some(data) = guard.as_ref() {
+                    if let Some(class_idx) = whm_class_idx {
+                        data.objects.iter()
+                            .filter(|o| o.class_idx == class_idx)
+                            .take(20)
+                            .map(|o| o.obj_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            self.render_instance_ref_chains(
+                html,
+                "Reference chains holding WeakHashMap instances",
+                whm_count as i64 * 64, // rough size estimate
+                total_bytes,
+                &sample_ids,
+                Some("Reference Chains for bad WeakHashMaps"),
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No WeakHashMap instances found in this heap dump.", ""]);
@@ -1479,7 +2087,22 @@ impl MainReportGenerator {
                 }
                 html.end_table();
                 html.append_raw("</div></details>");
+
+                // Typical reference paths for the top DirectBuffer subclass.
+                if let Some(top) = report.per_class.first() {
+                    let _ = html.append_raw(&self.render_class_ref_chain_panel(&top.class_name, total_heap));
+                }
             }
+
+            // Per-instance reference chains for top DirectByteBuffers.
+            self.render_instance_ref_chains(
+                html,
+                "Per-instance reference chains for largest DirectByteBuffers",
+                report.total_capacity,
+                total_heap,
+                &report.sample_obj_ids,
+                Some("Reference Chains for java.nio.DirectByteBuffers"),
+            );
         } else {
             html.begin_table(true, 5, &["", ""]);
             html.append_table_row(&["No DirectByteBuffer instances found", ""]);
@@ -1633,18 +2256,222 @@ impl MainReportGenerator {
     }
 
     fn section_long_ref_chains(&mut self, html: &mut HtmlStringBuilder) {
+        // Find objects whose parent[] chain to root exceeds the threshold.
+        let threshold: u32 = 1000;
+        let top_n: usize = 20;
+
+        // Collect all data while holding the lock; render after release.
+        struct ChainRow {
+            depth: u32,
+            obj_id: u64,
+            class_name: String,
+            path: Vec<(u64, String, String)>, // (parent_obj_id, parent_class, field)
+            reached_root: bool,
+        }
+
+        let rows: Vec<ChainRow> = {
+            let guard = self.stats.traversal_data.lock().unwrap();
+            let data = match guard.as_ref() {
+                Some(d) => d,
+                None => {
+                    drop(guard);
+                    self.begin_section(
+                        html,
+                        "Very Long (Over 1000 Elements) Reference Chains",
+                        false,
+                        "",
+                    );
+                    html.begin_table(true, 5, &["", ""]);
+                    html.append_table_row(&[
+                        "Reference chain analysis requires BFS traversal data.",
+                        "Run the analyzer with the standard pipeline.",
+                    ]);
+                    html.end_table();
+                    return;
+                }
+            };
+
+            // Walk parent[] for every visited object, compute chain depth.
+            let mut depths: Vec<u32> = vec![0; data.objects.len()];
+            let mut visited_chain: Vec<u32> = Vec::with_capacity(64);
+            let mut long_chains: Vec<(u32, u32)> = Vec::new(); // (depth, obj_idx)
+
+            for (idx, &is_visited) in data.visited.iter().enumerate() {
+                if !is_visited || depths[idx] > 0 {
+                    continue;
+                }
+                visited_chain.clear();
+                let mut current = idx as u32;
+                loop {
+                    let cur = current as usize;
+                    if depths[cur] > 0 {
+                        // Found a known depth — backfill.
+                        let mut d = depths[cur];
+                        for &node in visited_chain.iter().rev() {
+                            d += 1;
+                            depths[node as usize] = d;
+                            if d >= threshold {
+                                long_chains.push((d, node));
+                            }
+                        }
+                        break;
+                    }
+                    let parent = data.parent[cur];
+                    if parent == u32::MAX {
+                        depths[cur] = 1;
+                        for &node in visited_chain.iter().rev() {
+                            let d = depths[node as usize] + 1;
+                            // depths[node] hasn't been set yet. Use a counter.
+                        }
+                        let mut d = 1u32;
+                        for &node in visited_chain.iter().rev() {
+                            d += 1;
+                            depths[node as usize] = d;
+                            if d >= threshold {
+                                long_chains.push((d, node));
+                            }
+                        }
+                        break;
+                    }
+                    visited_chain.push(current);
+                    current = parent;
+                }
+            }
+
+            long_chains.sort_by(|a, b| b.0.cmp(&a.0));
+            long_chains.truncate(top_n);
+
+            long_chains.iter().map(|&(depth, obj_idx)| {
+                let obj = &data.objects[obj_idx as usize];
+                let class_name = if (obj.class_idx as usize) < self.heap.classes.len() {
+                    self.heap.classes[obj.class_idx as usize].name.replace('/', ".")
+                } else {
+                    "unknown".to_string()
+                };
+                // Walk path — cap at 50 hops for display.
+                let max_display: u32 = 50;
+                let mut path: Vec<(u64, String, String)> = Vec::new();
+                let mut current = obj_idx;
+                let mut hops = 0u32;
+                let mut reached_root = true;
+                loop {
+                    let parent = data.parent[current as usize];
+                    if parent == u32::MAX {
+                        break;
+                    }
+                    let parent_obj = &data.objects[parent as usize];
+                    let parent_class = if (parent_obj.class_idx as usize) < self.heap.classes.len() {
+                        self.heap.classes[parent_obj.class_idx as usize].name.replace('/', ".")
+                    } else {
+                        "unknown".to_string()
+                    };
+                    let edge = data.parent_edge[current as usize];
+                    let field = data.field_pool.get(edge).to_string();
+                    path.push((parent_obj.obj_id, parent_class, field));
+                    current = parent;
+                    hops += 1;
+                    if hops >= max_display {
+                        reached_root = false;
+                        break;
+                    }
+                }
+                ChainRow {
+                    depth,
+                    obj_id: obj.obj_id,
+                    class_name,
+                    path,
+                    reached_root,
+                }
+            }).collect()
+        };
+
+        let indicator = if rows.is_empty() {
+            String::new()
+        } else {
+            severity_med(&format!("{} chains > {} hops", rows.len(), threshold))
+        };
+
         self.begin_section(
             html,
             "Very Long (Over 1000 Elements) Reference Chains",
             false,
-            "",
+            &indicator,
         );
-        html.begin_table(true, 5, &["", ""]);
-        html.append_table_row(&[
-            "Reference chain analysis requires dominator tree computation.",
-            "This feature will be added in a future version.",
-        ]);
-        html.end_table();
+
+        if rows.is_empty() {
+            html.begin_table(true, 5, &["", ""]);
+            html.append_table_row(&[
+                &format!("No reference chains longer than {} elements found.", threshold),
+                "",
+            ]);
+            html.end_table();
+        } else {
+            html.begin_table(true, 0, &["Chain length", "Class", "Object", "Reference path"]);
+            for row in &rows {
+                let mut path_html = String::new();
+                for (i, (_, cls, fld)) in row.path.iter().enumerate() {
+                    let tab = (3 + i.min(7)) as u32;
+                    path_html.push_str(&format!(
+                        "<rc_tab{}>&nwarr;<t-c>{}</t-c><t-f>.{}</t-f><br></rc_tab{}>",
+                        tab, cls, fld, tab,
+                    ));
+                }
+                if !row.reached_root {
+                    path_html.push_str(&format!(
+                        "<rc_tab8>... and {} more hops to root<br></rc_tab8>",
+                        row.depth.saturating_sub(row.path.len() as u32),
+                    ));
+                }
+                html.append_table_row(&[
+                    &format_count(row.depth as u64),
+                    &format!("<t-c>{}</t-c>", row.class_name),
+                    &format!("<t-c>{}</t-c>@0x{:x}", row.class_name, row.obj_id),
+                    &path_html,
+                ]);
+            }
+            html.end_table();
+        }
+    }
+
+    fn get_class_display(&self, class_idx: u32) -> String {
+        if (class_idx as usize) < self.heap.classes.len() {
+            self.heap.classes[class_idx as usize].name.replace('/', ".")
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    /// Aggregate bad primitive array samples by class for Section 11
+    /// per-class breakdown. Returns (class_name, sample_count, extrapolated_bytes)
+    /// sorted by sample count descending. The extrapolation uses total bad-array
+    /// bytes / total samples as a simple scaling factor.
+    fn aggregate_bad_prim_array_by_class(&self) -> Vec<(String, u64, i64)> {
+        use std::collections::HashMap;
+
+        let guard = self.stats.traversal_data.lock().unwrap();
+        let data = match guard.as_ref() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+
+        let empty_samples = self.stats.empty_prim_array_samples.lock().unwrap();
+        let trailing_samples = self.stats.trailing_zero_prim_array_samples.lock().unwrap();
+
+        let mut per_class: HashMap<u32, (u64, i64)> = HashMap::new();
+        for &id in empty_samples.iter().chain(trailing_samples.iter()) {
+            if let Some(obj) = data.objects.iter().find(|o| o.obj_id == id) {
+                let entry = per_class.entry(obj.class_idx).or_insert((0, 0));
+                entry.0 += 1;
+                // Approximate size using body_size + header.
+                entry.1 += obj.body_size as i64 + self.heap.header_size as i64;
+            }
+        }
+
+        let mut v: Vec<(String, u64, i64)> = per_class.into_iter()
+            .map(|(idx, (count, bytes))| (self.get_class_display(idx), count, bytes))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
     }
 
     fn section_thread_stacks(&mut self, html: &mut HtmlStringBuilder) {
@@ -1810,7 +2637,70 @@ impl MainReportGenerator {
             html.end_table();
 
             if !info.jvm_flags_raw.is_empty() {
-                html.append_raw("<details><summary>Raw JVM flags</summary><div class=\"scroll-wrap\">");
+                // Categorize flags by type for clearer presentation.
+                let parsed = parse_jvm_flags(&info.jvm_flags_raw);
+
+                // Heap-related flags
+                if !parsed.heap_flags.is_empty() {
+                    html.append_raw("<details><summary>Heap configuration flags</summary><div class=\"scroll-wrap\">");
+                    html.begin_table(true, 0, &["Flag", "Value", "Description"]);
+                    for (flag, value, desc) in &parsed.heap_flags {
+                        html.append_table_row(&[
+                            &format!("<code>{}</code>", html_escape_simple(flag)),
+                            &html_escape_simple(value),
+                            desc,
+                        ]);
+                    }
+                    html.end_table();
+                    html.append_raw("</div></details>");
+                }
+
+                // GC-related flags
+                if !parsed.gc_flags.is_empty() {
+                    html.append_raw("<details><summary>Garbage collection flags</summary><div class=\"scroll-wrap\">");
+                    html.begin_table(true, 0, &["Flag", "Value", "Description"]);
+                    for (flag, value, desc) in &parsed.gc_flags {
+                        html.append_table_row(&[
+                            &format!("<code>{}</code>", html_escape_simple(flag)),
+                            &html_escape_simple(value),
+                            desc,
+                        ]);
+                    }
+                    html.end_table();
+                    html.append_raw("</div></details>");
+                }
+
+                // Performance/JIT flags
+                if !parsed.perf_flags.is_empty() {
+                    html.append_raw("<details><summary>Performance / JIT flags</summary><div class=\"scroll-wrap\">");
+                    html.begin_table(true, 0, &["Flag", "Value", "Description"]);
+                    for (flag, value, desc) in &parsed.perf_flags {
+                        html.append_table_row(&[
+                            &format!("<code>{}</code>", html_escape_simple(flag)),
+                            &html_escape_simple(value),
+                            desc,
+                        ]);
+                    }
+                    html.end_table();
+                    html.append_raw("</div></details>");
+                }
+
+                // Other flags
+                if !parsed.other_flags.is_empty() {
+                    html.append_raw("<details><summary>Other flags</summary><div class=\"scroll-wrap\">");
+                    html.begin_table(true, 0, &["Flag", "Value"]);
+                    for (flag, value) in &parsed.other_flags {
+                        html.append_table_row(&[
+                            &format!("<code>{}</code>", html_escape_simple(flag)),
+                            &html_escape_simple(value),
+                        ]);
+                    }
+                    html.end_table();
+                    html.append_raw("</div></details>");
+                }
+
+                // Full raw dump
+                html.append_raw("<details><summary>All flags (raw)</summary><div class=\"scroll-wrap\">");
                 html.begin_table(true, 0, &["Flags"]);
                 for flag in info.jvm_flags_raw.split_whitespace() {
                     let escaped = flag.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
@@ -1824,8 +2714,18 @@ impl MainReportGenerator {
 
     /// Generate the "MOST IMPORTANT ISSUES" advisor summary section.
     fn generate_advisor_summary(&self) -> String {
-        let mut summary = String::with_capacity(8192);
+        let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
+        let problems = ProblemReportSet::from_stats(&self.stats, &self.heap);
+        let ctx = AdvisorContext {
+            stats: &self.stats,
+            heap: &self.heap,
+            problems: &problems,
+        };
+        let registry = AdvisorRegistry::new();
+        let mut advices = registry.run_all(&ctx);
+        advices.sort_by_key(|a| (a.category.order(), a.order_hint));
 
+        let mut summary = String::with_capacity(8192);
         summary.push_str(&format!(
             "<details open id=\"summary-section\">\n<summary>{}</summary><br>\n",
             format_section_header("MOST IMPORTANT ISSUES", Some("#most_important_issues"))
@@ -1839,67 +2739,48 @@ impl MainReportGenerator {
         summary.push_str("(in Kbytes and as a percentage of used memory) if you get rid of this problem.<br>\n");
         summary.push_str("<br>\n");
 
-        let total_bytes = self.stats.total_shallow_size.load(Relaxed);
-
-        // Collect easy-to-fix problems
-        let mut easy_fix_panels = String::new();
-
-        // DirectByteBuffer off-heap easy fix
-        let dbb_report = self.stats.direct_buffers.get_report();
-        if dbb_report.total_capacity > 0 {
-            let pct = calc_percent(dbb_report.total_capacity, total_bytes.max(1));
-            if pct >= 5.0 {
-                easy_fix_panels.push_str(&format!(
-                    "<details>\n<summary><font class=\"OvhdColorHigh\">&nbsp;<font class=\"Bigger\"><b>Easy-to-fix problem found: unreachable DirectByteBuffers holding off-heap memory.  Overhead: <b>{}</b>.</b></font>&nbsp;</font></summary>\n\
-                    <div>\n<table class=\"dt\"><br>\n<tr class=\"C_02\">\n<td class=\"TAL\"><font class=\"Bigger\"><br>\n\
-                    We found a potential problem: <t-c>DirectByteBuffer</t-c> objects, that are<br>\n\
-                    unreachable (garbage), still hold native (off-heap) memory.<br>\n\
-                    Total memory used by these buffers is <b>{}</b><br>\n<br>\n\
-                    To reduce off-heap memory wasted by these DirectByteBuffers, you may need to<br>\n\
-                    reduce the heap size for your application (specified via the -Xmx JVM flag)<br>\n\
-                    so that GC happens more frequently and the problematic DirectByteBuffer<br>\n\
-                    objects are GCed sooner, or you may try to reduce the number of DirectByteBuffers.<br>\n<br>\n\
-                    For full details, go to <button onclick=\"openSection('Section-18');\">Section 18. Off-heap memory used by java.nio.DirectByteBuffers</button><br>\n\
-                    </font><br>\n</td></tr>\n</table><br>\n</div>\n\n</details><br>\n",
-                    format_with_percent(dbb_report.total_capacity, total_bytes.max(1)),
-                    format_with_percent(dbb_report.total_capacity, total_bytes.max(1))
-                ));
-            }
-        }
-
-        // JVM flags not provided easy fix
-        let info = self.stats.jvm_info.get();
-        if info.jvm_flags_raw.is_empty() {
-            easy_fix_panels.push_str(&format!(
-                "<details>\n<summary><font class=\"OvhdColorMed\">&nbsp;<font class=\"Bigger\"><b>Preventable problem found: JVM flags are not provided</b></font>&nbsp;</font></summary>\n\
-                <div>\n<table class=\"dt\"><br>\n<tr class=\"C_02\">\n<td class=\"TAL\"><font class=\"Bigger\"><br>\n\
-                The JVM flags (java command line arguments) for the app that generated this heap dump<br>\n\
-                are not provided.<br>\n<br>\n\
-                When the JVM flags are available, we can check for some errors and do several types of analysis<br>\n\
-                much more precisely. To include them, add the following code early in your app:<br>\n<br>\n\
-                <code>&nbsp&nbspimport java.lang.management.ManagementFactory;<br>\n\
-                &nbsp&nbspList&lt;String&gt; jvmArgs = ManagementFactory.getRuntimeMXBean().getInputArguments();<br>\n\
-                &nbsp&nbspSystem.getProperties().put(\"java.vm.inputarguments\", String.join(\" \", jvmArgs));</code><br>\n<br>\n\
-                For full details, go to <button onclick=\"openSection('Section-24');\">Section 24. JVM Flags</button><br>\n\
-                </font><br>\n</td></tr>\n</table><br>\n</div>\n\n</details><br>\n"
-            ));
-        }
-
-        if !easy_fix_panels.is_empty() {
+        // Easy-to-fix panel
+        let easy: Vec<&Advice> = advices.iter()
+            .filter(|a| a.category == AdviceCategory::EasyToFix)
+            .collect();
+        if !easy.is_empty() {
             summary.push_str(&bigger_font(&bold("Good news! Some problems that we found are easy to fix, see below:")));
             summary.push_str("<br>\n");
-            summary.push_str(&easy_fix_panels);
+            for a in &easy {
+                summary.push_str(&render_advice_panel(a, total_bytes));
+                summary.push_str("<br>\n");
+            }
         }
 
         summary.push_str(&bigger_font(&bold("All problems:")));
         summary.push_str("<br>\n");
-
-        // Build problem summary table
         summary.push_str("<table class=\"dt\">\n");
 
-        let garbage_bytes = self.stats.total_garbage_bytes.load(Relaxed);
-        let garbage_pct = calc_percent(garbage_bytes, total_bytes);
+        // All problems table: include every advice as a summary row
+        for a in &advices {
+            summary.push_str(&render_advice_table_row(a, total_bytes));
+        }
 
+        // Also surface some inline checks that don't yet have dedicated advisors.
+        self.append_inline_problem_rows(&mut summary, &problems, total_bytes);
+
+        summary.push_str("</table>\n");
+        summary.push_str("</font>\n");
+        summary.push_str("</details>\n");
+        summary
+    }
+
+    /// Append summary rows for problems that don't yet have dedicated advisors
+    /// (garbage ratio, humongous objects, dup arrays). These will be migrated
+    /// to advisors in later phases.
+    fn append_inline_problem_rows(
+        &self,
+        summary: &mut String,
+        problems: &ProblemReportSet,
+        total_bytes: i64,
+    ) {
+        // Garbage ratio
+        let garbage_pct = calc_percent(problems.garbage_bytes, total_bytes);
         if garbage_pct > 20.0 {
             summary.push_str(&format!(
                 "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Large amount of garbage objects {}</font></td></tr>\n",
@@ -1910,139 +2791,65 @@ impl MainReportGenerator {
                 "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
                 <tr><td class=\"TAL\"><font class=\"Bigger\">Garbage objects occupy {} of heap memory. Consider triggering a GC or investigating object lifecycle.</font></td></tr>\
                 </table></div></details></font></td></tr>\n",
-                format_with_percent(garbage_bytes, total_bytes.max(1))
+                format_with_percent(problems.garbage_bytes, total_bytes.max(1))
             ));
         }
 
-        // Check for humongous objects
-        let humongous_bytes: i64 = self
-            .stats
-            .per_class
-            .iter()
-            .map(|pc| pc.humongous_bytes.load(Relaxed))
-            .sum();
-        if humongous_bytes > 0 {
+        // Humongous objects (when G1OOM advisor didn't fire, e.g. non-G1 collector)
+        if problems.humongous_bytes > 0
+            && !problems.gc_type.to_ascii_uppercase().contains("G1")
+        {
             summary.push_str(&format!(
                 "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Humongous objects (&gt;1MB) found {}</font></td></tr>\n",
                 bold("Problem"),
-                severity_low(&format!("found - {}", format_bytes(humongous_bytes)))
+                severity_low(&format!("found - {}", format_bytes(problems.humongous_bytes)))
             ));
             summary.push_str(&format!(
                 "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
                 <tr><td class=\"TAL\"><font class=\"Bigger\">Objects larger than 1MB occupy {} of heap. For full details, go to \
                 <button onclick=\"openSection('Section-19');\">Section 19. Humongous objects</button></font></td></tr>\
                 </table></div></details></font></td></tr>\n",
-                format_with_percent(humongous_bytes, total_bytes.max(1))
+                format_with_percent(problems.humongous_bytes, total_bytes.max(1))
             ));
         }
 
-        // Check for duplicate strings
-        let string_report = self.stats.string_dup.get_report();
-        if string_report.wasted_bytes > 0 {
-            let pct = calc_percent(string_report.wasted_bytes, total_bytes.max(1));
-            if pct >= 1.0 {
-                let sev = if pct >= 5.0 { severity_high(&format!("found - {}", format_bytes(string_report.wasted_bytes))) } else { severity_med(&format!("found - {}", format_bytes(string_report.wasted_bytes))) };
-                summary.push_str(&format!(
-                    "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Duplicate strings {}</font></td></tr>\n",
-                    bold("Problem"), sev
-                ));
-                summary.push_str(&format!(
-                    "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
-                    <tr><td class=\"TAL\"><font class=\"Bigger\">{} duplicate string groups wasting {}. \
-                    <button onclick=\"openSection('Section-8');\">Section 8. Duplicate Strings</button></font></td></tr>\
-                    </table></div></details></font></td></tr>\n",
-                    string_report.duplicate_group_count,
-                    format_with_percent(string_report.wasted_bytes, total_bytes.max(1))
-                ));
-            }
-        }
-
-        // Check for DirectByteBuffers (in problems list too)
-        if dbb_report.total_capacity > 0 {
-            let pct = calc_percent(dbb_report.total_capacity, total_bytes.max(1));
-            if pct >= 5.0 {
-                summary.push_str(&format!(
-                    "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Large DirectByteBuffer off-heap usage {}</font></td></tr>\n",
-                    bold("Problem"),
-                    severity_high(&format!("{} off-heap", format_bytes(dbb_report.total_capacity)))
-                ));
-                summary.push_str(&format!(
-                    "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
-                    <tr><td class=\"TAL\"><font class=\"Bigger\">{} DirectByteBuffer instances using {} off-heap memory. \
-                    <button onclick=\"openSection('Section-18');\">Section 18. DirectByteBuffers</button></font></td></tr>\
-                    </table></div></details></font></td></tr>\n",
-                    dbb_report.total_count,
-                    format_bytes(dbb_report.total_capacity)
-                ));
-            }
-        }
-
-        // Check for boxed numbers overhead
-        let boxed_overhead: i64 = self.stats.per_class.iter()
-            .map(|pc| pc.boxed_number_overhead.load(Relaxed))
-            .sum();
-        if boxed_overhead > 0 {
-            let pct = calc_percent(boxed_overhead, total_bytes.max(1));
-            if pct >= 1.0 {
-                summary.push_str(&format!(
-                    "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Boxed number overhead {}</font></td></tr>\n",
-                    bold("Problem"),
-                    severity_low(&format!("{}", format_with_percent(boxed_overhead, total_bytes.max(1))))
-                ));
-                summary.push_str(&format!(
-                    "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
-                    <tr><td class=\"TAL\"><font class=\"Bigger\">Boxed numbers waste memory due to object headers. \
-                    <button onclick=\"openSection('Section-12');\">Section 12. Boxed Numbers</button></font></td></tr>\
-                    </table></div></details></font></td></tr>\n"
-                ));
-            }
-        }
-
-        // Check for duplicate arrays
-        let dup_prim_report = self.stats.dup_prim_arrays.get_report();
-        if dup_prim_report.wasted_bytes > 0 {
-            let pct = calc_percent(dup_prim_report.wasted_bytes, total_bytes.max(1));
+        // Duplicate primitive arrays
+        if problems.dup_prim.wasted_bytes > 0 {
+            let pct = calc_percent(problems.dup_prim.wasted_bytes, total_bytes.max(1));
             if pct >= 1.0 {
                 summary.push_str(&format!(
                     "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Duplicate primitive arrays {}</font></td></tr>\n",
                     bold("Problem"),
-                    severity_low(&format!("{}", format_with_percent(dup_prim_report.wasted_bytes, total_bytes.max(1))))
+                    severity_low(&format!("{}", format_with_percent(problems.dup_prim.wasted_bytes, total_bytes.max(1))))
                 ));
                 summary.push_str(&format!(
                     "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
                     <tr><td class=\"TAL\"><font class=\"Bigger\">{} groups of identical primitive arrays. \
                     <button onclick=\"openSection('Section-14');\">Section 14. Duplicate Primitive Arrays</button></font></td></tr>\
                     </table></div></details></font></td></tr>\n",
-                    dup_prim_report.duplicate_group_count
+                    problems.dup_prim.duplicate_group_count
                 ));
             }
         }
 
-        // Check for duplicate object arrays
-        let dup_obj_report = self.stats.dup_obj_arrays.get_report();
-        if dup_obj_report.wasted_bytes > 0 {
-            let pct = calc_percent(dup_obj_report.wasted_bytes, total_bytes.max(1));
+        // Duplicate object arrays
+        if problems.dup_obj.wasted_bytes > 0 {
+            let pct = calc_percent(problems.dup_obj.wasted_bytes, total_bytes.max(1));
             if pct >= 0.5 {
                 summary.push_str(&format!(
                     "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Duplicate object arrays {}</font></td></tr>\n",
                     bold("Problem"),
-                    severity_low(&format!("{}", format_with_percent(dup_obj_report.wasted_bytes, total_bytes.max(1))))
+                    severity_low(&format!("{}", format_with_percent(problems.dup_obj.wasted_bytes, total_bytes.max(1))))
                 ));
                 summary.push_str(&format!(
                     "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
                     <tr><td class=\"TAL\"><font class=\"Bigger\">{} groups of identical object arrays. \
                     <button onclick=\"openSection('Section-15');\">Section 15. Duplicate Object Arrays</button></font></td></tr>\
                     </table></div></details></font></td></tr>\n",
-                    dup_obj_report.duplicate_group_count
+                    problems.dup_obj.duplicate_group_count
                 ));
             }
         }
-
-        summary.push_str("</table>\n");
-        summary.push_str("</font>\n");
-        summary.push_str("</details>\n");
-
-        summary
     }
 }
 
@@ -2052,183 +2859,160 @@ fn format_class_name(name: &str) -> String {
     format!("<t-c>{}</t-c>", display)
 }
 
-/// Render reference chains for a single class as HTML.
-fn render_class_ref_chains(chains: &ClassRefChains, total_bytes: i64) -> String {
-    let mut html = String::new();
-
-    // Part 1: Expensive data fields
-    if !chains.expensive_fields.is_empty() {
-        html.push_str("<details><summary>Expensive data fields</summary><br><div>");
-        html.push_str(&render_chain_groups(&chains.expensive_fields, total_bytes));
-        html.push_str("</div></details>");
-    }
-
-    // Part 2: Full reference chains
-    if !chains.full_chains.is_empty() {
-        if !html.is_empty() {
-            html.push_str("<br>");
-        }
-        html.push_str("<details><summary>Full reference chains</summary><br><div>");
-        html.push_str(&render_chain_groups(&chains.full_chains, total_bytes));
-        html.push_str("</div></details>");
-    }
-
-    html
+/// Basic HTML escaping for inline text (advice / JVM flag values).
+fn html_escape_simple(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
-/// Render a list of chain groups as an HTML table.
-fn render_chain_groups(groups: &[ss_stats::ref_chain::RefChainGroup], total_bytes: i64) -> String {
-    let mut html = String::new();
-    html.push_str("<table class=\"dt\">");
+/// Categorized JVM flags parsed from the raw `-X`/`-XX` string. Each entry
+/// is (flag, value, description). Known flags get a human-readable
+/// description; unknown flags land in `other_flags` without one.
+struct ParsedJvmFlags {
+    heap_flags: Vec<(String, String, String)>,
+    gc_flags: Vec<(String, String, String)>,
+    perf_flags: Vec<(String, String, String)>,
+    other_flags: Vec<(String, String)>,
+}
 
-    for group in groups {
-        // Description row: collapsible summary with samples
-        let sample_html = render_samples(&group.samples);
-        let size_str = format_bytes(group.size_bytes);
-        let pct = calc_percent(group.size_bytes, total_bytes);
-        let desc = format!(
-            "<details><summary>{} ({:.1}%): {} objects</summary>{}</details>",
-            size_str, pct, group.count, sample_html,
-        );
-        html.push_str("<tr class=\"C_02\"><td class=\"TAL\">");
-        html.push_str(&desc);
-        html.push_str("</td></tr>\n");
+fn parse_jvm_flags(raw: &str) -> ParsedJvmFlags {
+    let mut heap = Vec::new();
+    let mut gc = Vec::new();
+    let mut perf = Vec::new();
+    let mut other = Vec::new();
 
-        // Reference path row
-        let path_strs: Vec<String> = group.path.iter().map(|step| {
-            match step {
-                ChainStep::Field { class_name, field_name } =>
-                    format!("&nwarr;<t-c>{}</t-c><t-f>.{}</t-f>", class_name, field_name),
-                ChainStep::ArrayElement { class_name } =>
-                    format!("&nwarr;<t-c>{}</t-c>[...]", class_name),
-                ChainStep::Root { description } =>
-                    format!("&nwarr;{}", description),
+    for tok in raw.split_whitespace() {
+        // Decompose: -XX:+Flag / -XX:-Flag / -XX:Flag=value / -Xmx<size> / -X<size>
+        let (flag, value) = if let Some(rest) = tok.strip_prefix("-XX:") {
+            if let Some(name) = rest.strip_prefix("+") {
+                (name.to_string(), "enabled".to_string())
+            } else if let Some(name) = rest.strip_prefix("-") {
+                (name.to_string(), "disabled".to_string())
+            } else if let Some(eq) = rest.find('=') {
+                (rest[..eq].to_string(), rest[eq+1..].to_string())
+            } else {
+                (rest.to_string(), String::new())
             }
-        }).collect();
-
-        if path_strs.is_empty() {
-            continue;
-        }
-
-        if path_strs.len() == 1 {
-            // Single step: render inline without collapsible
-            html.push_str("<tr class=\"C_03\"><td class=\"TAL\">&nbsp;&nbsp;");
-            html.push_str(&path_strs[0]);
-            html.push_str("</td></tr>\n");
+        } else if let Some(rest) = tok.strip_prefix("-X") {
+            // -Xmx512m, -Xms128m, -Xss, -Xmn, -Xshare:on, etc.
+            // Try to split into name + value
+            if let Some(eq) = rest.find(|c: char| c == ':' || c == '=') {
+                (format!("-X{}", &rest[..eq]), rest[eq..].to_string())
+            } else if rest.starts_with("mx") || rest.starts_with("ms")
+                || rest.starts_with("mn") || rest.starts_with("ss") {
+                let name = &rest[..2];
+                let val = &rest[2..];
+                (format!("-X{}", name), val.to_string())
+            } else {
+                (format!("-X{}", rest), String::new())
+            }
         } else {
-            // Multi-step: render with collapsible details
-            html.push_str("<tr class=\"C_03\"><td class=\"TAL\"><details><summary>&nbsp;&nbsp;");
-            html.push_str(&path_strs[0]);
-            html.push_str("</summary>");
-            for (i, step_str) in path_strs.iter().skip(1).enumerate() {
-                let tab_level = (3 + i).min(10);
-                html.push_str(&format!("<rc_tab{}>", tab_level));
-                html.push_str(step_str);
-                html.push_str("<br></rc_tab");
-                html.push_str(&tab_level.to_string());
-                html.push_str(">\n");
-            }
-            html.push_str("</details></td></tr>\n");
+            // Non-standard flag (e.g. just "Flag")
+            (tok.to_string(), String::new())
+        };
+
+        // Categorize and provide descriptions for well-known flags.
+        let upper = flag.to_uppercase();
+        let (category, description) = categorize_flag(&upper);
+        match category {
+            FlagCategory::Heap => heap.push((flag.clone(), value.clone(), description.into())),
+            FlagCategory::Gc => gc.push((flag.clone(), value.clone(), description.into())),
+            FlagCategory::Perf => perf.push((flag.clone(), value.clone(), description.into())),
+            FlagCategory::Other => other.push((flag.clone(), value.clone())),
         }
     }
 
-    html.push_str("</table>");
-    html
-}
-
-/// Render random sample descriptions as a sub-table.
-fn render_samples(samples: &[String]) -> String {
-    if samples.is_empty() {
-        return String::new();
-    }
-    let mut html = String::from("<div><table class=\"dt\">");
-    html.push_str("<tr class=\"C_01\"><th class=\"TAL\"><b>&nbsp;Random sample&nbsp;</b></th></tr>");
-    for sample in samples.iter().take(3) {
-        html.push_str("<tr class=\"C_04\"><td class=\"TSP_1\"><rc_tab2>");
-        html.push_str(sample);
-        html.push_str("</rc_tab2></td></tr>");
-    }
-    html.push_str("</table></div>");
-    html
-}
-
-/// Render reference chains for humongous objects directly into the HtmlStringBuilder.
-fn render_humongous_ref_chains(chains: &ClassRefChains, html: &mut HtmlStringBuilder, total_bytes: i64) {
-    // Expensive data fields: show only the first (closest) path step, non-collapsible
-    if !chains.expensive_fields.is_empty() {
-        html.append_raw("<details><summary>Expensive data fields</summary><br><div>");
-        html.begin_table(true, 0, &[]);
-        for group in &chains.expensive_fields {
-            let sample_html = render_samples(&group.samples);
-            let size_str = format_bytes(group.size_bytes);
-            let pct = calc_percent(group.size_bytes, total_bytes);
-            let desc = format!(
-                "<details><summary>{} ({:.1}%): {} objects</summary>{}</details>",
-                size_str, pct, group.count, sample_html,
-            );
-            html.append_span_row(&desc, 1, false);
-
-            // Expensive panel: only the first path step, rendered as a simple non-collapsible row
-            if let Some(step) = group.path.first() {
-                let step_str = match step {
-                    ChainStep::Field { class_name, field_name } =>
-                        format!("&nwarr;<t-c>{}</t-c><t-f>.{}</t-f>", class_name, field_name),
-                    ChainStep::ArrayElement { class_name } =>
-                        format!("&nwarr;<t-c>{}</t-c>[...]", class_name),
-                    ChainStep::Root { description } =>
-                        format!("&nwarr;{}", description),
-                };
-                // Single-step: non-collapsible row matching Java's C_03 style
-                let row_class = if html.alternate_row() { "C_02" } else { "C_03" };
-                html.append_raw(&format!(
-                    "<tr class=\"{}\"><td class=\"TAL\">&nbsp&nbsp{}</td></tr>\n",
-                    row_class, step_str
-                ));
-            }
-        }
-        html.end_table();
-        html.append_raw("</div></details>");
-    }
-
-    // Full reference chains: show all path steps, collapsible
-    if !chains.full_chains.is_empty() {
-        html.append_raw("<br><details><summary>Full reference chains</summary><br><div>");
-        html.begin_table(true, 0, &[]);
-        for group in &chains.full_chains {
-            let sample_html = render_samples(&group.samples);
-            let size_str = format_bytes(group.size_bytes);
-            let pct = calc_percent(group.size_bytes, total_bytes);
-            let desc = format!(
-                "<details><summary>{} ({:.1}%): {} objects</summary>{}</details>",
-                size_str, pct, group.count, sample_html,
-            );
-            html.append_span_row(&desc, 1, false);
-
-            // Note: append_reference_path_row adds its own &nwarr; prefix per step
-            let path_strs: Vec<String> = group.path.iter().map(|step| {
-                match step {
-                    ChainStep::Field { class_name, field_name } =>
-                        format!("<t-c>{}</t-c><t-f>.{}</t-f>", class_name, field_name),
-                    ChainStep::ArrayElement { class_name } =>
-                        format!("<t-c>{}</t-c>[...]", class_name),
-                    ChainStep::Root { description } =>
-                        description.clone(),
-                }
-            }).collect();
-
-            if !path_strs.is_empty() {
-                let chain_refs: Vec<String> = path_strs.iter().map(|s| s.as_str().to_string()).collect();
-                html.append_reference_path_row(&chain_refs, None, path_strs.len() > 1);
-            }
-        }
-        html.end_table();
-        html.append_raw("</div></details>");
+    ParsedJvmFlags {
+        heap_flags: heap,
+        gc_flags: gc,
+        perf_flags: perf,
+        other_flags: other,
     }
 }
 
-// ============================================================
-// Section 4 helpers
-// ============================================================
+enum FlagCategory { Heap, Gc, Perf, Other }
+
+fn categorize_flag(upper: &str) -> (FlagCategory, &'static str) {
+    // Heap-related
+    if upper.starts_with("-XM") || upper.starts_with("-XX:M") || upper.starts_with("-XX:+USEMEM")
+        || upper.contains("HEAPSIZE") || upper.contains("HEAPREGION")
+        || upper.contains("HEAP") || upper.contains("METASPACE")
+        || upper.contains("COMPRESSEDCLASSSPACE") || upper.contains("MAXDIRECTMEMORYSIZE")
+        || upper.contains("OOM") || upper.contains("SOFTMX") || upper.contains("HARDMX") {
+        return (FlagCategory::Heap, "Heap or stack memory sizing");
+    }
+    // GC
+    if upper.contains("GC") || upper.contains("USEG1") || upper.contains("USEZGC")
+        || upper.contains("USESHENANDOAH") || upper.contains("USEPARALLEL")
+        || upper.contains("USECMS") || upper.contains("USESERNIAL")
+        || upper.contains("STRINGDEDUPLICATION") || upper.contains("MAXGCPAUSEMILLIS")
+        || upper.contains("G1HEAPREGIONSIZE") || upper.contains("G1RESERVEPERCENT")
+        || upper.contains("CONCURRENCY") || upper.contains("PARALLELGC")
+        || upper.contains("USESHARED") || upper.contains("REQUIRESHARED")
+        || upper.contains("DYNAMICDUMP") || upper.contains("DUMPSHARED")
+        || upper.contains("SHARE") || upper.contains("ARCHIVE")
+        || upper.contains("CDS") || upper.contains("CLASSLIST") {
+        return (FlagCategory::Gc, "Garbage collector / class data sharing");
+    }
+    // Performance / JIT
+    if upper.contains("JIT") || upper.contains("TIEREDSTOPATLEVEL")
+        || upper.contains("TIEREDCOMPILATION") || upper.contains("CI")
+        || upper.contains("COMPILETHRESHOLD") || upper.contains("USEBIASEDLOCKING")
+        || upper.contains("LOCKING") || upper.contains("USECOUNTEDLOOPSAFETY")
+        || upper.contains("AGGRESSIVEOPTS") || upper.contains("USEOPTSTRING")
+        || upper.contains("ENABLEPRECONDITIONS") || upper.contains("INVOKE")
+        || upper.contains("FLIGHTRECORDER") || upper.contains("JFR")
+        || upper.contains("LOG") || upper.contains("XLOG") {
+        return (FlagCategory::Perf, "JIT compiler / logging / runtime");
+    }
+    (FlagCategory::Other, "")
+}
+
+/// Render a single advice as a collapsible panel (used in the Easy-to-fix area).
+fn render_advice_panel(advice: &Advice, _total_bytes: i64) -> String {
+    let color_class = match advice.severity {
+        AdviceSeverity::High => "OvhdColorHigh",
+        AdviceSeverity::Med | AdviceSeverity::Low => "OvhdColorMed",
+    };
+    let overhead_suffix = match advice.overhead_bytes {
+        Some(b) => format!("&nbsp;&nbsp;Overhead: <b>{}</b>.", format_with_percent(b, _total_bytes.max(1))),
+        None => String::new(),
+    };
+    format!(
+        "<details>\n\
+         <summary><font class=\"{}\">&nbsp;<font class=\"Bigger\"><b>{} {}{}</b></font>&nbsp;</font></summary>\n\
+         <div>\n<table class=\"dt\"><br>\n\
+         <tr class=\"C_02\">\n<td class=\"TAL\"><font class=\"Bigger\"><br>\n\
+         {}<br>\n<br>\n\
+         For full details, go to <button onclick=\"openSection('{}');\">Section {}</button><br>\n\
+         </font><br>\n</td></tr>\n</table><br>\n</div>\n\n</details>",
+        color_class,
+        advice.category.prefix(),
+        advice.title,
+        overhead_suffix,
+        advice.body_html,
+        advice.section_id,
+        advice.section_id.trim_start_matches("Section-"),
+    )
+}
+
+/// Render a single advice as a table row (used in the All problems table).
+fn render_advice_table_row(advice: &Advice, total_bytes: i64) -> String {
+    let sev_html = match advice.severity {
+        AdviceSeverity::High => severity_high(&format!("found")),
+        AdviceSeverity::Med => severity_med(&format!("found")),
+        AdviceSeverity::Low => severity_low(&format!("found")),
+    };
+    let _ = total_bytes;
+    format!(
+        "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: {} {}</font></td></tr>\n",
+        bold("Problem"),
+        advice.title,
+        sev_html,
+    )
+}
 
 fn format_root_description(meta: &ss_stats::ref_chain::GcRootMeta) -> String {
     let type_names: Vec<&str> = meta.root_types.iter().map(|rt| match rt {
@@ -2247,70 +3031,3 @@ fn format_root_description(meta: &ss_stats::ref_chain::GcRootMeta) -> String {
     format!("{}(<t-c>{}</t-c>)", type_str, meta.class_name)
 }
 
-fn render_tree_node(node: &ss_stats::ref_chain::GcRootTreeNode, total_bytes: i64) -> String {
-    let mut html = String::new();
-    let retained_pct = calc_percent(node.retained_bytes, total_bytes);
-    let self_pct = calc_percent(node.self_bytes, total_bytes);
-
-    if node.children.is_empty() && node.collapsed_count == 0 {
-        // Leaf node
-        if let Some(ref field_name) = node.field_name {
-            html.push_str(&format!(
-                "<li><t-f>{}</t-f>&nbsp;&searr;{}&nbsp;({}),&nbsp;{}&nbsp;reference(s)</li>\n",
-                field_name,
-                format_bytes(node.retained_bytes),
-                format_percent(retained_pct),
-                format_count(node.self_count),
-            ));
-        } else {
-            html.push_str(&format!(
-                "<li><t-c>{}</t-c>&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</li>\n",
-                node.class_name,
-                format_bytes(node.retained_bytes),
-                format_percent(retained_pct),
-                format_bytes(node.self_bytes),
-                format_percent(self_pct),
-                format_count(node.self_count),
-            ));
-        }
-    } else {
-        // Node with children — collapsible
-        if let Some(ref field_name) = node.field_name {
-            html.push_str(&format!(
-                "<li><label><t-f>{}</t-f>&nbsp;&searr;{}&nbsp;({}),&nbsp;{}&nbsp;reference(s)</label><input type=\"checkbox\" checked><ol>\n",
-                field_name,
-                format_bytes(node.retained_bytes),
-                format_percent(retained_pct),
-                format_count(node.self_count),
-            ));
-        } else {
-            html.push_str(&format!(
-                "<li><label><t-c>{}</t-c>&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</label><input type=\"checkbox\" checked><ol>\n",
-                node.class_name,
-                format_bytes(node.retained_bytes),
-                format_percent(retained_pct),
-                format_bytes(node.self_bytes),
-                format_percent(self_pct),
-                format_count(node.self_count),
-            ));
-        }
-
-        for child in &node.children {
-            html.push_str(&render_tree_node(child, total_bytes));
-        }
-
-        if node.collapsed_count > 0 {
-            let coll_pct = calc_percent(node.collapsed_bytes, total_bytes);
-            html.push_str(&format!(
-                "<li>...&nbsp;{}&nbsp;more referenced objects retaining&nbsp;{}&nbsp;({})</li>\n",
-                format_count(node.collapsed_count),
-                format_bytes(node.collapsed_bytes),
-                format_percent(coll_pct),
-            ));
-        }
-
-        html.push_str("</ol></li>\n");
-    }
-
-    html
-}

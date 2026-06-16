@@ -22,47 +22,7 @@ pub struct HeapObjectTraverser {
 }
 
 /// Per-object metadata collected during initial HPROF pass for BFS.
-struct ObjectEntry {
-    obj_id: u64,
-    class_idx: u32,
-    file_offset: usize,
-    body_size: i32,
-    /// Object type: 0=instance, 1=primitive array, 2=object array, 3=class object
-    kind: u8,
-    array_length: i32,
-}
-
-/// Field name pool: compact storage of field names used in edges.
-/// Index 0 = "[elements]" (array elements), 1 = "[static]" (static field).
-struct FieldPool {
-    names: Vec<String>,
-}
-
-impl FieldPool {
-    fn new() -> Self {
-        Self {
-            names: vec!["[elements]".into(), "[static]".into()],
-        }
-    }
-    fn intern(&mut self, name: &str) -> u32 {
-        if let Some(idx) = self.names.iter().position(|n| n == name) {
-            return idx as u32;
-        }
-        let idx = self.names.len() as u32;
-        self.names.push(name.to_string());
-        idx
-    }
-    fn get(&self, key: u32) -> &str {
-        &self.names[key as usize]
-    }
-}
-
-/// Edge in the object graph carrying field info.
-#[derive(Clone)]
-struct OutEdge {
-    target: u32,
-    field_key: u32, // index into FieldPool
-}
+pub use ss_stats::traversal_data::{ObjectEntry, FieldPool, OutEdge, TraversalData};
 
 impl HeapObjectTraverser {
     pub fn new(heap: Arc<HeapDump>, stats: Arc<StatsEngine>) -> Self {
@@ -87,7 +47,6 @@ impl HeapObjectTraverser {
         // JVM oop size (compressed oops = 4, normal = 8) for object array sizing
         let oop_size = self.heap.oop_size as usize;
         let header_size = self.heap.header_size as i64;
-        eprintln!("BFS: id_bytes={}, oop_size={}, header_size={}", id_bytes, oop_size, header_size);
 
         // Build class_object_id -> class_idx mapping
         let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::with_capacity(self.heap.classes.len());
@@ -163,10 +122,14 @@ impl HeapObjectTraverser {
         // For deferred (weak reference) classes, skip the "referent" field — it's a weak pointer,
         // not a strong one. Also skip "next" in finalizer/cleaner chains.
         let skip_instance_field_pairs: Vec<(&str, &str)> = vec![
-            ("java/lang/ref/Reference", "referent"),
-            ("java/lang/ref/Reference", "discovered"),
-            ("java/lang/ref/Reference", "pendingNext"),
-            ("java/lang/ref/Reference", "pending"),
+            // Java's TraversalWorkerThread does NOT skip any instance fields.
+            // Weak reference referent fields are followed normally.
+            // Only skip the Finalizer.prev field to avoid traversing the
+            // finalizer linked list backwards (matches Java's linkedListLinks logic).
+            // ("java/lang/ref/Reference", "referent"),
+            // ("java/lang/ref/Reference", "discovered"),
+            // ("java/lang/ref/Reference", "pendingNext"),
+            // ("java/lang/ref/Reference", "pending"),
             ("java/lang/ref/Finalizer", "prev"),
         ];
 
@@ -214,8 +177,6 @@ impl HeapObjectTraverser {
             }
         }
 
-        eprintln!("BFS Phase 1: building object table...");
-
         for record in hprof.records_iter() {
             let record = match record {
                 Ok(r) => r,
@@ -259,7 +220,7 @@ impl HeapObjectTraverser {
                                         array_length: 0,
                                     });
 
-                                    addr_to_idx.insert(obj_id, idx);
+                                    let _ = addr_to_idx.insert(obj_id, idx);
 
                                     if (class_idx as usize) < class_inst_sizes.len() {
                                         class_inst_sizes[class_idx as usize] += shallow;
@@ -289,7 +250,7 @@ impl HeapObjectTraverser {
                                         array_length: length,
                                     });
 
-                                    addr_to_idx.insert(obj_id, idx);
+                                    let _ = addr_to_idx.insert(obj_id, idx);
                                 }
                                 Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
                                     let obj_id = arr.obj_id().id();
@@ -312,7 +273,7 @@ impl HeapObjectTraverser {
                                         array_length: length,
                                     });
 
-                                    addr_to_idx.insert(obj_id, idx);
+                                    let _ = addr_to_idx.insert(obj_id, idx);
 
                                 }
                                 // Also capture ClassDump records as objects so GC roots
@@ -340,7 +301,7 @@ impl HeapObjectTraverser {
                                         array_length: 0,
                                     });
 
-                                    addr_to_idx.insert(class_obj_id, idx);
+                                    let _ = addr_to_idx.insert(class_obj_id, idx);
 
                                     // Don't add ClassDump sizes to per-class instance bytes —
                                     // they represent java.lang.Class instances, not regular instances.
@@ -353,8 +314,6 @@ impl HeapObjectTraverser {
                 _ => {}
             }
         }
-
-        eprintln!("BFS: built object table with {} objects", objects.len());
 
         // Phase 2: Build outgoing reference lists per object (with field info)
         eprintln!("BFS Phase 2: extracting outgoing references...");
@@ -395,9 +354,6 @@ impl HeapObjectTraverser {
                                                 &mut field_pool,
                                             );
                                             // Filter out references targeting ClassDump objects (kind==3).
-                                            // Java doesn't include ClassDump in ObjectIndex, so instance→Class
-                                            // references aren't followed. Without filtering, BFS would follow
-                                            // instance→ClassDump→static refs, reaching many extra objects.
                                             let refs: Vec<OutEdge> = refs.into_iter()
                                                 .filter(|e| objects[e.target as usize].kind != 3)
                                                 .collect();
@@ -415,8 +371,7 @@ impl HeapObjectTraverser {
                                         for elem in arr.elements(id_size) {
                                             if let Some(Some(id)) = elem.ok() {
                                                 if let Some(&child_idx) = addr_to_idx.get(&id.id()) {
-                                                    // Skip ClassDump objects — Java doesn't follow
-                                                    // object array elements to ClassDump targets
+                                                    // Skip ClassDump objects
                                                     if objects[child_idx as usize].kind != 3 {
                                                         refs.push(OutEdge { target: child_idx, field_key: 0 });
                                                     }
@@ -473,11 +428,7 @@ impl HeapObjectTraverser {
             }
         }
 
-        eprintln!("BFS: extracted {} outgoing references", refs_found);
-
         // Phase 3: BFS traversal from GC roots (with parent tracking for reference chains)
-        eprintln!("BFS Phase 3: running BFS from {} roots...", self.heap.roots.len());
-
         let mut visited: Vec<bool> = vec![false; objects.len()];
         let mut deferred_queue: VecDeque<u32> = VecDeque::new();
         // Parent tracking for reference chain reconstruction
@@ -492,8 +443,9 @@ impl HeapObjectTraverser {
         let is_thread_subclass = {
             let mut result = vec![false; self.heap.classes.len()];
             for cls in &self.heap.classes {
+                let mut found = cls.name.as_ref() == "java/lang/Thread"
+                    || cls.name.as_ref() == "java.lang.Thread";
                 let mut current_id = cls.super_class_id;
-                let mut found = false;
                 let mut visited_set = std::collections::HashSet::new();
                 while current_id != 0 && !found {
                     if !visited_set.insert(current_id) { break; }
@@ -523,7 +475,9 @@ impl HeapObjectTraverser {
             if root.root_type == RootType::SystemClass {
                 // Java's filterValidRootRefs drops ALL SYSTEM_CLASS roots because
                 // their objectAddress is a class address (in classAddressToIndexMap).
-                // Reachability is instead handled by synthetic JAVA_STATIC roots.
+                // Reachability is instead handled by synthetic JAVA_STATIC roots
+                // (which jvm-hprof 0.1.0 doesn't expose — see notes in
+                // build_gc_root_trees). Dropping matches Java's live/garbage counts.
                 return 0;
             } else {
                 // Non-SystemClass roots: check the referenced object's class
@@ -536,40 +490,40 @@ impl HeapObjectTraverser {
                     if name == "java/lang/ThreadGroup" || name == "java.lang.ThreadGroup" { return 0; }
                     if is_thread_subclass[class_idx as usize] { return 0; }
                     // Priority 1: isFinalizable (collection entry classes), primitive array, String, BoxedNumber
-                    // Matches Java's classifyRootPriority for non-static roots
+                    // Matches Java's classifyRootPriority for non-static roots.
+                    // NOTE: In Java, these roots go to the deferred bucket but the worker thread
+                    // does NOT actually defer them (skipDeferCategories doesn't include String/BoxedNum
+                    // and isFinalizable is false). So they are processed in the first pass.
+                    // Only isFinalizable and skipDeferCategories (weak ref/cleaner/threadgroup)
+                    // are truly deferred in the worker thread.
                     if obj.kind == 0 && defer_class_indices.contains(&class_idx) { return 1; }
-                    if obj.kind == 1 { return 1; } // primitive array
-                    if cls.category == ClassCategory::String { return 1; }
-                    if cls.category == ClassCategory::BoxedNumber { return 1; }
+                    // Primitive arrays, String, BoxedNumber roots are bucketed as deferred
+                    // in Java's classifyRootPriority, but processed in first pass by worker.
+                    // Treat them as normal to match Java's actual behavior.
+                    // if obj.kind == 1 { return 1; } // primitive array
+                    // if cls.category == ClassCategory::String { return 1; }
+                    // if cls.category == ClassCategory::BoxedNumber { return 1; }
                 }
             }
             -1 // normal priority
         };
 
         // Seed from GC roots with priority filtering
-        let mut root_count = 0u64;
-        let mut unresolved_roots = 0u64;
-        let mut dropped_p0 = 0u64;
-        let mut deferred_p1 = 0u64;
         for root in &self.heap.roots {
             if let Some(&idx) = addr_to_idx.get(&root.object_id) {
                 let priority = classify_root_priority(root, idx);
                 if priority == 0 {
-                    dropped_p0 += 1;
                     continue;
                 }
                 if !visited[idx as usize] {
                     visited[idx as usize] = true;
-                    root_of[idx as usize] = idx; // Self-attribution for root objects
+                    root_of[idx as usize] = idx;
                     if priority == 1 {
                         deferred_queue.push_back(idx);
-                        deferred_p1 += 1;
                     } else {
                         queue.push_back(idx);
                     }
-                    root_count += 1;
                 }
-                // Accumulate root metadata (one object can have multiple root types)
                 use ss_stats::ref_chain::GcRootMeta;
                 root_metas.entry(idx).and_modify(|m| {
                     if !m.root_types.contains(&root.root_type) {
@@ -583,26 +537,14 @@ impl HeapObjectTraverser {
                     root_types: vec![root.root_type],
                     thread_serial: root.thread_serial,
                 });
-            } else {
-                unresolved_roots += 1;
             }
         }
-        eprintln!(
-            "BFS: {} roots resolved ({} dropped p0, {} deferred p1), {} unresolved out of {} total",
-            root_count, dropped_p0, deferred_p1, unresolved_roots, self.heap.roots.len()
-        );
+
         let mut visited_count: u64 = 0;
         let mut class_object_visited: u64 = 0;
         let mut deferred_count: u64 = 0;
         // Total ClassDump objects (for accurate live/garbage exclusion)
         let total_class_objects: u64 = objects.iter().filter(|o| o.kind == 3).count() as u64;
-
-        // Java's filterValidRootRefs drops ALL JAVA_STATIC roots because their
-        // objectAddress is the class's own address (in classAddressToIndexMap).
-        // Java also drops ALL SYSTEM_CLASS HPROF roots (same filter).
-        // So Java only uses non-SYSTEM_CLASS HPROF roots for reachability.
-        // We match this by not adding synthetic JAVA_STATIC roots.
-        eprintln!("BFS: no synthetic JAVA_STATIC roots (matching Java's filterValidRootRefs)");
 
         // Phase A: Normal BFS
         while let Some(obj_idx) = queue.pop_front() {
@@ -617,7 +559,11 @@ impl HeapObjectTraverser {
             if obj.class_idx < self.heap.classes.len() as u32 {
                 let header_size = self.heap.header_size as i32;
                 let shallow = if obj.kind == 0 {
-                    ((header_size + obj.body_size + 7) & !7) as i64
+                    if (obj.class_idx as usize) < class_aligned_body.len() {
+                        class_aligned_body[obj.class_idx as usize]
+                    } else {
+                        ((header_size + obj.body_size + 7) & !7) as i64
+                    }
                 } else if obj.kind == 1 {
                     array_shallow_size(obj.array_length, 1, header_size as i64)
                 } else {
@@ -636,8 +582,7 @@ impl HeapObjectTraverser {
             if obj.kind != 3 {
                 for edge in &outgoing_refs[obj_idx as usize] {
                     let child_idx = edge.target;
-                    // Also skip edges targeting ClassDump objects — Java's filterValidRootRefs
-                    // drops roots pointing at class addresses
+                    // Skip edges targeting ClassDump objects
                     if objects[child_idx as usize].kind == 3 { continue; }
                     if (child_idx as usize) < visited.len() && !visited[child_idx as usize] {
                         visited[child_idx as usize] = true;
@@ -656,18 +601,6 @@ impl HeapObjectTraverser {
             }
         }
 
-        eprintln!(
-            "BFS Phase A done: visited {}, deferred {}",
-            visited_count, deferred_count
-        );
-
-        // Count visited ClassDump objects (kind==3)
-        let visited_class_objs: u64 = objects.iter().enumerate()
-            .filter(|(i, obj)| obj.kind == 3 && visited[*i])
-            .count() as u64;
-        eprintln!("BFS: {} ClassDump objects visited out of {} total class objects",
-            visited_class_objs, total_class_objects);
-
         // Phase B: Process deferred (weak/finalizer/cleaner) objects — follow ALL outgoing refs
         // Java's second pass (isFirstPass=false) follows all children, not just deferred ones.
         // We keep processing both queues until empty (deferred can enqueue regular, and vice versa).
@@ -681,7 +614,11 @@ impl HeapObjectTraverser {
                 if obj.class_idx < self.heap.classes.len() as u32 {
                     let header_size = self.heap.header_size as i32;
                     let shallow = if obj.kind == 0 {
-                        ((header_size + obj.body_size + 7) & !7) as i64
+                        if (obj.class_idx as usize) < class_aligned_body.len() {
+                            class_aligned_body[obj.class_idx as usize]
+                        } else {
+                            ((header_size + obj.body_size + 7) & !7) as i64
+                        }
                     } else if obj.kind == 1 {
                         array_shallow_size(obj.array_length, 1, header_size as i64)
                     } else {
@@ -719,7 +656,11 @@ impl HeapObjectTraverser {
                 if obj.class_idx < self.heap.classes.len() as u32 {
                     let header_size = self.heap.header_size as i32;
                     let shallow = if obj.kind == 0 {
-                        ((header_size + obj.body_size + 7) & !7) as i64
+                        if (obj.class_idx as usize) < class_aligned_body.len() {
+                            class_aligned_body[obj.class_idx as usize]
+                        } else {
+                            ((header_size + obj.body_size + 7) & !7) as i64
+                        }
                     } else if obj.kind == 1 {
                         array_shallow_size(obj.array_length, 1, header_size as i64)
                     } else {
@@ -788,7 +729,13 @@ impl HeapObjectTraverser {
             if !visited[i] && obj.kind != 3 {
                 let header_size = self.heap.header_size as i32;
                 let shallow = if obj.kind == 0 {
-                    ((header_size + obj.body_size + 7) & !7) as i64
+                    // Use field-based aligned size (class_aligned_body) to match
+                    // the size used for total_shallow_size / class_inst_sizes.
+                    if (obj.class_idx as usize) < class_aligned_body.len() {
+                        class_aligned_body[obj.class_idx as usize]
+                    } else {
+                        ((header_size + obj.body_size + 7) & !7) as i64
+                    }
                 } else if obj.kind == 1 {
                     array_shallow_size(obj.array_length, 1, header_size as i64)
                 } else {
@@ -809,24 +756,6 @@ impl HeapObjectTraverser {
             }
         }
         self.stats.total_garbage_bytes.store(garbage_bytes, Relaxed);
-
-        // Per-class garbage summary (top 20)
-        {
-            let mut class_garb: Vec<(u64, &str)> = Vec::new();
-            for pc in &self.stats.per_class {
-                let ig = pc.instance_garbage_count.load(Relaxed) as u64;
-                let ag = pc.array_garbage_count.load(Relaxed) as u64;
-                let total_g = ig + ag;
-                if total_g > 0 {
-                    class_garb.push((total_g, &pc.class_name));
-                }
-            }
-            class_garb.sort_by(|a, b| b.0.cmp(&a.0));
-            eprintln!("BFS: top garbage classes:");
-            for (g, name) in class_garb.iter().take(20) {
-                eprintln!("  garb={}, {}", g, name);
-            }
-        }
 
         // Phase 3c: Build GC root trees for Section 4
         eprintln!("BFS Phase 3c: building GC root trees...");
@@ -883,6 +812,16 @@ impl HeapObjectTraverser {
         ref_chain_store.humongous_chains = humongous_chains;
 
         *self.stats.ref_chains.lock().unwrap() = ref_chain_store;
+
+        // Persist BFS data for post-traversal rendering (ref chains in report).
+        *self.stats.traversal_data.lock().unwrap() = Some(TraversalData {
+            objects: std::mem::take(&mut objects),
+            parent: std::mem::take(&mut parent),
+            parent_edge: std::mem::take(&mut parent_edge),
+            root_of: std::mem::take(&mut root_of),
+            visited: std::mem::take(&mut visited),
+            field_pool: std::mem::take(&mut field_pool),
+        });
         eprintln!("BFS: reference chains analyzed for {} classes", chain_count);
 
         Ok(TraversalResult {
@@ -1151,17 +1090,23 @@ fn analyze_ref_chains(
             }).collect();
 
             // Build sample descriptions using rich content from HPROF re-parse
-            let sample_strs: Vec<String> = obj_indices.iter().take(5)
+            let sample_strs: Vec<String> = obj_indices.iter().take(8)
                 .map(|&idx| {
                     descriptions.get(&idx).cloned()
                         .unwrap_or_else(|| describe_object_simple(idx, objects, heap))
                 })
+                .collect();
+            // Capture the corresponding object addresses so Section 3 can
+            // render per-object chains with decoded field values.
+            let sample_obj_ids: Vec<u64> = obj_indices.iter().take(8)
+                .map(|&idx| objects.get(idx as usize).map(|o| o.obj_id).unwrap_or(0))
                 .collect();
 
             let group = RefChainGroup {
                 size_bytes: extrapolated_bytes,
                 count: extrapolated_count,
                 samples: sample_strs,
+                sample_obj_ids,
                 path,
             };
 
@@ -1262,17 +1207,21 @@ fn analyze_humongous_chains(
             }
         }).collect();
 
-        let sample_strs: Vec<String> = obj_indices.iter().take(5)
+        let sample_strs: Vec<String> = obj_indices.iter().take(8)
             .map(|&idx| {
                 descriptions.get(&idx).cloned()
                     .unwrap_or_else(|| describe_object_simple(idx, objects, heap))
             })
+            .collect();
+        let sample_obj_ids: Vec<u64> = obj_indices.iter().take(8)
+            .map(|&idx| objects.get(idx as usize).map(|o| o.obj_id).unwrap_or(0))
             .collect();
 
         let group = RefChainGroup {
             size_bytes: total_bytes,
             count,
             samples: sample_strs,
+            sample_obj_ids,
             path: path.clone(),
         };
 
@@ -1754,9 +1703,9 @@ fn matches_skip_class_pair(name: &str) -> bool {
 /// Sentinel value in root_of[] marking unvisited/garbage objects.
 const GC_ROOT_GARBAGE_SENTINEL: u32 = u32::MAX - 1;
 
-const GC_ROOT_MAX_DEPTH: usize = 8;
-const GC_ROOT_MAX_CHILDREN: usize = 10;
-const GC_ROOT_TOP_N: usize = 20;
+const GC_ROOT_MAX_DEPTH: usize = 10;
+const GC_ROOT_MAX_CHILDREN: usize = 12;
+const GC_ROOT_TOP_N: usize = 100;
 const GC_ROOT_SAMPLE_N: usize = 40;
 
 fn build_gc_root_trees(
@@ -1770,7 +1719,7 @@ fn build_gc_root_trees(
     heap: &HeapDump,
     field_pool: &FieldPool,
 ) -> ss_stats::ref_chain::GcRootStore {
-    // Step 1: Aggregate per-root retained sizes
+    // Step 1: Aggregate per-root retained sizes (keyed by root_obj_idx)
     let mut root_retained: HashMap<u32, (i64, u64)> = HashMap::new();
     let mut garbage_bytes: i64 = 0;
     let mut garbage_count: u64 = 0;
@@ -1791,17 +1740,51 @@ fn build_gc_root_trees(
         entry.1 += 1;
     }
 
-    // Step 2: Sort roots by retained size descending
-    let mut sorted_roots: Vec<(u32, i64, u64)> = root_retained.into_iter()
-        .map(|(k, (b, c))| (k, b, c))
-        .collect();
-    sorted_roots.sort_by(|a, b| b.1.cmp(&a.1));
+    // Step 2: Group roots by (primary_root_type, class_idx) — matching Java's
+    // behavior of merging all roots of the same type pointing to the same class
+    // into one Section 4 entry. We use the first root_type in the meta's list
+    // as the "primary" type.
+    //
+    // Filter out JavaStackFrame roots (Java does this — they're transient
+    // method-parameter references that aren't meaningful for retention analysis).
+    let mut groups: HashMap<(RootType, u32), Vec<(u32, i64, u64)>> = HashMap::new();
+    for (root_idx, retained_bytes, retained_count) in root_retained.iter().map(|(&k, &(b, c))| (k, b, c)) {
+        let meta = match root_metas.get(&root_idx) {
+            Some(m) => m,
+            None => continue,
+        };
+        // Skip roots with no recorded root_type or only Unknown.
+        let primary_type = meta.root_types.iter().find(|&&t| t != RootType::Unknown).copied();
+        let primary_type = match primary_type {
+            Some(t) => t,
+            None => continue,
+        };
+        // Skip Java Stack Frame roots (transient method-param refs).
+        if primary_type == RootType::JavaStackFrame {
+            continue;
+        }
+        let key = (primary_type, meta.class_idx);
+        groups.entry(key).or_default().push((root_idx, retained_bytes, retained_count));
+    }
 
-    // Step 3: Build trees for top N roots
-    let top_n = GC_ROOT_TOP_N.min(sorted_roots.len());
+    // Step 3: For each group, sum retained bytes and pick the largest member
+    // as the representative for tree building.
+    let mut sorted_groups: Vec<(RootType, u32, u32, i64, u64)> = groups.into_iter()
+        .map(|((rt, class_idx), members)| {
+            let total_bytes: i64 = members.iter().map(|(_, b, _)| *b).sum();
+            let total_count: u64 = members.iter().map(|(_, _, c)| *c).sum();
+            // Largest member by retained_bytes.
+            let largest = members.iter().max_by_key(|(_, b, _)| *b).map(|(idx, _, _)| *idx).unwrap_or(0);
+            (rt, class_idx, largest, total_bytes, total_count)
+        })
+        .collect();
+    sorted_groups.sort_by(|a, b| b.3.cmp(&a.3));
+
+    // Step 4: Build trees for top N groups
+    let top_n = GC_ROOT_TOP_N.min(sorted_groups.len());
     let mut entries: Vec<ss_stats::ref_chain::GcRootEntry> = Vec::with_capacity(top_n);
 
-    for &(root_idx, retained_bytes, retained_count) in &sorted_roots[..top_n] {
+    for &(_, _, root_idx, retained_bytes, retained_count) in &sorted_groups[..top_n] {
         let meta = root_metas.get(&root_idx).cloned().unwrap_or_else(|| {
             ss_stats::ref_chain::GcRootMeta {
                 root_obj_idx: root_idx,
@@ -1838,17 +1821,17 @@ fn build_gc_root_trees(
         });
     }
 
-    // Step 4: Compute remaining roots summary
-    let remaining = if sorted_roots.len() > top_n { &sorted_roots[top_n..] } else { &[] };
-    let remaining_count: u64 = remaining.iter().map(|(_, _, c)| *c).sum();
-    let remaining_bytes: i64 = remaining.iter().map(|(_, b, _)| *b).sum();
+    // Step 4: Compute remaining groups summary
+    let remaining = if sorted_groups.len() > top_n { &sorted_groups[top_n..] } else { &[] };
+    let remaining_count: u64 = remaining.iter().map(|(_, _, _, _, c)| *c).sum();
+    let remaining_bytes: i64 = remaining.iter().map(|(_, _, _, b, _)| *b).sum();
 
-    // Random sample of remaining roots
+    // Random sample of remaining groups
     let sample_n = GC_ROOT_SAMPLE_N.min(remaining.len());
     let step = if remaining.len() > sample_n { remaining.len() / sample_n } else { 1 };
     let remaining_samples: Vec<ss_stats::ref_chain::GcRootMeta> = remaining.iter().step_by(step)
         .take(GC_ROOT_SAMPLE_N)
-        .filter_map(|&(root_idx, _, _)| root_metas.get(&root_idx).cloned())
+        .filter_map(|&(_, _, root_idx, _, _)| root_metas.get(&root_idx).cloned())
         .collect();
 
     // Step 5: Build garbage info

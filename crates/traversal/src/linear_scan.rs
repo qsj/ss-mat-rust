@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use jvm_hprof::heap_dump::PrimitiveArrayType;
@@ -96,6 +96,7 @@ impl LinearScanCoordinator {
                                             // Store for later aggregation
                                             direct_buffer_instances.push(DirectBufferData {
                                                 class_idx,
+                                                obj_id: inst.obj_id().id(),
                                                 capacity,
                                             });
                                         } else if cat == ClassCategory::BoxedNumber {
@@ -231,9 +232,11 @@ impl LinearScanCoordinator {
                     if arr.length == 0 {
                         stats_ref.empty_prim_array_count.fetch_add(1, Relaxed);
                         stats_ref.empty_prim_array_bytes.fetch_add(size, Relaxed);
+                        push_sample(&stats_ref.empty_prim_array_samples, arr.obj_id);
                     } else if arr.length > 1 && has_trailing_zero_elements(&arr.raw_body, arr.element_size) {
                         stats_ref.trailing_zero_prim_array_count.fetch_add(1, Relaxed);
                         stats_ref.trailing_zero_prim_array_bytes.fetch_add(size, Relaxed);
+                        push_sample(&stats_ref.trailing_zero_prim_array_samples, arr.obj_id);
                     }
                 }
             }
@@ -260,9 +263,11 @@ impl LinearScanCoordinator {
                     if arr.length == 0 {
                         stats_ref.empty_obj_array_count.fetch_add(1, Relaxed);
                         stats_ref.empty_obj_array_bytes.fetch_add(size, Relaxed);
+                        push_sample(&stats_ref.empty_obj_array_samples, arr.obj_id);
                     } else if arr.length == 1 {
                         stats_ref.single_elem_obj_array_count.fetch_add(1, Relaxed);
                         stats_ref.single_elem_obj_array_bytes.fetch_add(size, Relaxed);
+                        push_sample(&stats_ref.single_elem_obj_array_samples, arr.obj_id);
                     } else {
                         // element_refs contains only non-null references
                         let non_null_count = arr.element_refs.len() as i32;
@@ -271,15 +276,18 @@ impl LinearScanCoordinator {
                             // All elements null (EMPTY)
                             stats_ref.all_null_obj_array_count.fetch_add(1, Relaxed);
                             stats_ref.all_null_obj_array_bytes.fetch_add(size, Relaxed);
+                            push_sample(&stats_ref.all_null_obj_array_samples, arr.obj_id);
                         } else if non_null_count == 1 {
                             // Exactly one non-null element (SINGLE_ELEM)
                             stats_ref.one_nonnull_obj_array_count.fetch_add(1, Relaxed);
                             stats_ref.one_nonnull_obj_array_bytes.fetch_add(size, Relaxed);
+                            push_sample(&stats_ref.one_nonnull_obj_array_samples, arr.obj_id);
                         } else if null_count as f64 > 0.70 * arr.length as f64 {
                             // >70% null elements (SPARSE, matching Java's minSparseZeroesPercent=70)
                             let waste = null_count as i64 * oop_sz as i64;
                             stats_ref.sparse_obj_array_count.fetch_add(1, Relaxed);
                             stats_ref.sparse_obj_array_bytes.fetch_add(waste, Relaxed);
+                            push_sample(&stats_ref.sparse_obj_array_samples, arr.obj_id);
                         }
                     }
                 }
@@ -304,15 +312,16 @@ impl LinearScanCoordinator {
 
         // Build groups for the StringDupCollector
         let total_string_count = string_result.len();
-        let unique_count = total_string_count - dup_strings.iter().map(|(_, c)| c - 1).sum::<usize>();
+        let unique_count = total_string_count - dup_strings.iter().map(|(_, c, _)| c - 1).sum::<usize>();
         let groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = dup_strings
             .iter()
-            .map(|(content, count)| {
+            .map(|(content, count, samples)| {
                 let wasted = (content.len() as i64) * (*count as i64 - 1) * 2;
                 ss_stats::duplicate_strings::DupStringGroup {
                     content: content.clone(),
                     count: *count,
                     wasted_bytes: wasted,
+                    sample_obj_ids: samples.clone(),
                 }
             })
             .collect();
@@ -361,6 +370,7 @@ struct StringInstanceData {
 
 struct DirectBufferData {
     class_idx: u32,
+    obj_id: u64,
     capacity: i32,
 }
 
@@ -519,16 +529,18 @@ fn compute_string_hash(s: &str) -> u64 {
     hasher.finish()
 }
 
-fn find_duplicate_strings(entries: &[(u64, StringHashEntry)]) -> Vec<(String, usize)> {
-    let mut groups: HashMap<u64, Vec<&StringHashEntry>> = HashMap::new();
-    for (_, entry) in entries {
-        groups.entry(entry.hash).or_default().push(entry);
+fn find_duplicate_strings(entries: &[(u64, StringHashEntry)]) -> Vec<(String, usize, Vec<u64>)> {
+    let mut groups: HashMap<u64, Vec<&(u64, StringHashEntry)>> = HashMap::new();
+    for pair in entries {
+        groups.entry(pair.1.hash).or_default().push(pair);
     }
 
     let mut dups = Vec::new();
     for (_, group) in groups {
         if group.len() > 1 {
-            dups.push((group[0].content.clone(), group.len()));
+            // Collect up to 5 sample obj IDs per group (for ref chain rendering).
+            let samples: Vec<u64> = group.iter().take(5).map(|(obj_id, _)| *obj_id).collect();
+            dups.push((group[0].1.content.clone(), group.len(), samples));
         }
     }
     dups.sort_by(|a, b| b.1.cmp(&a.1));
@@ -682,12 +694,14 @@ fn detect_duplicate_prim_arrays(
             *waste += wasted;
 
             if wasted > 1024 {
+                let samples: Vec<u64> = group.iter().take(5).map(|a| a.obj_id).collect();
                 top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
                     class_name: class_name.clone(),
                     count,
                     wasted_bytes: wasted,
                     size_bytes: size,
                     description: format!("byte[{}]", group[0].length),
+                    sample_obj_ids: samples,
                 });
             }
         }
@@ -783,12 +797,14 @@ fn detect_duplicate_obj_arrays(
             *waste += wasted;
 
             if wasted > 1024 {
+                let samples: Vec<u64> = group.iter().take(5).map(|a| a.obj_id).collect();
                 top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
                     class_name: class_name.clone(),
                     count,
                     wasted_bytes: wasted,
                     size_bytes: size,
                     description: format!("obj[{}]", group[0].length),
+                    sample_obj_ids: samples,
                 });
             }
         }
@@ -893,13 +909,27 @@ fn aggregate_direct_buffers(
         })
         .collect();
 
+    // Top N by capacity for per-instance ref chain rendering.
+    let mut sorted: Vec<&DirectBufferData> = instances.iter().collect();
+    sorted.sort_by(|a, b| b.capacity.cmp(&a.capacity));
+    let sample_obj_ids: Vec<u64> = sorted.iter().take(20).map(|d| d.obj_id).collect();
+
     eprintln!(
         "DirectByteBuffers: {} instances, {} off-heap capacity",
         total_count,
         total_capacity / (1024 * 1024)
     );
 
-    stats.direct_buffers.set_results(total_count, total_capacity, per_class_entries);
+    stats.direct_buffers.set_results(total_count, total_capacity, per_class_entries, sample_obj_ids);
+}
+
+/// Push an obj_id to a sample list, capping at 50 entries. Used to capture
+/// samples of bad arrays for per-instance reference chain rendering.
+fn push_sample(samples: &Mutex<Vec<u64>>, obj_id: u64) {
+    let mut v = samples.lock().unwrap();
+    if v.len() < 50 {
+        v.push(obj_id);
+    }
 }
 
 /// Check if a primitive array has trailing zero elements (>50% of elements are zero at the tail).
@@ -1917,5 +1947,269 @@ impl LinearScanCoordinator {
 
         eprintln!("OOM local details: {} frames with locals", frame_locals.len());
         frame_locals
+    }
+}
+
+// ============================================================
+// Public field-value resolution API (for the report crate)
+// ============================================================
+//
+// The report crate needs per-object field VALUES at render time to emit
+// `<t-s>` scalar tags inside reference chains. The BFS `TraversalData`
+// only stores the reference graph (parent/parent_edge/field names), not
+// values. This entry point re-parses the HPROF once for a given set of
+// object addresses and decodes their fields — mirroring the OOM-locals
+// path (`extract_oom_local_details`), but as a free function operating
+// over an arbitrary address set.
+
+/// Per-object decoded field values, keyed by object address.
+pub type FieldValueMap = HashMap<u64, DecodedObject>;
+
+/// One object's decoded representation, ready for `<t-c>/<t-f>/<t-s>` rendering.
+#[derive(Debug, Clone)]
+pub struct DecodedObject {
+    /// `java.lang.String`-style class name (dots, not slashes).
+    pub class_name: String,
+    /// For instances: `(field_name, FieldValue)` pairs (walks the class hierarchy).
+    pub fields: Vec<(String, FieldValue)>,
+    /// For object arrays: element class name + element class-name references.
+    pub array_elements: Option<(String, Vec<Option<String>>)>,
+    /// For primitive arrays: display string like `{485, -1, ...}`.
+    pub prim_array_display: Option<String>,
+}
+
+/// Resolved string contents for `String` objects keyed by the String object
+/// address. Populated by [`resolve_field_values`] so the renderer can turn a
+/// `String` reference into a `<t-s>"text"</t-s>` without re-walking the heap.
+pub type StringContentMap = HashMap<u64, String>;
+
+/// Result of resolving field values for a set of objects.
+#[derive(Debug, Default)]
+pub struct ResolvedValues {
+    /// Per-object decoded fields/arrays, keyed by object address.
+    pub objects: FieldValueMap,
+    /// String object address -> resolved text content.
+    pub strings: StringContentMap,
+    /// Address -> class_idx for every instance seen during the scan
+    /// (used to identify String references and other object types).
+    pub addr_to_class_idx: HashMap<u64, u32>,
+}
+
+/// Re-parse the HPROF once and decode fields for the given object addresses.
+///
+/// `obj_addrs` may contain instance, object-array, and primitive-array
+/// addresses. Any `String` instance referenced by a decoded field whose
+/// backing `byte[]`/`char[]` is also in `obj_addrs` has its text content
+/// resolved into `strings`.
+///
+/// Returns an empty [`ResolvedValues`] if the HPROF cannot be opened/parsed.
+pub fn resolve_field_values(
+    heap: &HeapDump,
+    hprof_path: &Path,
+    obj_addrs: &std::collections::HashSet<u64>,
+) -> ResolvedValues {
+    if obj_addrs.is_empty() {
+        return ResolvedValues::default();
+    }
+
+    let file = match std::fs::File::open(hprof_path) {
+        Ok(f) => f,
+        Err(_) => return ResolvedValues::default(),
+    };
+    let mmap = match unsafe { Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(_) => return ResolvedValues::default(),
+    };
+    let data = &mmap[..];
+
+    let hprof = match jvm_hprof::parse_hprof(data) {
+        Ok(h) => h,
+        Err(_) => return ResolvedValues::default(),
+    };
+
+    let id_size = hprof.header().id_size();
+    let id_bytes: usize = match id_size {
+        IdSize::U32 => 4,
+        IdSize::U64 => 8,
+    };
+
+    // Build class_object_id -> class_idx
+    let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::new();
+    for cls in &heap.classes {
+        if cls.class_object_id != 0 {
+            class_obj_to_idx.insert(cls.class_object_id, cls.index);
+        }
+    }
+
+    let string_class_idx = heap.class_by_name.get("java/lang/String").copied();
+
+    // Collect the raw bytes for every requested object in a single pass.
+    let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
+    let mut obj_arrays: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut prim_arrays: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
+    let mut addr_to_class_idx: HashMap<u64, u32> = HashMap::new();
+
+    for record in hprof.records_iter() {
+        let record = match record {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !matches!(record.tag(), RecordTag::HeapDump | RecordTag::HeapDumpSegment) {
+            continue;
+        }
+        let seg = match record.as_heap_dump_segment() {
+            Some(Ok(s)) => s,
+            _ => continue,
+        };
+        for sr in seg.sub_records() {
+            match sr {
+                Ok(heap_dump::SubRecord::Instance(inst)) => {
+                    let obj_id = inst.obj_id().id();
+                    if !obj_addrs.contains(&obj_id) {
+                        continue;
+                    }
+                    let class_idx = class_obj_to_idx
+                        .get(&inst.class_obj_id().id())
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                    if class_idx < heap.classes.len() as u32 {
+                        instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
+                        addr_to_class_idx.insert(obj_id, class_idx);
+                    }
+                }
+                Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
+                    let obj_id = arr.obj_id().id();
+                    if !obj_addrs.contains(&obj_id) {
+                        continue;
+                    }
+                    let mut elems = Vec::new();
+                    for r in arr.elements(id_size) {
+                        let val = match r {
+                            Ok(o) => o.map(|id| id.id()).unwrap_or(0),
+                            Err(_) => 0,
+                        };
+                        if id_bytes == 8 {
+                            elems.extend_from_slice(&val.to_be_bytes());
+                        } else {
+                            elems.extend_from_slice(&(val as u32).to_be_bytes());
+                        }
+                    }
+                    obj_arrays.insert(obj_id, elems);
+                    if let Some(&cidx) = class_obj_to_idx.get(&arr.array_class_obj_id().id()) {
+                        addr_to_class_idx.insert(obj_id, cidx);
+                    }
+                }
+                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
+                    let obj_id = arr.obj_id().id();
+                    if !obj_addrs.contains(&obj_id) {
+                        continue;
+                    }
+                    let prim_type = arr.primitive_type();
+                    let body = extract_prim_raw_body(&arr);
+                    if !body.is_empty() {
+                        prim_arrays.insert(obj_id, (body, prim_type));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Resolve String contents: every String instance whose backing array is
+    // available gets decoded into the strings map.
+    let mut strings: StringContentMap = HashMap::new();
+    if let Some(str_idx) = string_class_idx {
+        for (&addr, (cls_idx, fields)) in &instances {
+            if *cls_idx != str_idx {
+                continue;
+            }
+            let cls = &heap.classes[str_idx as usize];
+            let id_size_enum = if id_bytes == 4 { IdSize::U32 } else { IdSize::U64 };
+            if let Some(text) =
+                extract_string_content_with_body(fields, cls, id_size_enum, &prim_arrays)
+            {
+                strings.insert(addr, text);
+            }
+        }
+    }
+
+    // Decode each object into a DecodedObject.
+    let mut objects: FieldValueMap = HashMap::new();
+
+    // Primitive arrays.
+    for (addr, (body, _prim_type)) in &prim_arrays {
+        let class_name = addr_to_class_idx
+            .get(addr)
+            .and_then(|&idx| heap.classes.get(idx as usize))
+            .map(|c| c.name.replace('/', "."))
+            .unwrap_or_else(|| "primitive[]".to_string());
+        objects.insert(
+            *addr,
+            DecodedObject {
+                class_name,
+                fields: Vec::new(),
+                array_elements: None,
+                prim_array_display: Some(format!("[{} bytes]", body.len())),
+            },
+        );
+    }
+
+    // Object arrays.
+    for (addr, elems) in &obj_arrays {
+        let class_name = addr_to_class_idx
+            .get(addr)
+            .and_then(|&idx| heap.classes.get(idx as usize))
+            .map(|c| c.name.replace('/', "."))
+            .unwrap_or_else(|| "Object[]".to_string());
+        let elem_class = heap
+            .object_to_class_idx
+            .get(addr)
+            .and_then(|&idx| heap.classes.get(idx as usize))
+            .map(|c| c.name.replace('/', "."))
+            .unwrap_or_else(|| "Object".to_string());
+        let elem_refs = read_obj_array_elements(
+            elems,
+            id_bytes,
+            &heap.object_to_class_idx,
+            &heap.classes,
+        );
+        objects.insert(
+            *addr,
+            DecodedObject {
+                class_name,
+                fields: Vec::new(),
+                array_elements: Some((elem_class, elem_refs)),
+                prim_array_display: None,
+            },
+        );
+    }
+
+    // Instances.
+    for (addr, (class_idx, fields)) in &instances {
+        let class_info = &heap.classes[*class_idx as usize];
+        let class_name = class_info.name.replace('/', ".");
+        let decoded = read_all_fields(
+            fields,
+            class_info,
+            id_bytes,
+            &class_obj_to_idx,
+            &heap.classes,
+            &heap.object_to_class_idx,
+        );
+        objects.insert(
+            *addr,
+            DecodedObject {
+                class_name,
+                fields: decoded,
+                array_elements: None,
+                prim_array_display: None,
+            },
+        );
+    }
+
+    ResolvedValues {
+        objects,
+        strings,
+        addr_to_class_idx,
     }
 }

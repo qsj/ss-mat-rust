@@ -15,6 +15,10 @@ pub struct DupStringGroup {
     pub content: String,
     pub count: usize,
     pub wasted_bytes: i64,
+    /// Sample object IDs (HPROF addresses) of String instances in this group.
+    /// Used by the report to render per-instance reference chains. Empty if
+    /// the scanner didn't capture obj IDs.
+    pub sample_obj_ids: Vec<u64>,
 }
 
 /// Thread-safe wrapper for accumulating string dup results.

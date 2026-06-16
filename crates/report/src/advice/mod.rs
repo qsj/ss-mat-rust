@@ -1,3 +1,5 @@
+pub mod types;
+
 pub mod jvm_flags;
 pub mod g1_oom;
 pub mod boxed_number;
@@ -16,3 +18,8 @@ pub mod old_jdk_string;
 pub mod optional;
 pub mod weak_reference;
 pub mod object_header;
+
+pub use types::{
+    Advice, AdviceCategory, AdviceSeverity, Advisor, AdvisorContext,
+    AdvisorRegistry, ProblemReportSet,
+};

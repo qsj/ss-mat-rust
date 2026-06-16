@@ -125,7 +125,8 @@ fn main() -> Result<()> {
         Arc::clone(&heap_arc),
         Arc::clone(&stats_arc),
         heap_dump_path.file_name().and_then(|n| n.to_str()).unwrap_or("heap_dump").to_string(),
-    );
+    )
+    .with_hprof_path(heap_dump_path);
     let html = reporter.generate();
 
     std::fs::write(&report_path, &html)

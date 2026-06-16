@@ -21,6 +21,10 @@ pub struct RefChainGroup {
     pub count: u64,
     /// Random sample descriptions
     pub samples: Vec<String>,
+    /// Object addresses of the sampled objects (parallel to `samples` when
+    /// available), used to render per-object reference chains with field
+    /// values in Section 3. Empty when not collected.
+    pub sample_obj_ids: Vec<u64>,
     /// Chain path from leaf (target class) up toward root
     pub path: Vec<ChainStep>,
 }
