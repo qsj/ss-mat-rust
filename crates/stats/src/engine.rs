@@ -31,6 +31,9 @@ pub struct StatsEngine {
     /// the report can filter to live-only using BFS `visited` (matching Java,
     /// which only counts bad arrays reached during the live traversal).
     pub bad_array_records: Mutex<Vec<crate::problem_types::BadArrayRecord>>,
+    /// Bad collections (EMPTY/SINGLE_ELEM), captured during scan for live-only
+    /// filtering and wasted-capacity summation (Java's processContainer).
+    pub bad_collection_records: Mutex<Vec<crate::problem_types::BadCollectionRecord>>,
     pub jvm_info: JvmInfoCollector,
     pub thread_info: Mutex<Vec<ThreadInfo>>,
     pub oom_frame_locals: Mutex<Vec<FrameLocals>>,
@@ -92,6 +95,7 @@ impl StatsEngine {
             dup_obj_arrays: DupArrayCollector::new(),
             direct_buffers: DirectBufferCollector::new(),
             bad_array_records: Mutex::new(Vec::new()),
+            bad_collection_records: Mutex::new(Vec::new()),
             jvm_info: JvmInfoCollector::new(),
             thread_info: Mutex::new(Vec::new()),
             oom_frame_locals: Mutex::new(Vec::new()),

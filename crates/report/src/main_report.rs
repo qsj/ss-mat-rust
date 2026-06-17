@@ -1209,50 +1209,59 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
     fn section_bad_collections(&mut self, html: &mut HtmlStringBuilder) {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
 
-        // Collect collection/map class stats
-        let collection_classes = [
-            "java/util/HashMap", "java/util/LinkedHashMap", "java/util/Hashtable",
-            "java/util/HashMap$Node", "java/util/LinkedHashMap$Entry",
-            "java/util/concurrent/ConcurrentHashMap", "java/util/concurrent/ConcurrentHashMap$Node",
-            "java/util/TreeMap", "java/util/ArrayList", "java/util/LinkedList",
-            "java/util/Vector", "java/util/HashSet", "java/util/WeakHashMap",
-            "java/util/IdentityHashMap", "java/util/EnumSet", "java/util/BitSet",
-            "java/util/Collections$EmptyList", "java/util/Collections$EmptyMap", "java/util/Collections$EmptySet",
-            "java/util/Collections$SingletonList", "java/util/Collections$SingletonSet",
-        ];
-
-        let mut entries: Vec<(String, u64, i64)> = Vec::new();
-        let mut total_collection_bytes: i64 = 0;
-
-        for class_name in collection_classes {
-            if let Some(&idx) = self.heap.class_by_name.get(class_name) {
-                if let Some(pc) = self.stats.get_per_class(idx) {
-                    let count = pc.instance_count.load(Relaxed);
-                    let bytes = pc.total_instance_bytes.load(Relaxed);
-                    if count > 0 {
-                        total_collection_bytes += bytes;
-                        entries.push((class_name.replace('/', "."), count, bytes));
-                    }
-                }
+        // Java's Bad Collections overhead = wasted capacity of BAD collections
+        // (EMPTY/SINGLE_ELEM/SMALL/SPARSE/MANY_NULLS), reached during the live
+        // traversal. We captured EMPTY/SINGLE_ELEM collections during the scan
+        // (each contributing its full shallow body as waste). Filter to live.
+        let records = self.stats.bad_collection_records.lock().unwrap().clone();
+        let live_ids: std::collections::HashSet<u64> = {
+            let guard = self.stats.traversal_data.lock().unwrap();
+            match guard.as_ref() {
+                Some(data) => data.objects.iter().enumerate()
+                    .filter(|(i, _)| data.visited.get(*i).copied().unwrap_or(false))
+                    .map(|(_, o)| o.obj_id).collect(),
+                None => std::collections::HashSet::new(),
             }
+        };
+
+        // Aggregate live bad-collection waste per class.
+        let mut per_class: std::collections::HashMap<u32, (u64, i64)> = std::collections::HashMap::new();
+        let mut total_collection_bytes: i64 = 0;
+        let mut total_bad_count: u64 = 0;
+        for r in &records {
+            if !live_ids.contains(&r.obj_id) {
+                continue;
+            }
+            let (c, b) = per_class.entry(r.class_idx).or_insert((0, 0));
+            *c += 1;
+            *b += r.waste;
+            total_collection_bytes += r.waste;
+            total_bad_count += 1;
         }
+        let mut entries: Vec<(String, u64, i64)> = per_class.iter()
+            .map(|(&idx, &(c, b))| {
+                let name = self.heap.classes.get(idx as usize)
+                    .map(|c| c.name.replace('/', "."))
+                    .unwrap_or_else(|| "unknown".to_string());
+                (name, c, b)
+            })
+            .collect();
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
 
         let pct = calc_percent(total_collection_bytes, total_bytes);
-        let indicator = if pct >= 5.0 {
-            severity_med(&format!("{} ({:.1}%)", format_bytes(total_collection_bytes), pct))
+        let indicator = if total_collection_bytes > 0 && pct >= 2.0 {
+            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_collection_bytes)))
         } else if total_collection_bytes > 0 {
-            severity_low(&format!("{}", format_bytes(total_collection_bytes)))
+            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_collection_bytes)))
         } else {
             String::new()
         };
 
         self.begin_section(html, "Bad Collections", false, &indicator);
 
-        if !entries.is_empty() {
-            entries.sort_by(|a, b| b.2.cmp(&a.2));
-
+        if total_bad_count > 0 {
             // Summary table
-            html.begin_table(true, 0, &["# instances", "Shallow size", "% of heap", "Class name"]);
+            html.begin_table(true, 0, &["# instances", "Wasted bytes", "% of heap", "Class name"]);
             for (name, count, bytes) in entries.iter().take(30) {
                 html.append_table_row(&[
                     &format_count(*count),

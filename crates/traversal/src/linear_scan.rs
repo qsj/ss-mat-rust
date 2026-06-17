@@ -51,6 +51,7 @@ impl LinearScanCoordinator {
         let mut obj_arrays: Vec<ObjArrayData> = Vec::new();
         let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
         let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
+        let mut bad_collection_records: Vec<BadCollectionRecord> = Vec::new();
         let mut class_obj_ids: HashMap<u64, u32> = HashMap::new();
 
         // Build primitive array body map for String content extraction: obj_id -> (body, elem_type)
@@ -124,6 +125,29 @@ impl LinearScanCoordinator {
                                                 let overhead = shallow - prim_size;
                                                 pc.boxed_number_overhead.fetch_add(overhead, Relaxed);
                                                 pc.total_instance_bytes.fetch_add(shallow, Relaxed);
+                                            }
+                                        } else {
+                                            // Default instance handling + Bad Collections detection.
+                                            let cls = &self.heap.classes[class_idx as usize];
+                                            let header = self.heap.header_size as i64;
+                                            let shallow = (header + cls.instance_size as i64 + 7) & !7;
+                                            if let Some(pc) = self.stats.get_per_class(class_idx) {
+                                                pc.total_instance_bytes.fetch_add(shallow, Relaxed);
+                                                pc.instance_count.fetch_add(1, Relaxed);
+                                            }
+                                            // Bad Collections: Java's processContainer counts EMPTY
+                                            // (size==0) / SINGLE_ELEM (size==1) collections as fully
+                                            // wasted. Match collection classes by name.
+                                            if is_collection_class_name(&cls.name) {
+                                                let fields = inst.fields().to_vec();
+                                                let size = extract_collection_size(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                if size == 0 || size == 1 {
+                                                    bad_collection_records.push(BadCollectionRecord {
+                                                        obj_id: inst.obj_id().id(),
+                                                        class_idx,
+                                                        waste: shallow,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -373,6 +397,7 @@ impl LinearScanCoordinator {
         aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
         // Stash all bad-array records (live+garbage) for later live-only filtering.
         *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
+        *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
 
         // Duplicate primitive arrays detection
         detect_duplicate_prim_arrays(&prim_arrays, &self.heap.classes, &self.stats, self.heap.header_size as i64);
@@ -414,6 +439,70 @@ struct DirectBufferData {
 // Re-export the bad-array record type from stats (defined there to avoid a
 // stats -> traversal dependency cycle).
 pub use ss_stats::problem_types::BadArrayRecord;
+pub use ss_stats::problem_types::BadCollectionRecord;
+
+/// Whether a class name is a Java collection/map we should size-check for the
+/// Bad Collections overhead (Java's ContainerInstance subclasses mirror this).
+/// Checked by name because ClassCategory::Collection is not reliably assigned.
+fn is_collection_class_name(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "java/util/HashMap", "java/util/LinkedHashMap", "java/util/Hashtable",
+        "java/util/concurrent/ConcurrentHashMap",
+        "java/util/TreeMap", "java/util/TreeMap$Entry",
+        "java/util/EnumMap",
+        "java/util/ArrayList", "java/util/LinkedList", "java/util/Vector",
+        "java/util/HashSet", "java/util/LinkedHashSet", "java/util/TreeSet",
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "java/util/concurrent/ConcurrentSkipListMap",
+        "java/util/concurrent/ConcurrentSkipListSet",
+    ];
+    NAMES.iter().any(|n| name == *n)
+}
+
+/// Read the `size` int field of a Collection (HashMap/ArrayList/etc.),
+/// walking the class hierarchy. Returns -1 if absent (not a sized collection).
+/// Used to classify collections as EMPTY (size==0) / SINGLE_ELEM (size==1) for
+/// the Bad Collections overhead, matching Java's processContainer.
+fn extract_collection_size(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+) -> i32 {
+    let mut offset = 0usize;
+    let mut current_id = class_info.class_object_id;
+    let id_size = current_id_size();
+
+    loop {
+        let cls = if current_id == class_info.class_object_id {
+            Some(class_info)
+        } else {
+            class_by_address.get(&current_id).and_then(|&idx| all_classes.get(idx as usize))
+        };
+        if let Some(cls) = cls {
+            for fd in &cls.instance_fields {
+                if fd.name.as_ref() == "size" && fd.type_code == 10 {
+                    // type_code 10 = int (4 bytes)
+                    if offset + 4 <= fields.len() {
+                        return i32::from_be_bytes([
+                            fields[offset], fields[offset+1], fields[offset+2], fields[offset+3],
+                        ]);
+                    }
+                    return -1;
+                }
+                offset += field_type_size(fd.type_code, id_size);
+            }
+            if cls.super_class_id != 0 {
+                current_id = cls.super_class_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    -1
+}
 
 struct PrimArrayData {
     class_idx: u32,

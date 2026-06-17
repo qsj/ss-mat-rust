@@ -52,3 +52,12 @@ pub struct BadArrayRecord {
     pub kind: u8,
     pub size: i64,
 }
+
+/// One bad collection (EMPTY/SINGLE_ELEM) record, captured during the scan
+/// so the report can filter to live-only and sum the wasted capacity.
+#[derive(Clone)]
+pub struct BadCollectionRecord {
+    pub obj_id: u64,
+    pub class_idx: u32,
+    pub waste: i64,
+}
