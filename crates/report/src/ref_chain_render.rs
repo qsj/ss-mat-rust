@@ -99,21 +99,21 @@ fn format_field_value_simple(val: &FieldValue) -> String {
         FieldValue::Reference(None) => "<t-s>null</t-s>".to_string(),
         // Plain class display name, no <t-c> tag (matches Java line 173).
         FieldValue::Reference(Some(c)) => c.clone(),
-        FieldValue::Boolean(v) => format!("<t-s>{}</t-s>", v),
-        FieldValue::Byte(v) => format!("<t-s>{}</t-s>", v),
+        FieldValue::Boolean(v) => crate::encoded_strings::scalar_tag(&v.to_string()),
+        FieldValue::Byte(v) => crate::encoded_strings::scalar_tag(&v.to_string()),
         FieldValue::Char(v) => {
             let ch = char::from_u32(*v as u32).unwrap_or('?');
             if *v >= 0x20 && *v < 0x7f {
-                format!("<t-s>'{}'</t-s>", ch)
+                crate::encoded_strings::scalar_tag(&format!("'{}'", ch))
             } else {
-                format!("<t-s>\\u{:04x}</t-s>", v)
+                crate::encoded_strings::scalar_tag(&format!("\\u{:04x}", v))
             }
         }
-        FieldValue::Short(v) => format!("<t-s>{}</t-s>", v),
-        FieldValue::Int(v) => format!("<t-s>{}</t-s>", v),
-        FieldValue::Long(v) => format!("<t-s>{}</t-s>", v),
-        FieldValue::Float(bits) => format!("<t-s>{}</t-s>", f32::from_bits(*bits)),
-        FieldValue::Double(bits) => format!("<t-s>{}</t-s>", f64::from_bits(*bits)),
+        FieldValue::Short(v) => crate::encoded_strings::scalar_tag(&v.to_string()),
+        FieldValue::Int(v) => crate::encoded_strings::scalar_tag(&v.to_string()),
+        FieldValue::Long(v) => crate::encoded_strings::scalar_tag(&v.to_string()),
+        FieldValue::Float(bits) => crate::encoded_strings::scalar_tag(&f32::from_bits(*bits).to_string()),
+        FieldValue::Double(bits) => crate::encoded_strings::scalar_tag(&f64::from_bits(*bits).to_string()),
     }
 }
 
@@ -225,6 +225,10 @@ impl<'a> RefChainRenderer<'a> {
     pub fn render_problem_list(&self, input: RefChainRenderInput<'_>) -> String {
         let mut html = String::with_capacity(4096);
 
+        // Encoding is only active while rendering chain bodies (matches
+        // Java's htmlMode toggle around renderProblemChainsInto).
+        crate::encoded_strings::set_html_mode(true);
+
         // Optional sub-section header + two-tier fold wrapper, mirroring
         // Java's "Reference Chains for X" → Full reference chains structure.
         if let Some(sub) = &input.sec_sub_title {
@@ -232,7 +236,13 @@ impl<'a> RefChainRenderer<'a> {
                 "<br><font class=\"SecHdr\">{}</font><br>\n",
                 sub,
             ));
-            html.push_str("<details><summary>Full reference chains</summary><br>\n");
+            // Allocate an sd id for the full-chains fold so its encoded
+            // placeholders decode on toggle.
+            let sd_id = crate::encoded_strings::next_sd_id();
+            html.push_str(&format!(
+                "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary><br>\n",
+                sd_id, sd_id,
+            ));
         }
 
         let total_pct = calc_percent(input.size_bytes, input.total_bytes);
@@ -309,6 +319,10 @@ impl<'a> RefChainRenderer<'a> {
         if input.sec_sub_title.is_some() {
             html.push_str("</details>\n");
         }
+
+        // Done rendering chain bodies — disable encoding so other sections
+        // emit literal tags.
+        crate::encoded_strings::set_html_mode(false);
         html
     }
 
@@ -339,14 +353,18 @@ impl<'a> RefChainRenderer<'a> {
             // fields render their value's class name WITHOUT a redundant
             // `<t-c>` wrapper (matching Java line 173/181).
             let mut step = format!(
-                "&nwarr;<t-c>{}</t-c><t-f>.{}</t-f>",
-                class_name, field_name,
+                "&nwarr;{}<t-f>.{}</t-f>",
+                crate::encoded_strings::class_tag(&class_name), field_name,
             );
             if let Some(rv) = self.resolved_values {
                 if let Some(dec) = rv.objects.get(&parent_obj.obj_id) {
                     let body = render_decoded_object_body(dec, parent_obj.obj_id, rv);
                     if !body.is_empty() {
-                        step.push_str(&format!("&nbsp;<t-c>{}</t-c>{}", dec.class_name, body));
+                        step.push_str(&format!(
+                            "&nbsp;{}{}",
+                            crate::encoded_strings::class_tag(&dec.class_name),
+                            body,
+                        ));
                     }
                 }
             }
@@ -375,10 +393,18 @@ fn get_class_display(class_idx: u32, heap: &HeapDump) -> String {
 
 /// Render reference chains for a single class as HTML.
 pub fn render_class_ref_chains(chains: &ClassRefChains, total_bytes: i64) -> String {
+    // Encoding is active while rendering class chain paths (matches Java's
+    // htmlMode around renderMemoryByClass chain rendering).
+    crate::encoded_strings::set_html_mode(true);
+
     let mut html = String::new();
 
     if !chains.expensive_fields.is_empty() {
-        html.push_str("<details><summary>Expensive data fields</summary><br><div>");
+        let sd_id = crate::encoded_strings::next_sd_id();
+        html.push_str(&format!(
+            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Expensive data fields</summary><br><div>",
+            sd_id, sd_id,
+        ));
         html.push_str(&render_chain_groups(&chains.expensive_fields, total_bytes));
         html.push_str("</div></details>");
     }
@@ -387,11 +413,16 @@ pub fn render_class_ref_chains(chains: &ClassRefChains, total_bytes: i64) -> Str
         if !html.is_empty() {
             html.push_str("<br>");
         }
-        html.push_str("<details><summary>Full reference chains</summary><br><div>");
+        let sd_id = crate::encoded_strings::next_sd_id();
+        html.push_str(&format!(
+            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary><br><div>",
+            sd_id, sd_id,
+        ));
         html.push_str(&render_chain_groups(&chains.full_chains, total_bytes));
         html.push_str("</div></details>");
     }
 
+    crate::encoded_strings::set_html_mode(false);
     html
 }
 
@@ -415,9 +446,9 @@ pub fn render_chain_groups(groups: &[ss_stats::ref_chain::RefChainGroup], total_
         let path_strs: Vec<String> = group.path.iter().map(|step| {
             match step {
                 ChainStep::Field { class_name, field_name } =>
-                    format!("&nwarr;<t-c>{}</t-c><t-f>.{}</t-f>", class_name, field_name),
+                    format!("&nwarr;{}<t-f>.{}</t-f>", crate::encoded_strings::class_tag(class_name), field_name),
                 ChainStep::ArrayElement { class_name } =>
-                    format!("&nwarr;<t-c>{}</t-c>[...]", class_name),
+                    format!("&nwarr;{}[...]", crate::encoded_strings::class_tag(class_name)),
                 ChainStep::Root { description } =>
                     format!("&nwarr;{}", description),
             }
@@ -557,8 +588,8 @@ pub fn render_tree_node(node: &GcRootTreeNode, total_bytes: i64) -> String {
             ));
         } else {
             html.push_str(&format!(
-                "<li><t-c>{}</t-c>&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</li>\n",
-                node.class_name,
+                "<li>{}&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</li>\n",
+                crate::encoded_strings::class_tag(&node.class_name),
                 format_bytes(node.retained_bytes),
                 format_percent(retained_pct),
                 format_bytes(node.self_bytes),
@@ -577,8 +608,8 @@ pub fn render_tree_node(node: &GcRootTreeNode, total_bytes: i64) -> String {
             ));
         } else {
             html.push_str(&format!(
-                "<li><label><t-c>{}</t-c>&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</label><input type=\"checkbox\" checked><ol>\n",
-                node.class_name,
+                "<li><label>{}&nbsp;&searr;{}&nbsp;({}),&nbsp;self&nbsp;{}&nbsp;({}),&nbsp;{}&nbsp;object(s)</label><input type=\"checkbox\" checked><ol>\n",
+                crate::encoded_strings::class_tag(&node.class_name),
                 format_bytes(node.retained_bytes),
                 format_percent(retained_pct),
                 format_bytes(node.self_bytes),

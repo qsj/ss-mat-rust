@@ -71,7 +71,12 @@ var curModal;
 function openModal(mid,ev,nl){var m=document.getElementById(mid);curModal=m;var y=ev.clientY+20;var ys=nl*15+90;if(y+ys>window.innerHeight)y=window.innerHeight-ys;if(y<0)y=0;m.style.paddingTop=y+'px';m.style.display='block'}
 function closeModal(mid){document.getElementById(mid).style.display='none'}
 window.onclick=function(e){if(e.target==curModal)curModal.style.display='none'};
-function sortTable(tid,col){var t=document.getElementById('Table-'+tid),sw=true,dir='desc',sc=0;while(sw){sw=false;var rows=t.rows;for(var i=1;i<rows.length-2;i+=2){var s=false,xs=rows[i].getElementsByTagName('TD')[col].innerText,ys=rows[i+2].getElementsByTagName('TD')[col].innerText;var x=parseInt(xs.replace(/,/g,'')),y=parseInt(ys.replace(/,/g,''));if(xs.indexOf('Kb')!=-1)x*=1024;if(ys.indexOf('Kb')!=-1)y*=1024;if(isNaN(x))x=0;if(isNaN(y))y=0;if(dir=='asc'){if(x>y){s=true;break}}else{if(x<y){s=true;break}}}}if(s){rows[i].parentNode.insertBefore(rows[i+2],rows[i]);rows[i+1].parentNode.insertBefore(rows[i+3],rows[i+1]);sw=true;sc++}else if(sc==0&&dir=='asc'){dir='desc';sw=true}}}}"#;
+function sortTable(tid,col){var t=document.getElementById('Table-'+tid),sw=true,dir='desc',sc=0;while(sw){sw=false;var rows=t.rows;for(var i=1;i<rows.length-2;i+=2){var s=false,xs=rows[i].getElementsByTagName('TD')[col].innerText,ys=rows[i+2].getElementsByTagName('TD')[col].innerText;var x=parseInt(xs.replace(/,/g,'')),y=parseInt(ys.replace(/,/g,''));if(xs.indexOf('Kb')!=-1)x*=1024;if(ys.indexOf('Kb')!=-1)y*=1024;if(isNaN(x))x=0;if(isNaN(y))y=0;if(dir=='asc'){if(x>y){s=true;break}}else{if(x<y){s=true;break}}}}if(s){rows[i].parentNode.insertBefore(rows[i+2],rows[i]);rows[i+1].parentNode.insertBefore(rows[i+3],rows[i+1]);sw=true;sc++}else if(sc==0&&dir=='asc'){dir='desc';sw=true}}}}
+var ENCODED_STRINGS=[****INSERT_ENCODED_STR_LIST_HERE***];
+var ESP="|*/",ESS="|",ESC='c',ESSC='s';
+function replEncStrs(id){var el=document.getElementById('sd-'+id);rplRec(el)}
+function rplRec(el){var ch=el.children;for(var i=0;i<ch.length;i++){rplEl(ch[i]);rplRec(ch[i])}}
+function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1){rt+=t.substring(si,pi);var ni=pi+3,st=0,nc=t.charAt(ni);if(nc==ESC)st=1;else if(nc==ESSC)st=2;if(st==0){si=ni;rt+=t.substring(pi,ni);pi=t.indexOf(ESP,si);continue}var nei=t.indexOf(ESS,ni+1);if(nei!=-1&&nei-ni<=7){var ns=t.substring(ni+1,nei),n=parseInt(ns);if(!isNaN(n)&&n>=0&&n<=ENCODED_STRINGS.length){var s=ENCODED_STRINGS[n];rt+=(st==1?'<t-c>'+s+'</t-c>':'<t-s>'+s+'</t-s>')}else{rt+=t.substring(pi,nei+1)}si=nei+1}else{si=ni;rt+=t.substring(pi,ni)}pi=t.indexOf(ESP,si)}if(rt.length!=0){rt+=t.substring(si);el.innerHTML=rt}}"#;
 
 /// HTML string builder matching the Java JXRay report format.
 /// Provides formatting, tables, reference chain rendering, and modal dialogs.
@@ -397,7 +402,11 @@ impl HtmlStringBuilder {
         header.push_str("</title>\n<style>\n");
         header.push_str(CSS);
         header.push_str("\n</style>\n<script>\n");
-        header.push_str(JS);
+        let js_with_strings = JS.replace(
+            "****INSERT_ENCODED_STR_LIST_HERE***",
+            &crate::encoded_strings::take_array_js(),
+        );
+        header.push_str(&js_with_strings);
         header.push_str("\n</script>\n</head>\n<body>\n<div class=\"container\">\n");
         header.push_str(&format!(
             "<header class=\"report-header\"><h1>SS-Mat {}Heap Dump Report</h1><div class=\"meta\">{}<br>{} &middot; JVM {}</div></header>\n",

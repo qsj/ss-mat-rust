@@ -388,6 +388,16 @@ impl MainReportGenerator {
         doc.push_str(include_str!("../css_report.txt"));
         doc.push_str("\n</style>\n<script>\n");
         doc.push_str(include_str!("../js_report.txt"));
+        // Append encoded-string dedup decoder + the populated ENCODED_STRINGS
+        // array (strings collected during reference-chain rendering). Matches
+        // Java's HtmlStringBuilder head block.
+        doc.push_str("\nvar ENCODED_STRINGS=[");
+        doc.push_str(&crate::encoded_strings::take_array_js());
+        doc.push_str("];\n");
+        doc.push_str(r#"var ESP="|*/",ESS="|",ESC='c',ESSC='s';
+function replEncStrs(id){var el=document.getElementById('sd-'+id);rplRec(el)}
+function rplRec(el){var ch=el.children;for(var i=0;i<ch.length;i++){rplEl(ch[i]);rplRec(ch[i])}}
+function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1){rt+=t.substring(si,pi);var ni=pi+3,st=0,nc=t.charAt(ni);if(nc==ESC)st=1;else if(nc==ESSC)st=2;if(st==0){si=ni;rt+=t.substring(pi,ni);pi=t.indexOf(ESP,si);continue}var nei=t.indexOf(ESS,ni+1);if(nei!=-1&&nei-ni<=7){var ns=t.substring(ni+1,nei),n=parseInt(ns);if(!isNaN(n)&&n>=0&&n<=ENCODED_STRINGS.length){var s=ENCODED_STRINGS[n];rt+=(st==1?'<t-c>'+s+'</t-c>':'<t-s>'+s+'</t-s>')}else{rt+=t.substring(pi,nei+1)}si=nei+1}else{si=ni;rt+=t.substring(pi,ni)}pi=t.indexOf(ESP,si)}if(rt.length!=0){rt+=t.substring(si);el.innerHTML=rt}}"#);
         doc.push_str("\n</script>\n</head>\n<body>\n<div class=\"container\">\n");
         // Format timestamp and JVM version for header
         let date_str = if self.heap.timestamp_millis > 0 {
