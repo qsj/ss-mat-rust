@@ -633,12 +633,14 @@ fn classify_class(name: &str) -> ClassCategory {
         || name == "java/lang/ThreadGroup$"
     {
         ClassCategory::ThreadGroup
-    } else if name == "java/nio/DirectByteBuffer" || name == "java/nio/DirectIntBufferU"
-        || name == "java/nio/DirectLongBufferU" || name == "java/nio/DirectFloatBufferU"
-        || name == "java/nio/DirectDoubleBufferU" || name == "java/nio/DirectShortBufferU"
-        || name == "java/nio/DirectByteBufferR"
-        || name == "java/nio/DirectCharBufferU" || name == "java/nio/DirectCharBufferS"
+    } else if name == "java/nio/DirectByteBuffer" || name == "java/nio/DirectByteBufferR"
     {
+        // Match Java's ClassCategory.DIRECT_BB exactly: only the two buffer
+        // classes that hold native memory. Typed views (DirectLongBufferU,
+        // DirectIntBufferU, DirectCharBufferU/S, DirectFloatBufferU,
+        // DirectDoubleBufferU, DirectShortBufferU) are NOT counted — they
+        // share the underlying buffer's native memory and are excluded by
+        // JavaClassInfo.java.
         ClassCategory::DirectByteBuffer
     } else {
         ClassCategory::Other

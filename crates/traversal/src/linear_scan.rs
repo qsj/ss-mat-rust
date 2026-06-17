@@ -92,6 +92,15 @@ impl LinearScanCoordinator {
                                             let cls = &self.heap.classes[class_idx as usize];
                                             let capacity = extract_capacity_field(&fields, cls, &class_obj_ids, &self.heap.classes);
                                             let address = extract_address_field(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                            // Java analyzeBuffer lines 73-78: skip buffers whose
+                                            // `fd` or `att` field is a NON-NULL reference (these
+                                            // wrap a FileDescriptor/attachment, not pure off-heap
+                                            // memory). Read the reference value and skip if set.
+                                            if ref_field_nonnull(&fields, cls, "fd", &class_obj_ids, &self.heap.classes)
+                                                || ref_field_nonnull(&fields, cls, "att", &class_obj_ids, &self.heap.classes)
+                                            {
+                                                continue;
+                                            }
                                             if let Some(pc) = self.stats.get_per_class(class_idx) {
                                                 let header = self.heap.header_size as i64;
                                                 let shallow = (header + cls.instance_size as i64 + 7) & !7;
@@ -959,6 +968,51 @@ fn current_id_size() -> usize {
 
 thread_local! {
     static ID_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(8) };
+}
+
+/// Whether the object-reference field named `name` is non-null in this
+/// instance. Used to skip DirectByteBuffers whose `fd`/`att` is set (Java
+/// analyzeBuffer lines 73-78). Walks the class hierarchy to locate the field,
+/// reads the raw id bytes, and returns true only if they are non-zero.
+fn ref_field_nonnull(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    name: &str,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+) -> bool {
+    let mut offset = 0usize;
+    let mut current_id = class_info.class_object_id;
+    let id_size = current_id_size();
+
+    loop {
+        let cls = if current_id == class_info.class_object_id {
+            Some(class_info)
+        } else {
+            class_by_address.get(&current_id).and_then(|&idx| all_classes.get(idx as usize))
+        };
+        if let Some(cls) = cls {
+            for fd in &cls.instance_fields {
+                if fd.name.as_ref() == name && fd.type_code == 2 {
+                    // Object reference — read id_size bytes big-endian.
+                    if offset + id_size <= fields.len() {
+                        let raw = read_be_u64_id(fields, offset, id_size).unwrap_or(0);
+                        return raw != 0;
+                    }
+                    return false;
+                }
+                offset += field_type_size(fd.type_code, id_size);
+            }
+            if cls.super_class_id != 0 {
+                current_id = cls.super_class_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 fn read_be_u64_id(fields: &[u8], offset: usize, id_size: usize) -> Option<u64> {
