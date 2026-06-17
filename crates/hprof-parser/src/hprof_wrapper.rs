@@ -532,30 +532,29 @@ impl<'a> HeapDumpBuilder<'a> {
             thread_serial_map.len()
         );
 
-        // Determine oop_size and header_size.
-        // If heap info was parsed (heapOopSize found), use it directly.
-        // Otherwise, validate by checking object address overlap with different size assumptions.
-        // This matches Java's HprofDumpReader.buildHeapDump() logic.
-        let (oop_size, header_size) = if let Some(info) = &self.heap_info {
-            let oop = info.oop_size;
-            let hdr = if oop == 8 { 16u8 } else { 12u8 };
-            eprintln!("  Heap info: oop_size={}, header_size={}", oop, hdr);
-            (oop, hdr)
-        } else if identifier_size == 4 {
+        // Determine oop_size (reference size) and header_size.
+        //
+        // CRITICAL: the HPROF "Heap Info" record's heapOopSize reports the
+        // *native machine word size* (8 on 64-bit), NOT the compressed-oop
+        // size. For HotSpot JVMs with a heap < 32GB, compressed oops are in
+        // use and the effective reference size is 4. Java derives refSize by
+        // validating object-address overlap (HprofDumpReader.validatePointer
+        // Sizes), not by trusting heapOopSize.
+        //
+        // So regardless of whether heap info is present, on a 64-bit dump we
+        // run the same overlap validation: try (8,16); if objects would
+        // overlap, fall back to compressed (4,12).
+        let (oop_size, header_size) = if identifier_size == 4 {
             // 32-bit JVM
             eprintln!("  32-bit JVM: oop_size=4, header_size=8");
             (4u8, 8u8)
         } else {
-            // 64-bit JVM, no heap info — validate using object address overlap.
+            // 64-bit JVM — validate using object address overlap.
             // Collect sorted object addresses and check whether objects would overlap
             // with different (refSize, headerSize) assumptions.
-            // Java's approach: try (8,16), if overlap → try (4,12).
             let mut addrs: Vec<u64> = self.address_to_index.keys().copied().collect();
             addrs.sort_unstable();
 
-            // For each address, estimate minimum object size given headerSize.
-            // A typical small object: header + 0..8 bytes instance data = 16 or 24 bytes.
-            // The key check: does the next address fall within the current object?
             let validate = |hdr_size: u8| -> bool {
                 let mut prev_end: u64 = 0;
                 let mut checked: u32 = 0;
@@ -563,7 +562,6 @@ impl<'a> HeapDumpBuilder<'a> {
                     if checked > 0 && addr < prev_end {
                         return false; // overlap
                     }
-                    // Minimum aligned size with this header
                     let min_size = ((hdr_size as u64 + 8) + 7) & !7;
                     prev_end = addr + min_size;
                     checked += 1;
@@ -572,9 +570,13 @@ impl<'a> HeapDumpBuilder<'a> {
                 true
             };
 
+            if let Some(info) = &self.heap_info {
+                eprintln!("  Heap info record: heapOopSize={} (native word size, not refSize)", info.oop_size);
+            }
+
             // Try: headerSize=16 (implies refSize=8, no compressed oops)
             if validate(16) {
-                eprintln!("  64-bit JVM: oop_size=8, header_size=16");
+                eprintln!("  64-bit JVM: oop_size=8, header_size=16 (no compressed oops)");
                 (8u8, 16u8)
             } else {
                 eprintln!("  64-bit JVM (compressed oops): oop_size=4, header_size=12");
