@@ -8,17 +8,19 @@ pub fn format_kb(bytes: i64) -> String {
 }
 
 /// Format byte sizes with KB/MB/GB units.
+///
+/// Note: to keep cross-tool comparisons easy, the report uses KB throughout
+/// for values under 1 GB (e.g. `96,927KB`), matching Java's SizeFormatter.
+/// Only values ≥ 1 GB fall back to a `GB` suffix.
 pub fn format_bytes(bytes: i64) -> String {
     const KB: i64 = 1024;
-    const MB: i64 = 1024 * KB;
-    const GB: i64 = 1024 * MB;
+    const GB: i64 = 1024 * 1024 * 1024;
 
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
     } else if bytes >= KB {
-        format!("{:.0}Kb", bytes as f64 / KB as f64)
+        // KB with thousands separators, Java style: "96,927KB"
+        format!("{}KB", format_count((bytes / KB) as u64))
     } else {
         format!("{} bytes", bytes)
     }

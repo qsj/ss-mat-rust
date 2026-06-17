@@ -41,6 +41,9 @@ impl LinearScanCoordinator {
             .map_err(|e| anyhow::anyhow!("Failed to re-parse HPROF: {:?}", e))?;
 
         let id_size = hprof.header().id_size();
+        // Publish the id size so the DirectBuffer field readers can decode
+        // address/long fields with the correct width.
+        ID_SIZE.with(|c| c.set(match id_size { IdSize::U32 => 4, IdSize::U64 => 8 }));
 
         // Collect all instance and array data in a single pass
         let mut string_instances: Vec<StringInstanceData> = Vec::new();
@@ -88,6 +91,7 @@ impl LinearScanCoordinator {
                                             let fields = inst.fields().to_vec();
                                             let cls = &self.heap.classes[class_idx as usize];
                                             let capacity = extract_capacity_field(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                            let address = extract_address_field(&fields, cls, &class_obj_ids, &self.heap.classes);
                                             if let Some(pc) = self.stats.get_per_class(class_idx) {
                                                 let header = self.heap.header_size as i64;
                                                 let shallow = (header + cls.instance_size as i64 + 7) & !7;
@@ -98,6 +102,7 @@ impl LinearScanCoordinator {
                                                 class_idx,
                                                 obj_id: inst.obj_id().id(),
                                                 capacity,
+                                                address,
                                             });
                                         } else if cat == ClassCategory::BoxedNumber {
                                             // Accumulate boxed number overhead
@@ -372,6 +377,10 @@ struct DirectBufferData {
     class_idx: u32,
     obj_id: u64,
     capacity: i32,
+    /// Native memory address (the `address` field value). Used to dedup
+    /// DirectByteBufferR views that point at the same native block as their
+    /// underlying DirectByteBuffer (mirrors Java's `seenAddresses`).
+    address: u64,
 }
 
 struct PrimArrayData {
@@ -873,22 +882,135 @@ fn extract_capacity_field(
     0
 }
 
+/// Read the `address` field of a DirectByteBuffer (a long), walking the class
+/// hierarchy. Returns 0 if absent. Mirrors Java's `addressFieldIndex` lookup.
+fn extract_address_field(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+) -> u64 {
+    let mut offset = 0usize;
+    let mut current_id = class_info.class_object_id;
+    let id_size = current_id_size();
+
+    loop {
+        let cls = if current_id == class_info.class_object_id {
+            Some(class_info)
+        } else {
+            class_by_address.get(&current_id).and_then(|&idx| all_classes.get(idx as usize))
+        };
+        if let Some(cls) = cls {
+            for fd in &cls.instance_fields {
+                // `address` is stored as an 8-byte long. On JDK 17 it shows up
+                // as HPROF type_code 11 (8-byte), on older JDKs as 7. Accept
+                // either; both are 8 bytes wide per field_type_size.
+                if fd.name.as_ref() == "address" && (fd.type_code == 11 || fd.type_code == 7) {
+                    return read_be_u64_id(fields, offset, 8).unwrap_or(0);
+                }
+                offset += field_type_size(fd.type_code, id_size);
+            }
+            if cls.super_class_id != 0 {
+                current_id = cls.super_class_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    0
+}
+
+/// Whether the instance declares a field named `name`. Used to skip
+/// DirectByteBuffers carrying `fd`/`att` (Java analyzeBuffer lines 73-78).
+fn has_field(
+    class_info: &JavaClassInfo,
+    name: &str,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+) -> bool {
+    let mut current_id = class_info.class_object_id;
+    loop {
+        let cls = if current_id == class_info.class_object_id {
+            Some(class_info)
+        } else {
+            class_by_address.get(&current_id).and_then(|&idx| all_classes.get(idx as usize))
+        };
+        if let Some(cls) = cls {
+            if cls.instance_fields.iter().any(|fd| fd.name.as_ref() == name) {
+                return true;
+            }
+            if cls.super_class_id != 0 {
+                current_id = cls.super_class_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn current_id_size() -> usize {
+    ID_SIZE.with(|c| c.get())
+}
+
+thread_local! {
+    static ID_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(8) };
+}
+
+fn read_be_u64_id(fields: &[u8], offset: usize, id_size: usize) -> Option<u64> {
+    if id_size == 8 && offset + 8 <= fields.len() {
+        Some(u64::from_be_bytes([
+            fields[offset], fields[offset+1], fields[offset+2], fields[offset+3],
+            fields[offset+4], fields[offset+5], fields[offset+6], fields[offset+7],
+        ]))
+    } else if offset + 4 <= fields.len() {
+        Some(u32::from_be_bytes([fields[offset], fields[offset+1], fields[offset+2], fields[offset+3]]) as u64)
+    } else {
+        None
+    }
+}
+
 fn aggregate_direct_buffers(
     instances: &[DirectBufferData],
     classes: &[JavaClassInfo],
     stats: &StatsEngine,
 ) {
-    use std::collections::HashMap as StdMap;
+    use std::collections::{HashMap as StdMap, HashSet};
     let mut per_class: StdMap<u32, (usize, i64)> = StdMap::new(); // class_idx -> (count, total_capacity)
     let mut total_count: usize = 0;
     let mut total_capacity: i64 = 0;
+    // Dedup by native address: a DirectByteBufferR view points at the same
+    // native block as its underlying DirectByteBuffer. Only the first buffer
+    // for each address contributes capacity (mirrors Java's seenAddresses).
+    let mut seen_addresses: HashSet<u64> = HashSet::new();
+    // Per-buffer deduped records for reachable/unreachable splitting later.
+    let mut buffer_records: Vec<ss_stats::direct_buffer::DirectBufferRecord> = Vec::new();
 
     for inst in instances {
         total_count += 1;
-        total_capacity += inst.capacity as i64;
-        let (count, cap) = per_class.entry(inst.class_idx).or_insert((0, 0));
+        // If this buffer shares an address with one already counted, skip it.
+        let mut cap = inst.capacity as i64;
+        if inst.address != 0 && !seen_addresses.insert(inst.address) {
+            cap = 0;
+        }
+        total_capacity += cap;
+        let (count, total) = per_class.entry(inst.class_idx).or_insert((0, 0));
         *count += 1;
-        *cap += inst.capacity as i64;
+        *total += cap;
+        let class_name = if (inst.class_idx as usize) < classes.len() {
+            classes[inst.class_idx as usize].name.replace('/', ".")
+        } else {
+            "unknown".to_string()
+        };
+        buffer_records.push(ss_stats::direct_buffer::DirectBufferRecord {
+            obj_id: inst.obj_id,
+            capacity: cap,
+            class_name,
+        });
     }
 
     if total_count == 0 { return; }
@@ -915,12 +1037,19 @@ fn aggregate_direct_buffers(
     let sample_obj_ids: Vec<u64> = sorted.iter().take(20).map(|d| d.obj_id).collect();
 
     eprintln!(
-        "DirectByteBuffers: {} instances, {} off-heap capacity",
+        "DirectByteBuffers: {} instances, {} off-heap capacity, {} distinct addresses",
         total_count,
-        total_capacity / (1024 * 1024)
+        total_capacity / (1024 * 1024),
+        seen_addresses.len(),
     );
 
-    stats.direct_buffers.set_results(total_count, total_capacity, per_class_entries, sample_obj_ids);
+    stats.direct_buffers.set_results(
+        total_count,
+        total_capacity,
+        per_class_entries,
+        sample_obj_ids,
+        buffer_records,
+    );
 }
 
 /// Push an obj_id to a sample list, capping at 50 entries. Used to capture

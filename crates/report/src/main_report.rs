@@ -2078,12 +2078,33 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         );
 
         if report.total_count > 0 {
-            html.begin_table(true, 5, &["Total DirectByteBuffers", "Total off-heap capacity"]);
+            // Split reachable/unreachable via BFS `visited`. Buffers not
+            // reachable from any GC root are "unreachable" (garbage) and are
+            // the actionable subset Java highlights (e.g. 94,786KB / 53.2%).
+            let unreachable_capacity = self.compute_unreachable_dbb_capacity(&report);
+            let reachable_capacity = report.total_capacity - unreachable_capacity;
+
+            html.begin_table(true, 0, &["# objects", "Total capacity", "Total size"]);
             html.append_table_row(&[
                 &format_count(report.total_count as u64),
-                &format_bytes(report.total_capacity),
+                &format_with_percent(reachable_capacity, total_heap),
+                &format_with_percent(report.total_capacity, total_heap),
             ]);
             html.end_table();
+
+            // Unreachable (garbage) DirectByteBuffers — the easy-to-fix subset.
+            if unreachable_capacity > 0 {
+                let pct = calc_percent(unreachable_capacity, total_heap);
+                let sev = if pct >= 5.0 { severity_high } else if pct >= 2.0 { severity_med } else { severity_low };
+                html.append_raw(&format!(
+                    "<details><summary>{}</summary><div><table class=\"dt\"><br>\
+                     <tr class=\"C_02\"><td class=\"TAL\">DirectByteBuffer objects that are unreachable \
+                     (garbage) but still hold native (off-heap) memory: <b>{}</b> &nbsp;({:.1}% of used heap)</td></tr>\
+                     </table></div></details><br>",
+                    sev(&format!("unreachable DirectByteBuffers holding off-heap memory. Overhead: {} ({:.1}% of heap).", format_bytes(unreachable_capacity), pct)),
+                    format_bytes(unreachable_capacity), pct,
+                ));
+            }
 
             if !report.per_class.is_empty() {
                 html.append_raw("<details><summary>Per-type breakdown</summary><div class=\"scroll-wrap\">");
@@ -2727,6 +2748,39 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 html.append_raw("</div></details>");
             }
         }
+    }
+
+    /// Sum the off-heap capacity of DirectByteBuffers that are NOT reachable
+    /// from any GC root (i.e. garbage), using BFS `visited`. Returns 0 when
+    /// traversal data is unavailable. This is the "unreachable DBB" subset
+    /// Java highlights as an easy-to-fix problem.
+    fn compute_unreachable_dbb_capacity(
+        &self,
+        report: &ss_stats::direct_buffer::DirectBufferReport,
+    ) -> i64 {
+        if report.buffers.is_empty() {
+            return 0;
+        }
+        let guard = self.stats.traversal_data.lock().unwrap();
+        let data = match guard.as_ref() {
+            Some(d) => d,
+            None => return 0,
+        };
+        // Build obj_id -> visited lookup. `visited` is parallel to `objects`.
+        // Only buffers whose obj_id appears in objects AND is visited count as
+        // reachable; anything absent or not visited is unreachable.
+        let mut visited_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (i, obj) in data.objects.iter().enumerate() {
+            if data.visited.get(i).copied().unwrap_or(false) {
+                visited_ids.insert(obj.obj_id);
+            }
+        }
+        report
+            .buffers
+            .iter()
+            .filter(|b| !visited_ids.contains(&b.obj_id))
+            .map(|b| b.capacity)
+            .sum()
     }
 
     /// Render the unreachable-DirectByteBuffer easy-to-fix advice as a panel,
