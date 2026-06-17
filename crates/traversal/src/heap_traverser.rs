@@ -122,14 +122,11 @@ impl HeapObjectTraverser {
         // For deferred (weak reference) classes, skip the "referent" field — it's a weak pointer,
         // not a strong one. Also skip "next" in finalizer/cleaner chains.
         let skip_instance_field_pairs: Vec<(&str, &str)> = vec![
-            // Java's TraversalWorkerThread does NOT skip any instance fields.
-            // Weak reference referent fields are followed normally.
-            // Only skip the Finalizer.prev field to avoid traversing the
-            // finalizer linked list backwards (matches Java's linkedListLinks logic).
-            // ("java/lang/ref/Reference", "referent"),
-            // ("java/lang/ref/Reference", "discovered"),
-            // ("java/lang/ref/Reference", "pendingNext"),
-            // ("java/lang/ref/Reference", "pending"),
+            // Weak/soft/phantom reference internal fields are not strong
+            // reachability edges — following them over-marks live objects.
+            ("java/lang/ref/Reference", "referent"),
+            ("java/lang/ref/Reference", "discovered"),
+            ("java/lang/ref/Reference", "pending"),
             ("java/lang/ref/Finalizer", "prev"),
         ];
 
