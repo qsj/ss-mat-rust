@@ -27,6 +27,10 @@ pub struct StatsEngine {
     pub dup_prim_arrays: DupArrayCollector,
     pub dup_obj_arrays: DupArrayCollector,
     pub direct_buffers: DirectBufferCollector,
+    /// All bad object arrays (live+garbage), captured during linear scan so
+    /// the report can filter to live-only using BFS `visited` (matching Java,
+    /// which only counts bad arrays reached during the live traversal).
+    pub bad_array_records: Mutex<Vec<crate::problem_types::BadArrayRecord>>,
     pub jvm_info: JvmInfoCollector,
     pub thread_info: Mutex<Vec<ThreadInfo>>,
     pub oom_frame_locals: Mutex<Vec<FrameLocals>>,
@@ -87,6 +91,7 @@ impl StatsEngine {
             dup_prim_arrays: DupArrayCollector::new(),
             dup_obj_arrays: DupArrayCollector::new(),
             direct_buffers: DirectBufferCollector::new(),
+            bad_array_records: Mutex::new(Vec::new()),
             jvm_info: JvmInfoCollector::new(),
             thread_info: Mutex::new(Vec::new()),
             oom_frame_locals: Mutex::new(Vec::new()),

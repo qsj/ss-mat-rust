@@ -39,3 +39,16 @@ impl ProblemType {
         }
     }
 }
+
+/// One bad object array record, captured during the linear scan so the
+/// report can later filter to live-only using BFS `visited` (matching Java,
+/// which only counts bad arrays reached during the live traversal with
+/// `processingLiveObjects=true`).
+#[derive(Clone)]
+pub struct BadArrayRecord {
+    pub obj_id: u64,
+    pub class_idx: u32,
+    /// 0=len-zero, 1=len-one, 2=all-null, 3=one-nonnull, 4=sparse.
+    pub kind: u8,
+    pub size: i64,
+}

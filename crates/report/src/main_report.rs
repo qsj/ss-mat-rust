@@ -1358,16 +1358,32 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
     fn section_bad_obj_arrays(&mut self, html: &mut HtmlStringBuilder) {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
-        let empty_count = self.stats.empty_obj_array_count.load(Relaxed);
-        let empty_bytes = self.stats.empty_obj_array_bytes.load(Relaxed);
-        let single_count = self.stats.single_elem_obj_array_count.load(Relaxed);
-        let single_bytes = self.stats.single_elem_obj_array_bytes.load(Relaxed);
-        let all_null_count = self.stats.all_null_obj_array_count.load(Relaxed);
-        let all_null_bytes = self.stats.all_null_obj_array_bytes.load(Relaxed);
-        let one_nonnull_count = self.stats.one_nonnull_obj_array_count.load(Relaxed);
-        let one_nonnull_bytes = self.stats.one_nonnull_obj_array_bytes.load(Relaxed);
-        let sparse_count = self.stats.sparse_obj_array_count.load(Relaxed);
-        let sparse_bytes = self.stats.sparse_obj_array_bytes.load(Relaxed);
+
+        // Java only counts bad object arrays reached during the LIVE reachability
+        // traversal (processingLiveObjects=true). The linear scan captured ALL
+        // bad arrays (live+garbage); filter to live-only here using BFS `visited`.
+        let records = self.stats.bad_array_records.lock().unwrap().clone();
+        let live_ids: std::collections::HashSet<u64> = {
+            let guard = self.stats.traversal_data.lock().unwrap();
+            match guard.as_ref() {
+                Some(data) => data.objects.iter().enumerate()
+                    .filter(|(i, _)| data.visited.get(*i).copied().unwrap_or(false))
+                    .map(|(_, o)| o.obj_id).collect(),
+                None => std::collections::HashSet::new(),
+            }
+        };
+        let live_records: Vec<_> = records.iter().filter(|r| live_ids.contains(&r.obj_id)).collect();
+
+        let empty_count = live_records.iter().filter(|r| r.kind == 0).count() as u64;
+        let empty_bytes: i64 = live_records.iter().filter(|r| r.kind == 0).map(|r| r.size).sum();
+        let single_count = live_records.iter().filter(|r| r.kind == 1).count() as u64;
+        let single_bytes: i64 = live_records.iter().filter(|r| r.kind == 1).map(|r| r.size).sum();
+        let all_null_count = live_records.iter().filter(|r| r.kind == 2).count() as u64;
+        let all_null_bytes: i64 = live_records.iter().filter(|r| r.kind == 2).map(|r| r.size).sum();
+        let one_nonnull_count = live_records.iter().filter(|r| r.kind == 3).count() as u64;
+        let one_nonnull_bytes: i64 = live_records.iter().filter(|r| r.kind == 3).map(|r| r.size).sum();
+        let sparse_count = live_records.iter().filter(|r| r.kind == 4).count() as u64;
+        let sparse_bytes: i64 = live_records.iter().filter(|r| r.kind == 4).map(|r| r.size).sum();
 
         let total_bad = empty_count + single_count + all_null_count + one_nonnull_count + sparse_count;
         let total_bad_bytes = empty_bytes + single_bytes + all_null_bytes + one_nonnull_bytes + sparse_bytes;
@@ -1433,20 +1449,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_raw("</div>\n</details>\n");
 
             // Per-instance ref chain for sample bad object arrays.
-            // Combine samples from all bad-array categories.
-            let mut sample_ids: Vec<u64> = Vec::new();
-            for cat in [
-                &self.stats.empty_obj_array_samples,
-                &self.stats.single_elem_obj_array_samples,
-                &self.stats.all_null_obj_array_samples,
-                &self.stats.one_nonnull_obj_array_samples,
-                &self.stats.sparse_obj_array_samples,
-            ] {
-                let v = cat.lock().unwrap();
-                for &id in v.iter().take(5) {
-                    sample_ids.push(id);
-                }
-            }
+            // Take the largest live bad arrays as samples.
+            let mut sample_ids: Vec<u64> = live_records.iter()
+                .take(15)
+                .map(|r| r.obj_id)
+                .collect();
+            sample_ids.dedup();
             self.render_instance_ref_chains(
                 html,
                 "Per-instance reference chains for sample bad object arrays",

@@ -50,6 +50,7 @@ impl LinearScanCoordinator {
         let mut prim_arrays: Vec<PrimArrayData> = Vec::new();
         let mut obj_arrays: Vec<ObjArrayData> = Vec::new();
         let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
+        let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
         let mut class_obj_ids: HashMap<u64, u32> = HashMap::new();
 
         // Build primitive array body map for String content extraction: obj_id -> (body, elem_type)
@@ -273,35 +274,24 @@ impl LinearScanCoordinator {
                         humongous_count += 1;
                         humongous_bytes += size;
                     }
-                    // Track bad object arrays (matching Java's 5 categories)
+                    // Track bad object arrays (matching Java's 5 categories).
+                    // Capture a record so the report can later filter to
+                    // live-only using BFS `visited` (Java only counts live).
                     if arr.length == 0 {
-                        stats_ref.empty_obj_array_count.fetch_add(1, Relaxed);
-                        stats_ref.empty_obj_array_bytes.fetch_add(size, Relaxed);
-                        push_sample(&stats_ref.empty_obj_array_samples, arr.obj_id);
+                        bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 0, size });
                     } else if arr.length == 1 {
-                        stats_ref.single_elem_obj_array_count.fetch_add(1, Relaxed);
-                        stats_ref.single_elem_obj_array_bytes.fetch_add(size, Relaxed);
-                        push_sample(&stats_ref.single_elem_obj_array_samples, arr.obj_id);
+                        bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 1, size });
                     } else {
-                        // element_refs contains only non-null references
                         let non_null_count = arr.element_refs.len() as i32;
                         let null_count = arr.length - non_null_count;
                         if non_null_count == 0 {
-                            // All elements null (EMPTY)
-                            stats_ref.all_null_obj_array_count.fetch_add(1, Relaxed);
-                            stats_ref.all_null_obj_array_bytes.fetch_add(size, Relaxed);
-                            push_sample(&stats_ref.all_null_obj_array_samples, arr.obj_id);
+                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 2, size });
                         } else if non_null_count == 1 {
-                            // Exactly one non-null element (SINGLE_ELEM)
-                            stats_ref.one_nonnull_obj_array_count.fetch_add(1, Relaxed);
-                            stats_ref.one_nonnull_obj_array_bytes.fetch_add(size, Relaxed);
-                            push_sample(&stats_ref.one_nonnull_obj_array_samples, arr.obj_id);
+                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 3, size });
                         } else if null_count as f64 > 0.70 * arr.length as f64 {
-                            // >70% null elements (SPARSE, matching Java's minSparseZeroesPercent=70)
+                            // >70% null elements (SPARSE): waste = null slots × refSize.
                             let waste = null_count as i64 * oop_sz as i64;
-                            stats_ref.sparse_obj_array_count.fetch_add(1, Relaxed);
-                            stats_ref.sparse_obj_array_bytes.fetch_add(waste, Relaxed);
-                            push_sample(&stats_ref.sparse_obj_array_samples, arr.obj_id);
+                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 4, size: waste });
                         }
                     }
                 }
@@ -327,10 +317,37 @@ impl LinearScanCoordinator {
         // Build groups for the StringDupCollector
         let total_string_count = string_result.len();
         let unique_count = total_string_count - dup_strings.iter().map(|(_, c, _)| c - 1).sum::<usize>();
+
+        // Java's duplicate-string waste formula (StringContentDeduplicator):
+        //   groupWaste = (count-1)*stringBodySize
+        //              + (count-1)*backingArraySize
+        // where stringBodySize = align8(String instance fields + header), and
+        // backingArraySize = align8(objectAlignBase + elementSize*contentLen).
+        // elementSize is 1 for byte[] (Java 9+ compact strings, Latin-1).
+        let str_idx = self.heap.class_by_name.get("java/lang/String").copied();
+        let header = self.heap.header_size as i64;
+        let object_align_base = header + 4; // header + array length field
+        let string_body_size: i64 = str_idx
+            .and_then(|idx| self.heap.classes.get(idx as usize))
+            .map(|cls| {
+                let raw = header + cls.instance_size as i64;
+                (raw + 7) & !7 // align8
+            })
+            .unwrap_or(24); // fallback: hash(4)+coder(1)+value(4)+header(12)=24
+
         let groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = dup_strings
             .iter()
             .map(|(content, count, samples)| {
-                let wasted = (content.len() as i64) * (*count as i64 - 1) * 2;
+                let cnt = *count as i64;
+                let extra = cnt - 1; // the duplicate copies beyond the first
+                // Term A: extra String object bodies.
+                let waste_strings = extra * string_body_size;
+                // Term B: extra backing byte[] arrays. content.len() chars;
+                // Java 9+ compact strings store as byte[] (1 byte/char for Latin-1).
+                let array_raw = object_align_base + content.len() as i64;
+                let array_size = (array_raw + 7) & !7; // align8
+                let waste_arrays = extra * array_size;
+                let wasted = waste_strings + waste_arrays;
                 ss_stats::duplicate_strings::DupStringGroup {
                     content: content.clone(),
                     count: *count,
@@ -354,6 +371,8 @@ impl LinearScanCoordinator {
 
         // DirectByteBuffer off-heap analysis
         aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
+        // Stash all bad-array records (live+garbage) for later live-only filtering.
+        *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
 
         // Duplicate primitive arrays detection
         detect_duplicate_prim_arrays(&prim_arrays, &self.heap.classes, &self.stats, self.heap.header_size as i64);
@@ -391,6 +410,10 @@ struct DirectBufferData {
     /// underlying DirectByteBuffer (mirrors Java's `seenAddresses`).
     address: u64,
 }
+
+// Re-export the bad-array record type from stats (defined there to avoid a
+// stats -> traversal dependency cycle).
+pub use ss_stats::problem_types::BadArrayRecord;
 
 struct PrimArrayData {
     class_idx: u32,
