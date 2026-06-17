@@ -152,6 +152,8 @@ impl LinearScanCoordinator {
                                                 let align = 8i64;
                                                 let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
                                                 if size == 0 || size == 1 {
+                                                    // Java's EMPTY/SINGLE_ELEM overhead = getBodySize()
+                                                    // (the container's aligned shallow body).
                                                     waste = shallow;
                                                 } else if size >= 2 && size <= 4 {
                                                     // categoryCount: 2 for maps (key+value), 1 for lists.
