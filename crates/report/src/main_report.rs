@@ -1229,6 +1229,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let mut total_collection_bytes: i64 = 0;
         let mut total_bad_count: u64 = 0;
         for r in &records {
+            if r.waste <= 0 {
+                continue;
+            }
             if !live_ids.contains(&r.obj_id) {
                 continue;
             }

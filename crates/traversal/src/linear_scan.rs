@@ -135,17 +135,40 @@ impl LinearScanCoordinator {
                                                 pc.total_instance_bytes.fetch_add(shallow, Relaxed);
                                                 pc.instance_count.fetch_add(1, Relaxed);
                                             }
-                                            // Bad Collections: Java's processContainer counts EMPTY
-                                            // (size==0) / SINGLE_ELEM (size==1) collections as fully
-                                            // wasted. Match collection classes by name.
+                                            // Bad Collections: Java's processContainer counts
+                                            // EMPTY (size==0) / SINGLE_ELEM (size==1) as fully
+                                            // wasted, and SPARSE (size <= capacity/3) as
+                                            // (capacity-size)*refSize. Capture size + backing
+                                            // array id; resolve capacity post-pass.
                                             if is_collection_class_name(&cls.name) {
                                                 let fields = inst.fields().to_vec();
                                                 let size = extract_collection_size(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                let backing_id = extract_backing_array_id(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                // EMPTY/SINGLE_ELEM: waste = full shallow body.
+                                                // SMALL (2-4 elems): waste = body - minimum-viable
+                                                // footprint (Java processContainer SMALL branch).
+                                                let ref_sz = self.heap.oop_size as i64;
+                                                let mut waste = 0i64;
+                                                let align = 8i64;
+                                                let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
                                                 if size == 0 || size == 1 {
+                                                    waste = shallow;
+                                                } else if size >= 2 && size <= 4 {
+                                                    // categoryCount: 2 for maps (key+value), 1 for lists.
+                                                    let cat_count = if cls.name.contains("Map") { 2 } else { 1 };
+                                                    let min_elems = (ref_sz_align * size as i64 * cat_count + align - 1) & !(align - 1);
+                                                    let min_total = ref_sz_align + min_elems;
+                                                    waste = (shallow - min_total).max(0);
+                                                }
+                                                // Record whenever it's potentially bad (we'll refine
+                                                // SPARSE after the backing-array length is known).
+                                                if waste > 0 || backing_id != 0 {
                                                     bad_collection_records.push(BadCollectionRecord {
                                                         obj_id: inst.obj_id().id(),
                                                         class_idx,
-                                                        waste: shallow,
+                                                        size,
+                                                        backing_array_id: backing_id,
+                                                        waste,
                                                     });
                                                 }
                                             }
@@ -395,6 +418,22 @@ impl LinearScanCoordinator {
 
         // DirectByteBuffer off-heap analysis
         aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
+        // Resolve collection backing-array capacities and compute SPARSE waste.
+        // Build obj_id -> length lookup over the captured object arrays.
+        let array_len_by_id: std::collections::HashMap<u64, i32> = obj_arrays.iter()
+            .map(|a| (a.obj_id, a.length)).collect();
+        let ref_sz = self.heap.oop_size as i64;
+        for rec in bad_collection_records.iter_mut() {
+            if rec.size <= 1 || rec.backing_array_id == 0 {
+                continue;
+            }
+            if let Some(&cap) = array_len_by_id.get(&rec.backing_array_id) {
+                if cap > 0 && rec.size <= cap / 3 {
+                    rec.waste = (cap as i64 - rec.size as i64) * ref_sz;
+                }
+            }
+        }
+
         // Stash all bad-array records (live+garbage) for later live-only filtering.
         *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
         *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
@@ -502,6 +541,82 @@ fn extract_collection_size(
         }
     }
     -1
+}
+
+/// Read the backing-array object reference of a Collection, walking the class
+/// hierarchy. Returns the referenced array's obj_id (0 if null/absent).
+/// Field name is class-specific: HashMap/Hashtable/LinkedHashMap use `table`,
+/// ConcurrentHashMap uses `table`, ArrayList/Vector use `elementData`,
+/// TreeMap uses `root`, LinkedList uses `first`. Returns the first matching
+/// reference field that is non-null.
+fn extract_backing_array_id(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+) -> u64 {
+    // Determine candidate backing-field names from the class name.
+    let candidates: &[&str] = match class_info.name.as_ref() {
+        "java/util/ArrayList" | "java/util/Vector" | "java/util/concurrent/CopyOnWriteArrayList" =>
+            &["elementData"],
+        "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/Hashtable"
+        | "java/util/WeakHashMap" | "java/util/EnumMap"
+        | "java/util/concurrent/ConcurrentHashMap" =>
+            &["table", "nextTable"],
+        "java/util/HashSet" | "java/util/LinkedHashSet" =>
+            &["map"],
+        "java/util/LinkedList" | "java/util/concurrent/ConcurrentSkipListMap" =>
+            &["first", "head"],
+        _ => return 0,
+    };
+    let id_size = current_id_size();
+    for cand in candidates {
+        if let Some(raw) = read_ref_field(fields, class_info, cand, class_by_address, all_classes, id_size) {
+            return raw;
+        }
+    }
+    0
+}
+
+/// Read an object-reference field's raw id value (big-endian), or None if the
+/// field is absent or null. type_code 2 = object reference.
+fn read_ref_field(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    name: &str,
+    class_by_address: &HashMap<u64, u32>,
+    all_classes: &[JavaClassInfo],
+    id_size: usize,
+) -> Option<u64> {
+    let mut offset = 0usize;
+    let mut current_id = class_info.class_object_id;
+    loop {
+        let cls = if current_id == class_info.class_object_id {
+            Some(class_info)
+        } else {
+            class_by_address.get(&current_id).and_then(|&idx| all_classes.get(idx as usize))
+        };
+        if let Some(cls) = cls {
+            for fd in &cls.instance_fields {
+                if fd.name.as_ref() == name && fd.type_code == 2 {
+                    if offset + id_size <= fields.len() {
+                        let raw = read_be_u64_id(fields, offset, id_size)?;
+                        return Some(raw);
+                    }
+                    return None;
+                }
+                offset += field_type_size(fd.type_code, id_size);
+            }
+            if cls.super_class_id != 0 {
+                current_id = cls.super_class_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 struct PrimArrayData {

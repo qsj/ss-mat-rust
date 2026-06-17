@@ -53,11 +53,19 @@ pub struct BadArrayRecord {
     pub size: i64,
 }
 
-/// One bad collection (EMPTY/SINGLE_ELEM) record, captured during the scan
-/// so the report can filter to live-only and sum the wasted capacity.
+/// One bad collection record, captured during the scan. `capacity` is
+/// resolved post-pass from the backing-array lookup; SPARSE detection uses
+/// `size <= capacity/3`.
 #[derive(Clone)]
 pub struct BadCollectionRecord {
     pub obj_id: u64,
     pub class_idx: u32,
+    pub size: i32,
+    /// Backing-array object id (e.g. HashMap.table / ArrayList.elementData),
+    /// resolved to a length post-pass for SPARSE/SMALL waste computation.
+    /// 0 when no backing field was found.
+    pub backing_array_id: u64,
+    /// Waste computed so far. EMPTY/SINGLE_ELEM set this to the shallow body
+    /// during the scan; SPARSE adds (capacity-size)*refSize post-pass.
     pub waste: i64,
 }
