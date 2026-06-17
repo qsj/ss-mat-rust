@@ -628,9 +628,17 @@ fn extract_prim_raw_body(arr: &heap_dump::PrimitiveArray) -> Vec<u8> {
     Vec::new()
 }
 
+/// Shallow size of an array object, matching Java's
+/// `PrimitiveArrayInstance.getBodySize()` / `ObjectArrayInstance.getBodySize()`:
+///   `align(elementSize * length + objectAlignBase, alignment)`
+/// where `objectAlignBase = headerSize + arrayLengthField(4)`. Rust's header_size
+/// is the object header (e.g. 12 with compressed oops); arrays additionally
+/// carry a 4-byte length field, so the base is `header_size + 4`.
 fn array_shallow_size(length: i32, element_size: i32, header_size: i64) -> i64 {
+    let object_align_base = header_size + 4;
     let data_size = length as i64 * element_size as i64;
-    let raw = header_size + data_size;
+    let raw = object_align_base + data_size;
+    // Align to 8 bytes (Java's default object alignment).
     (raw + 7) & !7
 }
 
