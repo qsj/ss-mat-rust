@@ -1700,8 +1700,8 @@ fn matches_skip_class_pair(name: &str) -> bool {
 /// Sentinel value in root_of[] marking unvisited/garbage objects.
 const GC_ROOT_GARBAGE_SENTINEL: u32 = u32::MAX - 1;
 
-const GC_ROOT_MAX_DEPTH: usize = 20;
-const GC_ROOT_MAX_CHILDREN: usize = 25;
+const GC_ROOT_MAX_DEPTH: usize = 10;
+const GC_ROOT_MAX_CHILDREN: usize = 12;
 const GC_ROOT_TOP_N: usize = 100;
 const GC_ROOT_SAMPLE_N: usize = 40;
 
@@ -1914,10 +1914,10 @@ fn build_single_root_tree(
     // Prune threshold: don't prune at shallow depths (direct field refs are
     // always shown), then progressively prune tiny groups. Matching Java's
     // behavior of retaining more branches before collapsing.
-    let min_group_bytes: i64 = if depth < 3 {
+    let min_group_bytes: i64 = if depth < 2 {
         0
     } else {
-        (root_retained_bytes / 100000).max(64) as i64
+        (root_retained_bytes / 10000).max(256) as i64
     };
 
     // Take top N children, collapse the rest
