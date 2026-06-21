@@ -1700,8 +1700,8 @@ fn matches_skip_class_pair(name: &str) -> bool {
 /// Sentinel value in root_of[] marking unvisited/garbage objects.
 const GC_ROOT_GARBAGE_SENTINEL: u32 = u32::MAX - 1;
 
-const GC_ROOT_MAX_DEPTH: usize = 10;
-const GC_ROOT_MAX_CHILDREN: usize = 12;
+const GC_ROOT_MAX_DEPTH: usize = 20;
+const GC_ROOT_MAX_CHILDREN: usize = 25;
 const GC_ROOT_TOP_N: usize = 100;
 const GC_ROOT_SAMPLE_N: usize = 40;
 
@@ -1911,12 +1911,13 @@ fn build_single_root_tree(
         sb.cmp(&sa)
     });
 
-    // Prune threshold: don't prune at shallow depths (direct field refs are always small),
-    // then skip groups smaller than 0.01% of root retained (min 256 bytes) at deeper levels.
-    let min_group_bytes: i64 = if depth < 2 {
+    // Prune threshold: don't prune at shallow depths (direct field refs are
+    // always shown), then progressively prune tiny groups. Matching Java's
+    // behavior of retaining more branches before collapsing.
+    let min_group_bytes: i64 = if depth < 3 {
         0
     } else {
-        (root_retained_bytes / 10000).max(256) as i64
+        (root_retained_bytes / 100000).max(64) as i64
     };
 
     // Take top N children, collapse the rest
@@ -1937,7 +1938,9 @@ fn build_single_root_tree(
         }
 
         if i < max_children {
-            // Expand the first member recursively
+            // Expand the first member recursively (single-member expansion
+            // with proportional scaling — matches Java's tree shape while
+            // keeping build time bounded).
             let first_member = members[0];
             let mut child_node = build_single_root_tree(
                 first_member, root_idx, objects, root_of, outgoing_refs,
