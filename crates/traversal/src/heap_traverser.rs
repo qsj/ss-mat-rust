@@ -1737,6 +1737,38 @@ fn build_gc_root_trees(
         entry.1 += 1;
     }
 
+    // Step 1b: Collect "display-only" JAVA_STATIC roots from class objects'
+    // static field references. These point at objects that are already live
+    // (reachable from real GC roots), so they don't change the live/garbage
+    // split — they only add Section 4 display entries labeled
+    // "Java Static [ClassName.field]" (matching Java's JAVA_STATIC roots).
+    //
+    // Java creates these during ClassDump parsing (HprofRecordReader tag 32)
+    // and they enter bucket 0 alongside real roots. We add them post-BFS as
+    // display-only: their retained_bytes are 0 (the bytes are already
+    // attributed to the real root that first claimed the object), so the
+    // entries show as small references, matching Java's "40b (< 0.1%)" style.
+    let mut static_display_roots: Vec<(u32, String, u32)> = Vec::new(); // (obj_idx, label, class_idx)
+    for (class_idx, obj) in objects.iter().enumerate() {
+        if obj.kind != 3 { continue; } // only class objects have static refs
+        for edge in &outgoing_refs[class_idx] {
+            let target = edge.target as usize;
+            if target >= visited.len() { continue; }
+            if !visited[target] { continue; } // skip garbage
+            if objects[target].kind == 3 { continue; } // skip class→class
+            // Only add as a static display root if the target is NOT already a
+            // real root (avoid duplicate entries for objects that are both real
+            // roots AND static field targets).
+            if root_of[target] == target as u32 { continue; }
+            let owning_class_name = if (obj.class_idx as usize) < heap.classes.len() {
+                heap.classes[obj.class_idx as usize].name.replace('/', ".")
+            } else { String::new() };
+            let field_name = field_pool.get(edge.field_key).to_string();
+            let label = format!("Java Static [{}.{}]", owning_class_name, field_name);
+            static_display_roots.push((target as u32, label, objects[target].class_idx));
+        }
+    }
+
     // Step 2: Group roots by (primary_root_type, class_idx) — matching Java's
     // behavior of merging all roots of the same type pointing to the same class
     // into one Section 4 entry. We use the first root_type in the meta's list
@@ -1764,6 +1796,20 @@ fn build_gc_root_trees(
         groups.entry(key).or_default().push((root_idx, retained_bytes, retained_count));
     }
 
+    // Step 2b: Add display-only JAVA_STATIC roots as separate entries.
+    // Each static field target gets its own group key (unique per (class, field)).
+    // Retained bytes = 0 (already attributed to the real root); the entry shows
+    // the "Java Static [Class.field]" label with a small tree.
+    for &(obj_idx, ref label, class_idx) in &static_display_roots {
+        // Use a synthetic unique class_idx to avoid merging different static fields.
+        // Encode: high bit set + obj_idx to make each entry unique.
+        let synthetic_key = 0x8000_0000 | obj_idx;
+        groups.insert(
+            (RootType::SystemClass, synthetic_key),
+            vec![(obj_idx, 0, 0)], // 0 retained (display-only)
+        );
+    }
+
     // Step 3: For each group, sum retained bytes and pick the largest member
     // as the representative for tree building.
     let mut sorted_groups: Vec<(RootType, u32, u32, i64, u64)> = groups.into_iter()
@@ -1781,17 +1827,36 @@ fn build_gc_root_trees(
     let top_n = GC_ROOT_TOP_N.min(sorted_groups.len());
     let mut entries: Vec<ss_stats::ref_chain::GcRootEntry> = Vec::with_capacity(top_n);
 
-    for &(_, _, root_idx, retained_bytes, retained_count) in &sorted_groups[..top_n] {
-        let meta = root_metas.get(&root_idx).cloned().unwrap_or_else(|| {
+    for &(rt, class_key, root_idx, retained_bytes, retained_count) in &sorted_groups[..top_n] {
+        // For display-only JAVA_STATIC entries (synthetic class_key with high bit),
+        // use the static label instead of looking up root_metas.
+        let is_static_display = class_key & 0x8000_0000 != 0;
+        let meta = if is_static_display {
+            // Find the static label for this root_idx.
+            let label = static_display_roots.iter()
+                .find(|&&(idx, _, _)| idx == root_idx)
+                .map(|(_, l, _)| l.clone())
+                .unwrap_or_else(|| "Java Static".to_string());
             ss_stats::ref_chain::GcRootMeta {
                 root_obj_idx: root_idx,
                 obj_id: objects[root_idx as usize].obj_id,
                 class_idx: objects[root_idx as usize].class_idx,
-                class_name: get_class_display(objects[root_idx as usize].class_idx, heap),
-                root_types: vec![ss_heap_model::root::RootType::Unknown],
+                class_name: label,
+                root_types: vec![ss_heap_model::root::RootType::SystemClass],
                 thread_serial: None,
             }
-        });
+        } else {
+            root_metas.get(&root_idx).cloned().unwrap_or_else(|| {
+                ss_stats::ref_chain::GcRootMeta {
+                    root_obj_idx: root_idx,
+                    obj_id: objects[root_idx as usize].obj_id,
+                    class_idx: objects[root_idx as usize].class_idx,
+                    class_name: get_class_display(objects[root_idx as usize].class_idx, heap),
+                    root_types: vec![ss_heap_model::root::RootType::Unknown],
+                    thread_serial: None,
+                }
+            })
+        };
 
         let self_bytes = compute_obj_shallow(&objects[root_idx as usize], oop_size, header_size);
 
@@ -1806,13 +1871,13 @@ fn build_gc_root_trees(
             heap,
             field_pool,
             0,
-            retained_bytes,
+            retained_bytes.max(self_bytes), // ensure non-zero for display roots
         );
 
         entries.push(ss_stats::ref_chain::GcRootEntry {
             meta,
-            retained_bytes,
-            retained_count,
+            retained_bytes: retained_bytes.max(self_bytes),
+            retained_count: retained_count.max(1),
             self_bytes,
             tree,
         });

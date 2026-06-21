@@ -3138,6 +3138,12 @@ fn format_root_description(meta: &ss_stats::ref_chain::GcRootMeta) -> String {
     }).collect();
     let type_str = type_names.join(", ");
 
-    format!("{}(<t-c>{}</t-c>)", type_str, meta.class_name)
+    // For Java Static display roots, class_name is already a full description
+    // like "Java Static [com.foo.Bar.FIELD]" — don't wrap in <t-c>.
+    if meta.class_name.starts_with("Java Static") {
+        meta.class_name.clone()
+    } else {
+        format!("{}(<t-c>{}</t-c>)", type_str, meta.class_name)
+    }
 }
 
