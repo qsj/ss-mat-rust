@@ -8,7 +8,7 @@ use anyhow::Result;
 use jvm_hprof::{heap_dump, IdSize, RecordTag};
 use memmap2::Mmap;
 
-use ss_heap_model::class_info::ClassCategory;
+
 use ss_heap_model::heap_dump::HeapDump;
 use ss_heap_model::root::{HeapRootReference, RootType};
 use ss_stats::engine::StatsEngine;
@@ -768,7 +768,7 @@ impl HeapObjectTraverser {
             &field_pool,
         );
         eprintln!("BFS: built {} GC root tree entries", gc_root_store.entries.len());
-        *self.stats.gc_roots.lock().unwrap() = gc_root_store;
+        *self.stats.gc_roots.lock().expect("stats mutex poisoned") = gc_root_store;
 
         // Phase 4: Reference chain analysis for top classes
         eprintln!("BFS Phase 4: analyzing reference chains...");
@@ -808,10 +808,10 @@ impl HeapObjectTraverser {
         );
         ref_chain_store.humongous_chains = humongous_chains;
 
-        *self.stats.ref_chains.lock().unwrap() = ref_chain_store;
+        *self.stats.ref_chains.lock().expect("stats mutex poisoned") = ref_chain_store;
 
         // Persist BFS data for post-traversal rendering (ref chains in report).
-        *self.stats.traversal_data.lock().unwrap() = Some(TraversalData {
+        *self.stats.traversal_data.lock().expect("stats mutex poisoned") = Some(TraversalData {
             objects: std::mem::take(&mut objects),
             parent: std::mem::take(&mut parent),
             parent_edge: std::mem::take(&mut parent_edge),

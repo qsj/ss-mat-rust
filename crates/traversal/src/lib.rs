@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_assignments, unused_imports, unused_mut, unused_parens)]
 pub mod engine;
 pub mod linear_scan;
 pub mod scan_workers;

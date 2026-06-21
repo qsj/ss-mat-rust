@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_assignments, unused_imports, unused_mut, unused_parens)]
 mod flags;
 mod progress;
 
@@ -5,8 +6,31 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn main() -> Result<()> {
+    // Install a panic hook that turns panics (e.g. from the jvm-hprof parser
+    // on malformed input) into a clean error message instead of a backtrace.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let loc = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!(
+            "\nError: analysis aborted unexpectedly.\n  Reason: {}\n  At: {}\n  This usually means the HPROF file is corrupted or uses an unsupported format.\n  Run with RUST_BACKTRACE=1 for a full backtrace.",
+            msg, loc
+        );
+        // Do NOT call default_hook — we've replaced the scary output.
+        let _ = default_hook;
+    }));
+
     eprintln!("SS-Mat version 0.1.0 (Rust)");
 
     let cli = flags::Cli::parse();
@@ -32,11 +56,13 @@ fn main() -> Result<()> {
     eprintln!("Heap dump: {}", heap_dump_path.display());
     eprintln!("Report output: {}", report_path.display());
 
+    let run_start = Instant::now();
+
     // Phase 1: Parse HPROF file
     eprintln!("\n=== Phase 1: Parsing HPROF ===");
+    let t = Instant::now();
     let heap = ss_hprof_parser::hprof_wrapper::parse_hprof(heap_dump_path)
-        .context("Failed to parse HPROF file")?;
-
+        .map_err(|e| friendly_hprof_error(&e, heap_dump_path))?;
     eprintln!(
         "  Classes: {}, Objects: {}, Roots: {}, Strings: {}",
         heap.classes.len(),
@@ -44,22 +70,26 @@ fn main() -> Result<()> {
         heap.roots.len(),
         heap.string_table.len()
     );
+    print_elapsed("Phase 1", t.elapsed());
 
     // Phase 2: Initialize StatsEngine with per-class data
     eprintln!("\n=== Phase 2: Statistics Engine ===");
+    let t = Instant::now();
     let stats = ss_stats::engine::StatsEngine::new(&heap.classes);
     populate_per_class_stats(&heap, &stats);
-
     // Extract JVM info from string table
     extract_jvm_info(&heap, &stats);
+    print_elapsed("Phase 2", t.elapsed());
 
     // Phase 3: Linear scan
     eprintln!("\n=== Phase 3: Linear Scan ===");
+    let t = Instant::now();
     let heap_arc = Arc::new(heap);
     let stats_arc = Arc::new(stats);
     let coordinator =
         ss_traversal::linear_scan::LinearScanCoordinator::new(Arc::clone(&heap_arc), Arc::clone(&stats_arc));
-    coordinator.run(heap_dump_path)?;
+    coordinator.run(heap_dump_path)
+        .with_context(|| format!("Linear scan failed on {}", heap_dump_path.display()))?;
 
     // Extract system properties by walking java.lang.System.props object graph
     let sys_props = coordinator.extract_system_properties(heap_dump_path);
@@ -85,7 +115,7 @@ fn main() -> Result<()> {
         }
         if let Some(serial) = oom_serial {
             let locals = coordinator.extract_oom_local_details(heap_dump_path, serial);
-            let mut ol = stats_arc.oom_frame_locals.lock().unwrap();
+            let mut ol = stats_arc.oom_frame_locals.lock().expect("stats mutex poisoned");
             *ol = locals;
         }
     }
@@ -97,17 +127,20 @@ fn main() -> Result<()> {
 
     // Store thread info in StatsEngine
     {
-        let mut ti = stats_arc.thread_info.lock().unwrap();
+        let mut ti = stats_arc.thread_info.lock().expect("stats mutex poisoned");
         *ti = thread_info;
     }
+    print_elapsed("Phase 3 (linear scan + extraction)", t.elapsed());
 
     // Phase 3b: BFS traversal from GC roots
     eprintln!("\n=== Phase 3b: BFS Traversal ===");
+    let t = Instant::now();
     let traverser = ss_traversal::heap_traverser::HeapObjectTraverser::new(
         Arc::clone(&heap_arc),
         Arc::clone(&stats_arc),
     );
-    let traversal_result = traverser.run_traversal(heap_dump_path)?;
+    let traversal_result = traverser.run_traversal(heap_dump_path)
+        .with_context(|| format!("BFS traversal failed on {}", heap_dump_path.display()))?;
     eprintln!(
         "  Traversal: {} live, {} garbage ({:.1}%), total shallow: {}",
         traversal_result.visited_count,
@@ -118,9 +151,11 @@ fn main() -> Result<()> {
         ss_report::table_formatter::format_bytes(traversal_result.total_shallow),
     );
     drop(traverser);
+    print_elapsed("Phase 3b", t.elapsed());
 
     // Phase 4: Generate HTML report
     eprintln!("\n=== Phase 4: Generating Report ===");
+    let t = Instant::now();
     let mut reporter = ss_report::main_report::MainReportGenerator::new(
         Arc::clone(&heap_arc),
         Arc::clone(&stats_arc),
@@ -133,14 +168,46 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to write report to {}", report_path.display()))?;
 
     eprintln!("Report written to: {}", report_path.display());
+    print_elapsed("Phase 4", t.elapsed());
 
     // Print final summary
     if let Some(stats) = Arc::into_inner(stats_arc) {
         stats.print_summary();
     }
 
-    eprintln!("\nAnalysis complete.");
+    eprintln!("\nAnalysis complete. Total time: {:.2}s", run_start.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Turn a raw HPROF parse error into a clear, actionable message.
+fn friendly_hprof_error(e: &anyhow::Error, path: &PathBuf) -> anyhow::Error {
+    let msg = format!("{:?}", e);
+    // Detect common failure signatures.
+    if msg.contains("TakeUntil") || msg.contains("Eof") {
+        anyhow::anyhow!(
+            "The file '{}' is not a valid HPROF heap dump, or is truncated/corrupted.\n\
+             HPROF files start with the bytes \"JAVA PROFILE\"; ensure you passed a .hprof\n\
+             produced by -XX:+HeapDumpOnOutOfMemoryError or jmap.\n\
+             Underlying parser error: {}",
+            path.display(), e
+        )
+    } else if msg.contains("Unsupported HPROF version") {
+        anyhow::anyhow!(
+            "Unsupported HPROF version in '{}'. SS-Mat supports HPROF versions 1.0.2 and 1.0.3.\n\
+             Underlying error: {}",
+            path.display(), e
+        )
+    } else {
+        anyhow::anyhow!(
+            "Failed to parse HPROF file '{}': {}\n\
+             The file may be corrupted or use an unsupported format.",
+            path.display(), e
+        )
+    }
+}
+
+fn print_elapsed(label: &str, elapsed: std::time::Duration) {
+    eprintln!("  {} took {:.2}s", label, elapsed.as_secs_f64());
 }
 
 fn populate_per_class_stats(
@@ -170,6 +237,16 @@ fn validate_inputs(path: &PathBuf) -> Result<()> {
     }
     if !path.is_file() {
         anyhow::bail!("Not a regular file: {}", path.display());
+    }
+
+    // Warn on unusually small files (likely not a real heap dump).
+    if let Ok(meta) = path.metadata() {
+        if meta.len() < 1024 {
+            anyhow::bail!(
+                "File {} is only {} bytes — too small to be a valid HPROF heap dump.",
+                path.display(), meta.len()
+            );
+        }
     }
 
     let compressed_extensions = [".zip", ".gz", ".tgz", ".rar", ".bz2"];

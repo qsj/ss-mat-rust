@@ -2633,3 +2633,106 @@ pub fn resolve_field_values(
         addr_to_class_idx,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- array_shallow_size: must match Java's array getBodySize ----
+    // Formula: align8(header_size + 4 [length field] + element_size * length)
+
+    #[test]
+    fn array_size_empty_byte_array() {
+        // byte[0], header=12: align8(12+4+0) = align8(16) = 16
+        assert_eq!(array_shallow_size(0, 1, 12), 16);
+    }
+
+    #[test]
+    fn array_size_single_element_byte() {
+        // byte[1], header=12: align8(12+4+1) = align8(17) = 24
+        assert_eq!(array_shallow_size(1, 1, 12), 24);
+    }
+
+    #[test]
+    fn array_size_object_array_compressed() {
+        // Object[4], header=12, refSize=4: align8(12+4+16) = align8(32) = 32
+        assert_eq!(array_shallow_size(4, 4, 12), 32);
+    }
+
+    #[test]
+    fn array_size_large_prim_array() {
+        // int[1000], header=12: align8(12+4+4000) = align8(4016) = 4016
+        assert_eq!(array_shallow_size(1000, 4, 12), 4016);
+    }
+
+    #[test]
+    fn array_size_8byte_header() {
+        // byte[0] on 32-bit, header=8: align8(8+4+0) = align8(12) = 16
+        assert_eq!(array_shallow_size(0, 1, 8), 16);
+    }
+
+    // ---- field_type_size: HPROF type codes ----
+
+    #[test]
+    fn field_type_object_ref_4byte() {
+        assert_eq!(field_type_size(2, 4), 4);
+    }
+
+    #[test]
+    fn field_type_object_ref_8byte() {
+        assert_eq!(field_type_size(2, 8), 8);
+    }
+
+    #[test]
+    fn field_type_boolean() {
+        assert_eq!(field_type_size(4, 8), 1);
+    }
+
+    #[test]
+    fn field_type_int() {
+        assert_eq!(field_type_size(10, 8), 4);
+    }
+
+    #[test]
+    fn field_type_long() {
+        assert_eq!(field_type_size(7, 8), 8);
+    }
+
+    // ---- boxed_primitive_size ----
+
+    #[test]
+    fn boxed_size_all_types() {
+        assert_eq!(boxed_primitive_size("java/lang/Byte"), 1);
+        assert_eq!(boxed_primitive_size("java/lang/Boolean"), 1);
+        assert_eq!(boxed_primitive_size("java/lang/Short"), 2);
+        assert_eq!(boxed_primitive_size("java/lang/Character"), 2);
+        assert_eq!(boxed_primitive_size("java/lang/Integer"), 4);
+        assert_eq!(boxed_primitive_size("java/lang/Float"), 4);
+        assert_eq!(boxed_primitive_size("java/lang/Long"), 8);
+        assert_eq!(boxed_primitive_size("java/lang/Double"), 8);
+        assert_eq!(boxed_primitive_size("java/lang/String"), 0); // not boxed
+    }
+
+    // ---- has_trailing_zero_elements ----
+
+    #[test]
+    fn trailing_zeros_detected() {
+        // int[4] = {1, 0, 0, 0} — 3/4 trailing zeros > 50%
+        let body: Vec<u8> = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec();
+        assert!(has_trailing_zero_elements(&body, 4));
+    }
+
+    #[test]
+    fn no_trailing_zeros() {
+        // int[4] = {1, 2, 3, 4} — no trailing zeros
+        let body: Vec<u8> = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0].to_vec();
+        assert!(!has_trailing_zero_elements(&body, 4));
+    }
+
+    #[test]
+    fn trailing_zeros_short_array() {
+        // int[1] — too short to evaluate
+        let body: Vec<u8> = [0, 0, 0, 0].to_vec();
+        assert!(!has_trailing_zero_elements(&body, 4));
+    }
+}

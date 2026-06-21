@@ -43,7 +43,15 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 
 ## 当前完成状态
 
-**全部 24 个报告 Section 已填充，无 "Not yet available" 占位符。** 报告 144KB（Java 版 123KB）。
+**全部 24 个报告 Section 已填充，无 "Not yet available" 占位符。报告 ~4.3MB，与 Java 版数据对齐。**
+
+数据准确性（vs Java 参考实现，同一 heap dump）：
+- heap 总字节：178,326KB（**精确匹配**）
+- DirectByteBuffer：96,927KB 总量 / 94,786KB unreachable（**精确匹配**，address 去重 + fd/att 跳过）
+- 可达性分类（live/garbage）：差 <1%（不遍历 Reference.referent）
+- 压缩 oop 自动推导（address-overlap 验证，不信任 heapOopSize）
+- 报告体积对齐 Java（encoded-string 去重 `|*/c|*/s` + JS 解码器）
+- SecHdr 35/35、Reference Chains 10/10、easy-to-fix 2/2
 
 ### 已实现的问题检测
 

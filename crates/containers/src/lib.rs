@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_assignments, unused_imports, unused_mut, unused_parens)]
 pub mod registry;
 pub mod descriptor;
 pub mod instance;

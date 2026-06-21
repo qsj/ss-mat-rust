@@ -112,7 +112,9 @@ impl HeapInfo {
             || self.in_range(address, self.to_start, self.to_end)
         {
             1
-        } else if self.old_gen_start > 0 || self.perm_gen_start > 0 {
+        } else if self.in_range(address, self.old_gen_start, self.old_gen_end)
+            || self.in_range(address, self.perm_gen_start, self.perm_gen_end)
+        {
             2
         } else {
             0
