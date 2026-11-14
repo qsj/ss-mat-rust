@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| derive_report_path(heap_dump_path));
 
-    let _flags = flags::Flags::from_cli(&cli);
+    let flags = flags::Flags::from_cli(&cli);
 
     eprintln!("Heap dump: {}", heap_dump_path.display());
     eprintln!("Report output: {}", report_path.display());
@@ -77,8 +77,6 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let stats = ss_stats::engine::StatsEngine::new(&heap.classes);
     populate_per_class_stats(&heap, &stats);
-    // Extract JVM info from string table
-    extract_jvm_info(&heap, &stats);
     print_elapsed("Phase 2", t.elapsed());
 
     // Phase 3: Linear scan
@@ -86,13 +84,32 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let heap_arc = Arc::new(heap);
     let stats_arc = Arc::new(stats);
-    let coordinator =
-        ss_traversal::linear_scan::LinearScanCoordinator::new(Arc::clone(&heap_arc), Arc::clone(&stats_arc));
+
+    ss_traversal::linear_scan::configure_thread_pool(flags.max_scan_threads)?;
+
+    let coordinator = ss_traversal::linear_scan::LinearScanCoordinator::with_config(
+        Arc::clone(&heap_arc),
+        Arc::clone(&stats_arc),
+        ss_traversal::linear_scan::ScanConfig {
+            min_trailing_zeroes_percent: flags.min_trailing_zeroes_percent,
+            min_sparse_zeroes_percent: flags.min_sparse_zeroes_percent,
+            min_unused_hi_bits_percent: flags.min_unused_hi_bits_percent,
+        },
+    );
+
+    // Extract system properties first: java.vm.inputarguments (when present)
+    // is the authoritative source for JVM flags, and the G1 region size is
+    // needed by the linear scan's humongous-object detection.
+    let sys_props = coordinator.extract_system_properties(heap_dump_path);
+    extract_jvm_info(
+        heap_arc.as_ref(),
+        stats_arc.as_ref(),
+        flags.jvm_flags_content.as_deref(),
+        &sys_props,
+    );
+
     coordinator.run(heap_dump_path)
         .with_context(|| format!("Linear scan failed on {}", heap_dump_path.display()))?;
-
-    // Extract system properties by walking java.lang.System.props object graph
-    let sys_props = coordinator.extract_system_properties(heap_dump_path);
 
     // Extract thread names by walking Thread instances
     let thread_info = coordinator.extract_thread_info(heap_dump_path);
@@ -122,9 +139,6 @@ fn main() -> Result<()> {
 
     drop(coordinator);
 
-    // Update JVM info with extracted system properties
-    update_system_properties(&stats_arc, sys_props);
-
     // Store thread info in StatsEngine
     {
         let mut ti = stats_arc.thread_info.lock().expect("stats mutex poisoned");
@@ -152,6 +166,52 @@ fn main() -> Result<()> {
     );
     drop(traverser);
     print_elapsed("Phase 3b", t.elapsed());
+
+    // Opt-in S14 forensics: join the detector's duplicate groups with the
+    // final BFS live set. Inert when SS_MAT_DEBUG_DIR is not set.
+    if let Some(debug_dir) = ss_stats::debug_dump::debug_dir() {
+        let live_prim = {
+            let guard = stats_arc.traversal_data.lock().expect("stats mutex poisoned");
+            guard
+                .as_ref()
+                .map(ss_stats::debug_dump::live_primitive_array_ids)
+                .unwrap_or_default()
+        };
+        match ss_stats::debug_dump::write_s14_bundle(&debug_dir, &live_prim) {
+            Ok(s) => eprintln!(
+                "Debug: S14 groups={} arrays={} waste={}B live={} garbage={} string_backing={} -> {}",
+                s.groups,
+                s.arrays_in_groups,
+                s.waste_bytes,
+                s.live_members,
+                s.garbage_members,
+                s.string_backing_members,
+                debug_dir.display()
+            ),
+            Err(e) => eprintln!("Debug: failed to write S14 dump: {}", e),
+        }
+        match ss_stats::debug_dump::write_problem_bundle(&debug_dir, stats_arc.as_ref()) {
+            Ok(s) => eprintln!(
+                "Debug: problem dump S8 {}/{} dup={} {}B groups={} | S9 objects={} bad={} {}B | S10 objects={} bad={} {}B | S11 objects={} bad={} {}B -> {}",
+                s.s8_total_strings,
+                s.s8_unique_strings,
+                s.s8_duplicate_values,
+                s.s8_wasted_bytes,
+                s.s8_groups_dumped,
+                s.collection_total_objects,
+                s.collection_problem_count,
+                s.collection_overhead,
+                s.obj_array_total_objects,
+                s.obj_array_problem_count,
+                s.obj_array_overhead,
+                s.prim_array_total_objects,
+                s.prim_array_problem_count,
+                s.prim_array_overhead,
+                debug_dir.display()
+            ),
+            Err(e) => eprintln!("Debug: failed to write problem dump: {}", e),
+        }
+    }
 
     // Phase 4: Generate HTML report
     eprintln!("\n=== Phase 4: Generating Report ===");
@@ -275,30 +335,26 @@ fn derive_report_path(heap_dump: &PathBuf) -> PathBuf {
     heap_dump.with_file_name(format!("{}.html", stem))
 }
 
-fn extract_jvm_info(heap: &ss_heap_model::heap_dump::HeapDump, stats: &ss_stats::engine::StatsEngine) {
-    let mut jvm_flags_raw = String::new();
-    let mut gc_type = String::from("Unknown");
-
-    // Collect JVM flags with strict filtering to avoid garbled output
-    for (_id, s) in &heap.string_table {
-        if (s.starts_with("-X") || s.starts_with("-XX:")) && s.len() < 200 && !s.contains('\0') && !s.contains('\n') {
-            // Must look like a real JVM flag: starts with known prefix + reasonable length
-            let is_valid = if s.starts_with("-Xmx") || s.starts_with("-Xms") || s.starts_with("-Xmn") || s.starts_with("-Xss") {
-                true // -Xmx<size>, -Xms<size> etc.
-            } else if s.starts_with("-XX:") {
-                // -XX:+Flag, -XX:-Flag, -XX:Flag=value
-                s.contains('=') || s.contains("+") || s.contains("-")
-            } else if s.starts_with("-X") {
-                s.len() < 50 // Other -X flags should be short
-            } else {
-                false
-            };
-            if is_valid {
-                if !jvm_flags_raw.is_empty() { jvm_flags_raw.push(' '); }
-                jvm_flags_raw.push_str(s);
-            }
-        }
+fn extract_jvm_info(
+    heap: &ss_heap_model::heap_dump::HeapDump,
+    stats: &ss_stats::engine::StatsEngine,
+    jvm_flags_file: Option<&str>,
+    sys_props: &[(String, String)],
+) {
+    // JVM startup flags are not stored in HPROF by default. Use, in order:
+    //   1. an explicit --jvm-flags-file
+    //   2. java.vm.inputarguments / jxray.java.vm.inputarguments properties
+    // Never guess flags by scanning arbitrary heap strings.
+    let mut jvm_flags_raw = jvm_flags_file.unwrap_or("").trim().to_string();
+    if jvm_flags_raw.is_empty() {
+        jvm_flags_raw = sys_props
+            .iter()
+            .find(|(k, _)| k == "java.vm.inputarguments" || k == "jxray.java.vm.inputarguments")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
     }
+
+    let mut gc_type = String::from("Unknown");
 
     // Detect GC type from flags (iterate in reverse: last flag wins)
     let flags: Vec<&str> = jvm_flags_raw.split_whitespace().collect();
@@ -340,29 +396,8 @@ fn extract_jvm_info(heap: &ss_heap_model::heap_dump::HeapDump, stats: &ss_stats:
         }
     }
 
-    // Default GC type based on Java version if no explicit flag found
-    if gc_type == "Unknown" {
-        let java_version = heap.string_table.values().find(|s| {
-            (s.starts_with("1.8.") || s.starts_with("9.") || s.starts_with("1")
-                || (s.len() >= 5 && s.len() < 30
-                    && s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    && s.contains('.')
-                    && s.chars().take(2).all(|c| c.is_ascii_digit())))
-                && !s.starts_with("-")
-        }).and_then(|s| {
-            // Extract major version
-            if s.starts_with("1.8.") { Some(8) }
-            else if let Some(dot) = s.find('.') {
-                s[..dot].parse::<i32>().ok()
-            } else { None }
-        });
-
-        gc_type = if java_version.unwrap_or(8) >= 9 {
-            "G1".to_string()
-        } else {
-            "Parallel".to_string()
-        };
-    }
+    // Do not guess the GC type from the Java version when no flags are
+    // available: the report must say "not provided" rather than invent one.
 
     // Calculate G1 region size if not explicitly set
     if g1_region_size <= 0 {
@@ -384,8 +419,10 @@ fn extract_jvm_info(heap: &ss_heap_model::heap_dump::HeapDump, stats: &ss_stats:
         g1_region_size = region_mb * 1024 * 1024;
     }
 
-    // Extract system property values by pattern matching
-    let mut value_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Prefer the real System.getProperties() object graph. The string-table
+    // heuristics below only fill keys that the object graph did not provide.
+    let mut value_map: std::collections::HashMap<String, String> =
+        sys_props.iter().cloned().collect();
 
     for (_id, s) in &heap.string_table {
         let s = s.as_str();
@@ -464,7 +501,6 @@ fn extract_jvm_info(heap: &ss_heap_model::heap_dump::HeapDump, stats: &ss_stats:
         }
     }
 
-    // Also try to detect pointer size from os.arch
     let ptr_size = heap.identifier_size;
 
     // Build sorted property list
@@ -503,14 +539,4 @@ fn parse_memory_flag(s: &str) -> i64 {
         Ok(v) => v * multiplier,
         Err(_) => -1,
     }
-}
-
-/// Update JVM info with system properties extracted from the object graph.
-fn update_system_properties(stats: &Arc<ss_stats::engine::StatsEngine>, props: Vec<(String, String)>) {
-    if props.is_empty() {
-        return;
-    }
-    let mut info = stats.jvm_info.get();
-    info.system_properties = props;
-    stats.jvm_info.set(info);
 }

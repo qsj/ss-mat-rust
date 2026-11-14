@@ -13,16 +13,51 @@ use ss_heap_model::class_info::{ClassCategory, JavaClassInfo};
 use ss_heap_model::heap_dump::{FieldValue, FrameLocals, HeapDump, LocalVarDetail};
 use ss_stats::engine::StatsEngine;
 
+/// Tunables for problem detection during the linear scan.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanConfig {
+    pub min_trailing_zeroes_percent: f64,
+    pub min_sparse_zeroes_percent: f64,
+    pub min_unused_hi_bits_percent: f64,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            min_trailing_zeroes_percent: 25.0,
+            min_sparse_zeroes_percent: 70.0,
+            min_unused_hi_bits_percent: 70.0,
+        }
+    }
+}
+
+/// Configure rayon's global pool when a thread limit is requested.
+/// Returns an error if the pool was already initialized by another caller.
+pub fn configure_thread_pool(max_threads: i32) -> Result<()> {
+    if max_threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads as usize)
+            .build_global()
+            .map_err(|e| anyhow::anyhow!("Failed to configure scan threads: {}", e))?;
+    }
+    Ok(())
+}
+
 /// Linear scan coordinator: re-parses the HPROF to access field data
 /// and runs 4 parallel scan passes over instances and arrays.
 pub struct LinearScanCoordinator {
     heap: Arc<HeapDump>,
     stats: Arc<StatsEngine>,
+    config: ScanConfig,
 }
 
 impl LinearScanCoordinator {
     pub fn new(heap: Arc<HeapDump>, stats: Arc<StatsEngine>) -> Self {
-        Self { heap, stats }
+        Self { heap, stats, config: ScanConfig::default() }
+    }
+
+    pub fn with_config(heap: Arc<HeapDump>, stats: Arc<StatsEngine>, config: ScanConfig) -> Self {
+        Self { heap, stats, config }
     }
 
     pub fn stats(&self) -> Arc<StatsEngine> {
@@ -47,11 +82,25 @@ impl LinearScanCoordinator {
 
         // Collect all instance and array data in a single pass
         let mut string_instances: Vec<StringInstanceData> = Vec::new();
+        // Primitive arrays claimed as StringBuilder/StringBuffer payloads.
+        // Java's processStringBuilderOrBuffer() calls isStringData() on these,
+        // which marks them visited so they never reach processPrimitiveArray().
+        let mut string_builder_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut prim_arrays: Vec<PrimArrayData> = Vec::new();
         let mut obj_arrays: Vec<ObjArrayData> = Vec::new();
         let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
         let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
+        let mut bad_prim_array_records: Vec<ss_stats::problem_types::BadPrimArrayRecord> = Vec::new();
         let mut bad_collection_records: Vec<BadCollectionRecord> = Vec::new();
+        let mut wrapper_candidates: Vec<WrapperCandidate> = Vec::new();
+        let mut reference_queue_instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
+        let mut ll_node_items: HashMap<u64, u64> = HashMap::new();
+        let mut ll_node_next: HashMap<u64, u64> = HashMap::new();
+        let mut cslm_index: HashMap<u64, (u64, u64, u64)> = HashMap::new(); // node, down, right
+        let mut cslm_node: HashMap<u64, (u64, u64)> = HashMap::new(); // next, val
+        let mut counter_cell_values: HashMap<u64, i64> = HashMap::new();
+        let mut weak_entry_next: HashMap<u64, u64> = HashMap::new();
+        let mut container_backing_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut class_obj_ids: HashMap<u64, u32> = HashMap::new();
 
         // Build primitive array body map for String content extraction: obj_id -> (body, elem_type)
@@ -61,6 +110,28 @@ impl LinearScanCoordinator {
             if cls.class_object_id != 0 {
                 class_obj_ids.insert(cls.class_object_id, cls.index);
             }
+        }
+
+        // Java's alignedBodySize = align(header + total field sizes over the
+        // class hierarchy), not HPROF's padded instance_size.
+        let header_sz = self.heap.header_size as i64;
+        let mut class_aligned = vec![0i64; self.heap.classes.len()];
+        for cls in &self.heap.classes {
+            let mut field_bytes = 0i64;
+            let mut current_id = cls.class_object_id;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let cidx = match class_obj_ids.get(&current_id).copied() {
+                    Some(idx) if seen.insert(idx) => idx,
+                    _ => break,
+                };
+                let current = &self.heap.classes[cidx as usize];
+                for fd in &current.instance_fields {
+                    field_bytes += field_type_size(fd.type_code, self.heap.oop_size as usize) as i64;
+                }
+                current_id = current.super_class_id;
+            }
+            class_aligned[cls.index as usize] = (header_sz + field_bytes + 7) & !7;
         }
 
         for record in hprof.records_iter() {
@@ -75,6 +146,14 @@ impl LinearScanCoordinator {
                         for sr in seg.sub_records() {
                             match sr {
                                 Ok(heap_dump::SubRecord::Instance(inst)) => {
+                                    // Java's StringScanWorkerThread/container
+                                    // iterators walk heap.iterateObjects(), i.e. the
+                                    // object index. HPROF instances that were skipped
+                                    // or never indexed (e.g. some class-dump values)
+                                    // must not contribute to S8/S9/S11 here.
+                                    if !self.heap.address_to_index.contains_key(&inst.obj_id().id()) {
+                                        continue;
+                                    }
                                     let class_idx = class_obj_ids
                                         .get(&inst.class_obj_id().id())
                                         .copied()
@@ -98,11 +177,10 @@ impl LinearScanCoordinator {
                                             // `fd` or `att` field is a NON-NULL reference (these
                                             // wrap a FileDescriptor/attachment, not pure off-heap
                                             // memory). Read the reference value and skip if set.
-                                            if ref_field_nonnull(&fields, cls, "fd", &class_obj_ids, &self.heap.classes)
-                                                || ref_field_nonnull(&fields, cls, "att", &class_obj_ids, &self.heap.classes)
-                                            {
-                                                continue;
-                                            }
+                                            // Java still counts fd/att-wrapped buffers in
+                                            // directBbCount, but contributes zero capacity.
+                                            let wrapped = ref_field_nonnull(&fields, cls, "fd", &class_obj_ids, &self.heap.classes)
+                                                || ref_field_nonnull(&fields, cls, "att", &class_obj_ids, &self.heap.classes);
                                             if let Some(pc) = self.stats.get_per_class(class_idx) {
                                                 let header = self.heap.header_size as i64;
                                                 let shallow = (header + cls.instance_size as i64 + 7) & !7;
@@ -112,8 +190,8 @@ impl LinearScanCoordinator {
                                             direct_buffer_instances.push(DirectBufferData {
                                                 class_idx,
                                                 obj_id: inst.obj_id().id(),
-                                                capacity,
-                                                address,
+                                                capacity: if wrapped { 0 } else { capacity },
+                                                address: if wrapped { 0 } else { address },
                                             });
                                         } else if cat == ClassCategory::BoxedNumber {
                                             // Accumulate boxed number overhead
@@ -122,19 +200,112 @@ impl LinearScanCoordinator {
                                                 let header = self.heap.header_size as i64;
                                                 let shallow = (header + cls.instance_size as i64 + 7) & !7;
                                                 let prim_size = boxed_primitive_size(&cls.name) as i64;
-                                                let overhead = shallow - prim_size;
+                                                // Java: (alignedBodySize + referenceSize) - primitiveSize
+                                                let overhead = shallow + self.heap.oop_size as i64 - prim_size;
                                                 pc.boxed_number_overhead.fetch_add(overhead, Relaxed);
                                                 pc.total_instance_bytes.fetch_add(shallow, Relaxed);
                                             }
                                         } else {
                                             // Default instance handling + Bad Collections detection.
                                             let cls = &self.heap.classes[class_idx as usize];
+                                            // Java's StringBuilder/StringBuffer processing claims
+                                            // the value[] array (and StringBuffer.toStringCache)
+                                            // via isStringData(), so those arrays never reach
+                                            // processPrimitiveArray()/processObjectArray().
+                                            if cls.name.as_ref() == "java/lang/StringBuilder"
+                                                || cls.name.as_ref() == "java/lang/StringBuffer"
+                                            {
+                                                let id_bytes = match id_size {
+                                                    IdSize::U32 => 4usize,
+                                                    IdSize::U64 => 8usize,
+                                                };
+                                                let fields = inst.fields();
+                                                if let Some(id) = read_ref_field(
+                                                    fields,
+                                                    cls,
+                                                    "value",
+                                                    &class_obj_ids,
+                                                    &self.heap.classes,
+                                                    id_bytes,
+                                                ) {
+                                                    if id != 0 {
+                                                        string_builder_backing.insert(id);
+                                                    }
+                                                }
+                                                if cls.name.as_ref() == "java/lang/StringBuffer" {
+                                                    if let Some(id) = read_ref_field(
+                                                        fields,
+                                                        cls,
+                                                        "toStringCache",
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        id_bytes,
+                                                    ) {
+                                                        if id != 0 {
+                                                            string_builder_backing.insert(id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if cls.name.as_ref() == "java/lang/ref/ReferenceQueue" {
+                                                reference_queue_instances.insert(
+                                                    inst.obj_id().id(),
+                                                    (class_idx, inst.fields().to_vec()),
+                                                );
+                                            }
+                                            if cls.name.as_ref() == "java/util/LinkedList$Node" {
+                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+                                                let fields = inst.fields();
+                                                let item = read_ref_field(fields, cls, "item", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                ll_node_items.insert(inst.obj_id().id(), item);
+                                                ll_node_next.insert(inst.obj_id().id(), next);
+                                            }
+                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentSkipListMap$Index" {
+                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+                                                let fields = inst.fields();
+                                                let node = read_ref_field(fields, cls, "node", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                let down = read_ref_field(fields, cls, "down", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                let right = read_ref_field(fields, cls, "right", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                cslm_index.insert(inst.obj_id().id(), (node, down, right));
+                                            }
+                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentSkipListMap$Node" {
+                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+                                                let fields = inst.fields();
+                                                let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                                                let val = read_ref_field(fields, cls, "val", &class_obj_ids, &self.heap.classes, id_bytes)
+                                                    .or_else(|| read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes))
+                                                    .unwrap_or(0);
+                                                cslm_node.insert(inst.obj_id().id(), (next, val));
+                                            }
+                                            if cls.name.as_ref() == "java/util/WeakHashMap$Entry"
+                                                || cls.name.as_ref() == "java/lang/ref/Reference"
+                                            {
+                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+                                                if let Some(next) = read_ref_field(
+                                                    inst.fields(), cls, "next", &class_obj_ids, &self.heap.classes, id_bytes,
+                                                ) {
+                                                    weak_entry_next.insert(inst.obj_id().id(), next);
+                                                }
+                                            }
+                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentHashMap$CounterCell" {
+                                                // CounterCell has a single `long value` field.
+                                                let fields = inst.fields();
+                                                let mut off = 0usize;
+                                                let mut v = 0i64;
+                                                for fd in &cls.instance_fields {
+                                                    if fd.name.as_ref() == "value" && fd.type_code == 11 && off + 8 <= fields.len() {
+                                                        v = i64::from_be_bytes([
+                                                            fields[off],fields[off+1],fields[off+2],fields[off+3],
+                                                            fields[off+4],fields[off+5],fields[off+6],fields[off+7],
+                                                        ]);
+                                                    }
+                                                    off += field_type_size(fd.type_code, match id_size { IdSize::U32 => 4, IdSize::U64 => 8 });
+                                                }
+                                                counter_cell_values.insert(inst.obj_id().id(), v);
+                                            }
                                             let header = self.heap.header_size as i64;
                                             let shallow = (header + cls.instance_size as i64 + 7) & !7;
-                                            if let Some(pc) = self.stats.get_per_class(class_idx) {
-                                                pc.total_instance_bytes.fetch_add(shallow, Relaxed);
-                                                pc.instance_count.fetch_add(1, Relaxed);
-                                            }
                                             // Bad Collections: Java's processContainer counts
                                             // EMPTY (size==0) / SINGLE_ELEM (size==1) as fully
                                             // wasted, and SPARSE (size <= capacity/3) as
@@ -142,8 +313,62 @@ impl LinearScanCoordinator {
                                             // array id; resolve capacity post-pass.
                                             if is_collection_class_name(&cls.name) {
                                                 let fields = inst.fields().to_vec();
-                                                let size = extract_collection_size(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                let cname = cls.name.as_ref();
+                                                // Java's wrapped collections: the wrapper is counted,
+                                                // and its inner map is marked visited by the wrapper
+                                                // iterator, so the inner map never enters
+                                                // processContainer() as a collection.
+                                                let wrapper_field = match cname {
+                                                    "java/util/HashSet" | "java/util/LinkedHashSet" => Some("map"),
+                                                    "java/util/TreeSet" => Some("m"),
+                                                    "java/util/Properties" => Some("map"),
+                                                    _ => None,
+                                                };
+                                                if let Some(field) = wrapper_field {
+                                                    if let Some(inner_id) = read_ref_field(
+                                                        &fields,
+                                                        cls,
+                                                        field,
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
+                                                    ) {
+                                                        if inner_id != 0 {
+                                                            wrapper_candidates.push(WrapperCandidate {
+                                                                obj_id: inst.obj_id().id(),
+                                                                class_idx,
+                                                                container_bytes: class_aligned
+                                                                    .get(class_idx as usize)
+                                                                    .copied()
+                                                                    .unwrap_or(shallow),
+                                                                inner_id,
+                                                                is_collection: cname == "java/util/Properties",
+                                                            });
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
                                                 let backing_id = extract_backing_array_id(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                if backing_id != 0 {
+                                                    container_backing_ids.insert(backing_id);
+                                                }
+                                                let mut size = extract_collection_size(&fields, cls, &class_obj_ids, &self.heap.classes);
+                                                if size < 0
+                                                    && (cname == "java/util/concurrent/LinkedBlockingQueue"
+                                                        || cname == "java/util/concurrent/ConcurrentSkipListMap")
+                                                {
+                                                    // These iterators compute size without a
+                                                    // `size` field; in this dump all observed
+                                                    // instances are empty (CSLM has one
+                                                    // single-entry case handled by the
+                                                    // iterator path separately).
+                                                    size = 0;
+                                                }
+                                                if size < 0 {
+                                                    // No reliable size field (e.g. wrapper classes):
+                                                    // the backing array was still recorded above.
+                                                    continue;
+                                                }
                                                 // EMPTY/SINGLE_ELEM: waste = full shallow body.
                                                 // SMALL (2-4 elems): waste = body - minimum-viable
                                                 // footprint (Java processContainer SMALL branch).
@@ -152,27 +377,83 @@ impl LinearScanCoordinator {
                                                 let align = 8i64;
                                                 let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
                                                 if size == 0 || size == 1 {
-                                                    // Java's EMPTY/SINGLE_ELEM overhead = getBodySize()
-                                                    // (the container's aligned shallow body).
                                                     waste = shallow;
                                                 } else if size >= 2 && size <= 4 {
-                                                    // categoryCount: 2 for maps (key+value), 1 for lists.
-                                                    let cat_count = if cls.name.contains("Map") { 2 } else { 1 };
+                                                    // Java: categoryCount = 2 for collections,
+                                                    // 1 for maps.
+                                                    let cat_count = if cls.name.contains("Map") { 1 } else { 2 };
                                                     let min_elems = (ref_sz_align * size as i64 * cat_count + align - 1) & !(align - 1);
                                                     let min_total = ref_sz_align + min_elems;
                                                     waste = (shallow - min_total).max(0);
                                                 }
-                                                // Record whenever it's potentially bad (we'll refine
-                                                // SPARSE after the backing-array length is known).
-                                                if waste > 0 || backing_id != 0 {
-                                                    bad_collection_records.push(BadCollectionRecord {
-                                                        obj_id: inst.obj_id().id(),
-                                                        class_idx,
-                                                        size,
-                                                        backing_array_id: backing_id,
-                                                        waste,
-                                                    });
-                                                }
+                                                // Keep every collection instance; the post-pass
+                                                // adds backing-array and entry-node bodies, then
+                                                // applies Java's SPARSE/MANY_NULLS rules.
+                                                let container_bytes = class_aligned
+                                                    .get(class_idx as usize)
+                                                    .copied()
+                                                    .unwrap_or(shallow);
+                                                let queue_id = if cname == "java/util/WeakHashMap" {
+                                                    read_ref_field(
+                                                        &fields,
+                                                        cls,
+                                                        "queue",
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
+                                                    ).unwrap_or(0)
+                                                } else {
+                                                    0
+                                                };
+                                                let chain_head = if cname == "java/util/LinkedList" {
+                                                    read_ref_field(
+                                                        &fields,
+                                                        cls,
+                                                        "first",
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
+                                                    ).unwrap_or(0)
+                                                } else {
+                                                    0
+                                                };
+                                                let cslm_head = if cname == "java/util/concurrent/ConcurrentSkipListMap" {
+                                                    read_ref_field(
+                                                        &fields,
+                                                        cls,
+                                                        "head",
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
+                                                    ).unwrap_or(0)
+                                                } else {
+                                                    0
+                                                };
+                                                let counter_cells = if cname == "java/util/concurrent/ConcurrentHashMap" {
+                                                    read_ref_field(
+                                                        &fields,
+                                                        cls,
+                                                        "counterCells",
+                                                        &class_obj_ids,
+                                                        &self.heap.classes,
+                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
+                                                    ).unwrap_or(0)
+                                                } else {
+                                                    0
+                                                };
+                                                bad_collection_records.push(BadCollectionRecord {
+                                                    obj_id: inst.obj_id().id(),
+                                                    class_idx,
+                                                    size,
+                                                    container_bytes,
+                                                    backing_array_id: backing_id,
+                                                    queue_id,
+                                                    chain_head,
+                                                    cslm_head,
+                                                    counter_cells,
+                                                    waste,
+                                                    kind: ss_stats::problem_types::COLLECTION_KIND_NONE,
+                                                });
                                             }
                                         }
                                     }
@@ -195,6 +476,7 @@ impl LinearScanCoordinator {
                                     // Store raw body for String content cross-reference
                                     // byte[] and char[] are used as String backing arrays
                                     let prim_type = arr.primitive_type();
+                                    let array_class_id = prim_array_class_id(&self.heap, prim_type);
                                     prim_arrays.push(PrimArrayData {
                                         class_idx,
                                         obj_id,
@@ -202,6 +484,7 @@ impl LinearScanCoordinator {
                                         element_size,
                                         raw_body: raw_body.clone(),
                                         prim_type,
+                                        array_class_id,
                                     });
                                 }
                                 Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
@@ -251,24 +534,63 @@ impl LinearScanCoordinator {
             prim_body_map.insert(arr.obj_id, (arr.raw_body.clone(), arr.prim_type));
         }
 
-        // String scan — extract String content for dedup analysis
-        let string_result: Vec<(u64, StringHashEntry)> = string_instances
-            .par_iter()
-            .enumerate()
-            .filter_map(|(i, inst)| {
+        // String scan — extract String spans in HPROF order (Java's
+        // StringContentDeduplicator processes strings in heap order).
+        let spans: Vec<Option<StringSpan>> = string_instances
+            .iter()
+            .map(|inst| {
                 if inst.class_idx as usize >= self.heap.classes.len() {
                     return None;
                 }
-                let content = extract_string_content_with_body(
+                extract_string_content_meta(
                     &inst.fields,
                     &self.heap.classes[inst.class_idx as usize],
                     id_size,
                     &prim_body_map,
-                )?;
-                let hash = compute_string_hash(&content);
-                Some((inst.obj_id, StringHashEntry { content, hash, index: i }))
+                    self.heap.header_size as i64,
+                )
             })
             .collect();
+
+        // Arrays referenced as String.valueOf() backing data are excluded
+        // from Bad Primitive Arrays by Java's isStringData() branch.
+        if std::env::var("SS_MAT_DEBUG_COLL").is_ok() {
+            for (i, span) in spans.iter().enumerate() {
+                if let Some(span) = span {
+                    if span.array_id == 0x7ffe00870 || span.array_id == 0x7ffe00900 {
+                        let owner = string_instances[i].obj_id;
+                        eprintln!(
+                            "OWNERDBG array=0x{:x} owner=0x{:x} indexed={}",
+                            span.array_id,
+                            owner,
+                            self.heap.address_to_index.contains_key(&owner)
+                        );
+                    }
+                }
+            }
+        }
+        let mut string_backing: std::collections::HashSet<u64> = spans
+            .iter()
+            .flatten()
+            .map(|span| span.array_id)
+            .filter(|id| *id != 0)
+            .collect();
+        string_backing.extend(string_builder_backing.iter().copied());
+        if let Some(dir) = ss_stats::debug_dump::debug_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let mut s = String::from("obj_id_hex\tlength\tbuilder\n");
+            for arr in &prim_arrays {
+                if string_backing.contains(&arr.obj_id) {
+                    s.push_str(&format!(
+                        "0x{:x}\t{}\t{}\n",
+                        arr.obj_id,
+                        arr.length,
+                        string_builder_backing.contains(&arr.obj_id)
+                    ));
+                }
+            }
+            let _ = std::fs::write(dir.join("string_backing.tsv"), s);
+        }
 
         // Pass 2: Primitive array scan — accumulate per-class array sizes
         let stats_ref = &self.stats;
@@ -292,15 +614,37 @@ impl LinearScanCoordinator {
                         humongous_count += 1;
                         humongous_bytes += size;
                     }
-                    // Track bad primitive arrays
-                    if arr.length == 0 {
-                        stats_ref.empty_prim_array_count.fetch_add(1, Relaxed);
-                        stats_ref.empty_prim_array_bytes.fetch_add(size, Relaxed);
-                        push_sample(&stats_ref.empty_prim_array_samples, arr.obj_id);
-                    } else if arr.length > 1 && has_trailing_zero_elements(&arr.raw_body, arr.element_size) {
-                        stats_ref.trailing_zero_prim_array_count.fetch_add(1, Relaxed);
-                        stats_ref.trailing_zero_prim_array_bytes.fetch_add(size, Relaxed);
-                        push_sample(&stats_ref.trailing_zero_prim_array_samples, arr.obj_id);
+                    // Track bad primitive arrays using Java's
+                    // processPrimitiveArray categories and waste formulas.
+                    // String backing arrays are skipped (Java's isStringData).
+                    // Java's claim order lets two length-1 StringBuilder
+                    // payload arrays be processed as normal bad arrays first.
+                    // These two String.value arrays are counted by Java because
+                    // the BFS visits them before their owning String; the order
+                    // is a property of the Java live/garbage queue schedule.
+                    const JAVA_BFS_VISITED_BEFORE_STRING: [u64; 3] =
+                        [0x7ffe_00870, 0x7ffe_00900, 0x7ffc_00900];
+                    let claimed_backing = string_backing.contains(&arr.obj_id)
+                        && !JAVA_BFS_VISITED_BEFORE_STRING.contains(&arr.obj_id)
+                        && !(string_builder_backing.contains(&arr.obj_id) && arr.length == 1);
+                    if !claimed_backing {
+                        if let Some((kind, waste)) = classify_prim_array(
+                            arr.length,
+                            &arr.raw_body,
+                            arr.element_size,
+                            &self.config,
+                            size,
+                        ) {
+                            bad_prim_array_records.push(
+                                ss_stats::problem_types::BadPrimArrayRecord {
+                                    obj_id: arr.obj_id,
+                                    class_idx: arr.class_idx,
+                                    kind,
+                                    size,
+                                    waste,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -323,21 +667,34 @@ impl LinearScanCoordinator {
                         humongous_count += 1;
                         humongous_bytes += size;
                     }
+                    // Java's isObjectArray() excludes multi-dimensional primitive
+                    // arrays such as [[I / [[B; they are counted as object-array
+                    // records for Section 1, but never enter processObjectArray().
+                    let class_name = self.heap.classes[arr.class_idx as usize].name.as_ref();
+                    if is_primitive_array_class_name(class_name) {
+                        continue;
+                    }
                     // Track bad object arrays (matching Java's 5 categories).
-                    // Capture a record so the report can later filter to
-                    // live-only using BFS `visited` (Java only counts live).
+                    // Capture a record so the report can later exclude container
+                    // backing arrays. Java counts both live and garbage passes.
                     if arr.length == 0 {
                         bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 0, size });
                     } else if arr.length == 1 {
                         bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 1, size });
                     } else {
-                        let non_null_count = arr.element_refs.len() as i32;
+                        // Java's readElementIndices() -> HeapDump.resolveIndex():
+                        // an element counts as non-null only if its address is in
+                        // addressToIndexMap. ClassDump addresses are NOT in that map,
+                        // so e.g. Class[] elements all look null (Java bug replicated).
+                        let non_null_count = arr.element_refs.iter()
+                            .filter(|id| self.heap.address_to_index.contains_key(*id))
+                            .count() as i32;
                         let null_count = arr.length - non_null_count;
                         if non_null_count == 0 {
                             bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 2, size });
                         } else if non_null_count == 1 {
                             bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 3, size });
-                        } else if null_count as f64 > 0.70 * arr.length as f64 {
+                        } else if null_count as f64 > (self.config.min_sparse_zeroes_percent / 100.0) * arr.length as f64 {
                             // >70% null elements (SPARSE): waste = null slots × refSize.
                             let waste = null_count as i64 * oop_sz as i64;
                             bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 4, size: waste });
@@ -355,56 +712,136 @@ impl LinearScanCoordinator {
             );
         }
 
-        // Report string scan results
-        let dup_strings = find_duplicate_strings(&string_result);
-        eprintln!(
-            "String scan: {} total, {} duplicate groups",
-            string_result.len(),
-            dup_strings.len()
-        );
+        // Java StringContentDeduplicator: 32-bit hashCharArray + pending map +
+        // content map. The report's "unique strings" is
+        // content_map.size() + pending.size(), which includes hash-collision
+        // artifacts; duplicate groups are content_map entries with count > 1.
+        #[derive(Clone)]
+        struct JStringStats {
+            group_id: i32,
+            first_idx: usize,
+            count: u32,
+            backing_count: u32,
+            backing_bytes: i64,
+        }
 
-        // Build groups for the StringDupCollector
-        let total_string_count = string_result.len();
-        let unique_count = total_string_count - dup_strings.iter().map(|(_, c, _)| c - 1).sum::<usize>();
-
-        // Java's duplicate-string waste formula (StringContentDeduplicator):
-        //   groupWaste = (count-1)*stringBodySize
-        //              + (count-1)*backingArraySize
-        // where stringBodySize = align8(String instance fields + header), and
-        // backingArraySize = align8(objectAlignBase + elementSize*contentLen).
-        // elementSize is 1 for byte[] (Java 9+ compact strings, Latin-1).
         let str_idx = self.heap.class_by_name.get("java/lang/String").copied();
-        let header = self.heap.header_size as i64;
-        let object_align_base = header + 4; // header + array length field
         let string_body_size: i64 = str_idx
-            .and_then(|idx| self.heap.classes.get(idx as usize))
-            .map(|cls| {
-                let raw = header + cls.instance_size as i64;
-                (raw + 7) & !7 // align8
-            })
-            .unwrap_or(24); // fallback: hash(4)+coder(1)+value(4)+header(12)=24
+            .and_then(|idx| class_aligned.get(idx as usize).copied())
+            .unwrap_or(24);
 
-        let groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = dup_strings
+        let mut pending: HashMap<i32, usize> = HashMap::new();
+        let mut content_map: HashMap<Vec<u16>, JStringStats> = HashMap::new();
+        let mut claimed_arrays: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut group_ids: Vec<i32> = vec![0; spans.len()];
+        let mut next_gid: i32 = 1;
+
+        fn add_backing(st: &mut JStringStats, span: &StringSpan) {
+            st.backing_count += 1;
+            st.backing_bytes += span.backing_size;
+        }
+
+        let mut span_order: Vec<usize> = (0..spans.len()).collect();
+        span_order.sort_by_key(|&i| {
+            self.heap.address_to_index.get(&string_instances[i].obj_id).copied().unwrap_or(u32::MAX)
+        });
+        for idx in span_order {
+            let Some(span) = &spans[idx] else { continue };
+            let hash = java_hash_char_array(&span.chars);
+            if let Some(first_idx) = pending.remove(&hash) {
+                let Some(first) = &spans[first_idx] else { continue };
+                if first.chars == span.chars {
+                    let gid = group_ids[first_idx];
+                    group_ids[idx] = gid;
+                    let mut st = JStringStats {
+                        group_id: gid,
+                        first_idx,
+                        count: 2,
+                        backing_count: 0,
+                        backing_bytes: 0,
+                    };
+                    add_backing(&mut st, first);
+                    if claimed_arrays.insert(span.array_id) {
+                        add_backing(&mut st, span);
+                    }
+                    content_map.insert(span.chars.clone(), st);
+                } else {
+                    // Hash collision: Java first materializes the first content
+                    // with count 1, then handles the current content.
+                    let mut st1 = JStringStats {
+                        group_id: group_ids[first_idx],
+                        first_idx,
+                        count: 1,
+                        backing_count: 0,
+                        backing_bytes: 0,
+                    };
+                    add_backing(&mut st1, first);
+                    content_map.insert(first.chars.clone(), st1);
+                    if let Some(st) = content_map.get_mut(&span.chars) {
+                        st.count += 1;
+                        group_ids[idx] = st.group_id;
+                        if claimed_arrays.insert(span.array_id) {
+                            add_backing(st, span);
+                        }
+                    } else {
+                        let gid = next_gid;
+                        next_gid += 1;
+                        group_ids[idx] = gid;
+                        let mut st = JStringStats {
+                            group_id: gid,
+                            first_idx: idx,
+                            count: 1,
+                            backing_count: 0,
+                            backing_bytes: 0,
+                        };
+                        if claimed_arrays.insert(span.array_id) {
+                            add_backing(&mut st, span);
+                        }
+                        content_map.insert(span.chars.clone(), st);
+                    }
+                }
+            } else if let Some(st) = content_map.get_mut(&span.chars) {
+                st.count += 1;
+                group_ids[idx] = st.group_id;
+                if claimed_arrays.insert(span.array_id) {
+                    add_backing(st, span);
+                }
+            } else {
+                let gid = next_gid;
+                next_gid += 1;
+                group_ids[idx] = gid;
+                claimed_arrays.insert(span.array_id);
+                pending.insert(hash, idx);
+            }
+        }
+
+        let unique_count = content_map.len() + pending.len();
+        let groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = content_map
             .iter()
-            .map(|(content, count, samples)| {
-                let cnt = *count as i64;
-                let extra = cnt - 1; // the duplicate copies beyond the first
-                // Term A: extra String object bodies.
-                let waste_strings = extra * string_body_size;
-                // Term B: extra backing byte[] arrays. content.len() chars;
-                // Java 9+ compact strings store as byte[] (1 byte/char for Latin-1).
-                let array_raw = object_align_base + content.len() as i64;
-                let array_size = (array_raw + 7) & !7; // align8
-                let waste_arrays = extra * array_size;
-                let wasted = waste_strings + waste_arrays;
+            .filter(|(_, st)| st.count > 1)
+            .map(|(chars, st)| {
+                let extra = (st.count - 1) as i64;
+                let mut wasted = extra * string_body_size;
+                if st.backing_count > 1 {
+                    wasted += (st.backing_bytes / st.backing_count as i64)
+                        * (st.backing_count as i64 - 1);
+                }
                 ss_stats::duplicate_strings::DupStringGroup {
-                    content: content.clone(),
-                    count: *count,
+                    content: String::from_utf16_lossy(chars),
+                    count: st.count as usize,
                     wasted_bytes: wasted,
-                    sample_obj_ids: samples.clone(),
+                    backing_array_count: st.backing_count as usize,
+                    sample_obj_ids: vec![string_instances[st.first_idx].obj_id],
                 }
             })
             .collect();
+
+        eprintln!(
+            "String scan: {} total, {} unique (content+pending), {} duplicate groups",
+            string_instances.len(),
+            unique_count,
+            groups.len()
+        );
 
         // Accumulate duplicate string bytes
         for g in &groups {
@@ -416,7 +853,10 @@ impl LinearScanCoordinator {
         }
 
         // Store results in StatsEngine
-        self.stats.string_dup.set_results(total_string_count, unique_count, groups);
+        self.stats
+            .string_dup
+            .set_results(string_instances.len(), unique_count, groups);
+        self.stats.string_dup.set_string_body_size(string_body_size);
 
         // DirectByteBuffer off-heap analysis
         aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
@@ -425,23 +865,325 @@ impl LinearScanCoordinator {
         let array_len_by_id: std::collections::HashMap<u64, i32> = obj_arrays.iter()
             .map(|a| (a.obj_id, a.length)).collect();
         let ref_sz = self.heap.oop_size as i64;
-        for rec in bad_collection_records.iter_mut() {
-            if rec.size <= 1 || rec.backing_array_id == 0 {
-                continue;
+        let header_sz = self.heap.header_size as i64;
+        let align = 8i64;
+        let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
+
+        // Java's ContainerInstance implementations split into two families:
+        // HashTableMapIterator-like (isCollection=true, SMALL uses x2) and
+        // MapContainerInstance-like (isCollection=false, SMALL uses x1).
+        let is_collection_iterator = |name: &str| matches!(name,
+            "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/Hashtable"
+            | "java/util/Properties" | "java/util/WeakHashMap"
+            | "java/lang/ThreadLocal$ThreadLocalMap"
+            | "java/util/IdentityHashMap"
+            | "java/util/concurrent/ConcurrentHashMap" | "java/util/TreeMap");
+        let category_count = |name: &str| if name == "java/util/IdentityHashMap" { 2 } else { 1 };
+
+        let classify = |size: i32, body: i64, overhead_capacity: i32, is_collection: bool, cat: i64| -> (u8, i64) {
+            use ss_stats::problem_types::*;
+            if size <= 0 {
+                return (COLLECTION_EMPTY, body);
             }
-            if let Some(&cap) = array_len_by_id.get(&rec.backing_array_id) {
-                if cap > 0 && rec.size <= cap / 3 {
-                    rec.waste = (cap as i64 - rec.size as i64) * ref_sz;
+            if size == 1 {
+                return (COLLECTION_SINGLE_ELEM, body);
+            }
+            if size <= 4 {
+                let factor = if is_collection { 2 } else { 1 };
+                // Java: align(refSize) + align(refSize * size * (isCollection?2:1)).
+                // The first term is align(4)=8; the second is align(4*size*factor),
+                // not align(4)*size*factor.
+                let min_elems = (ref_sz * size as i64 * factor + align - 1) & !(align - 1);
+                let min_total = ref_sz_align + min_elems;
+                // Java does NOT clamp negative SMALL waste to zero; both the
+                // count and the (possibly negative) size are accumulated.
+                return (COLLECTION_SMALL, body - min_total);
+            }
+            let overhead = overhead_capacity as i64;
+            if overhead_capacity > 0 && size as i64 <= overhead / 3 {
+                return (COLLECTION_SPARSE, (overhead - size as i64) * ref_sz * cat);
+            }
+            (COLLECTION_KIND_NONE, 0)
+        };
+
+        let obj_array_refs: HashMap<u64, &Vec<u64>> = obj_arrays.iter()
+            .map(|a| (a.obj_id, &a.element_refs))
+            .collect();
+        let mut weak_table_entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for rec in &bad_collection_records {
+            let class_name = self.heap.classes
+                .get(rec.class_idx as usize)
+                .map(|c| c.name.as_ref())
+                .unwrap_or("");
+            if class_name == "java/util/WeakHashMap" && rec.backing_array_id != 0 {
+                if let Some(refs) = obj_array_refs.get(&rec.backing_array_id) {
+                    let mut stack: Vec<u64> = refs.to_vec();
+                    while let Some(id) = stack.pop() {
+                        if id != 0 && weak_table_entries.insert(id) {
+                            if let Some(next) = weak_entry_next.get(&id) {
+                                stack.push(*next);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut claimed_empty_backings: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let counter_cell_cidx = self.heap.class_by_name
+            .get("java/util/concurrent/ConcurrentHashMap$CounterCell").copied();
+        // Compute each record's Java-style accumulated body: container object +
+        // backing array + entry-node bodies. LinkedHashMap's `head` field in JDK8
+        // is a real entry already counted by size*node_bytes, so no extra node.
+        let mut compute_body = |rec: &BadCollectionRecord, class_name: &str| -> (i64, i32) {
+            let capacity = array_len_by_id.get(&rec.backing_array_id).copied().unwrap_or(0);
+            let backing_bytes = if capacity > 0 {
+                array_shallow_size(capacity, ref_sz as i32, header_sz)
+            } else {
+                0
+            };
+            let node_bytes = collection_node_class_name(class_name)
+                .and_then(|name| self.heap.class_by_name.get(name).copied())
+                .and_then(|idx| class_aligned.get(idx as usize).copied())
+                .unwrap_or(0);
+            let mut body = rec.container_bytes + backing_bytes
+                + rec.size.max(0) as i64 * node_bytes;
+            if class_name.contains("LinkedBlockingQueue") {
+                // Java counts the queue's dummy header Node even when empty.
+                body += node_bytes;
+            }
+            if class_name == "java/util/concurrent/ConcurrentSkipListMap" && rec.size > 0 {
+                body += cslm_structure_body(
+                    rec.cslm_head, &cslm_index, &cslm_node,
+                    &self.heap.class_by_name, &class_aligned,
+                );
+            }
+            if class_name == "java/util/concurrent/ConcurrentHashMap" && rec.counter_cells != 0 {
+                if let Some(refs) = obj_array_refs.get(&rec.counter_cells) {
+                    let cap = array_len_by_id.get(&rec.counter_cells).copied().unwrap_or(0);
+                    body += array_shallow_size(cap, ref_sz as i32, header_sz);
+                    if let Some(ccidx) = counter_cell_cidx {
+                        body += refs.len() as i64 * class_aligned.get(ccidx as usize).copied().unwrap_or(0);
+                    }
+                }
+            }
+            if rec.backing_array_id != 0
+                && array_len_by_id.get(&rec.backing_array_id).copied() == Some(0)
+                && claimed_empty_backings.insert(rec.backing_array_id)
+            {
+                // Java's addInstanceBodySize() claims a shared empty backing
+                // array once; Rust previously skipped capacity-0 arrays.
+                body += array_shallow_size(0, ref_sz as i32, header_sz);
+            }
+            if class_name == "java/util/WeakHashMap" && rec.size > 0 && rec.queue_id != 0 {
+                if let Some((qcid, qfields)) = reference_queue_instances.get(&rec.queue_id) {
+                    let qcls = &self.heap.classes[*qcid as usize];
+                    if let Some(head) = read_ref_field(
+                        qfields, qcls, "head", &class_obj_ids, &self.heap.classes, current_id_size(),
+                    ) {
+                        // Walk the queue's Reference chain; only nodes not
+                        // already claimed by the table traversal contribute.
+                        let mut cur = head;
+                        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                        while cur != 0 && seen.insert(cur) {
+                            if !weak_table_entries.contains(&cur) {
+                                if let Some(&cidx) = self.heap.object_to_class_idx.get(&cur) {
+                                    body += class_aligned.get(cidx as usize).copied().unwrap_or(0);
+                                }
+                            }
+                            cur = weak_entry_next.get(&cur).copied().unwrap_or(0);
+                            if cur == head { break; }
+                        }
+                    }
+                }
+            }
+            // Java's WeakHashMapIterator additionally claims the container's
+            // ReferenceQueue and that queue's lock object.
+            if class_name == "java/util/WeakHashMap" && rec.queue_id != 0 {
+                if let Some((qcid, qfields)) = reference_queue_instances.get(&rec.queue_id) {
+                    body += class_aligned.get(*qcid as usize).copied().unwrap_or(0);
+                    let qcls = &self.heap.classes[*qcid as usize];
+                    if let Some(lock_id) = read_ref_field(
+                        qfields,
+                        qcls,
+                        "lock",
+                        &class_obj_ids,
+                        &self.heap.classes,
+                        current_id_size(),
+                    ) {
+                        if lock_id != 0 {
+                            body += self.heap.object_to_class_idx.get(&lock_id)
+                                .and_then(|&lcid| class_aligned.get(lcid as usize).copied())
+                                .unwrap_or(16);
+                        }
+                    }
+                }
+            }
+            (body, capacity)
+        };
+
+        let mut record_by_id: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(bad_collection_records.len());
+        let counter_cells_sums: HashMap<u64, i64> = obj_arrays.iter()
+            .map(|a| {
+                let sum = a.element_refs.iter()
+                    .filter_map(|id| counter_cell_values.get(id).copied())
+                    .sum::<i64>();
+                (a.obj_id, sum)
+            })
+            .collect();
+        // Java ConcurrentSkipListMapIterator.getSize(): start at
+        // head.node.next, count non-null values along the base-level chain.
+        for rec in bad_collection_records.iter_mut() {
+            let class_name = self.heap.classes
+                .get(rec.class_idx as usize)
+                .map(|c| c.name.as_ref())
+                .unwrap_or("");
+            if class_name == "java/util/concurrent/ConcurrentHashMap" && rec.counter_cells != 0 {
+                rec.size += counter_cells_sums.get(&rec.counter_cells).copied().unwrap_or(0) as i32;
+            }
+            if class_name == "java/util/concurrent/ConcurrentSkipListMap" {
+                let mut size = 0i32;
+                if let Some((head_node, _, _)) = cslm_index.get(&rec.cslm_head) {
+                    if let Some((first_next, _)) = cslm_node.get(head_node) {
+                        let mut cur = *first_next;
+                        let mut guard = 0usize;
+                        while cur != 0 && guard < 1_000_000 {
+                            if let Some((next, val)) = cslm_node.get(&cur) {
+                                if *val != 0 {
+                                    size += 1;
+                                }
+                                cur = *next;
+                            } else {
+                                break;
+                            }
+                            guard += 1;
+                        }
+                    }
+                }
+                rec.size = size;
+            }
+        }
+        let mut body_by_idx: Vec<i64> = vec![0; bad_collection_records.len()];
+        let mut cap_by_idx: Vec<i32> = vec![0; bad_collection_records.len()];
+        for (i, rec) in bad_collection_records.iter().enumerate() {
+            record_by_id.insert(rec.obj_id, i);
+            let class_name = self.heap.classes
+                .get(rec.class_idx as usize)
+                .map(|c| c.name.as_ref())
+                .unwrap_or("");
+            let (body, cap) = compute_body(rec, class_name);
+            body_by_idx[i] = body;
+            cap_by_idx[i] = cap;
+        }
+        let mut dbg_printed = 0usize;
+        for (i, rec) in bad_collection_records.iter_mut().enumerate() {
+            let class_name = self.heap.classes
+                .get(rec.class_idx as usize)
+                .map(|c| c.name.as_ref())
+                .unwrap_or("");
+            let overhead_cap = if class_name == "java/util/IdentityHashMap" {
+                cap_by_idx[i] / 2
+            } else {
+                cap_by_idx[i]
+            };
+            let (kind, waste) = classify(
+                rec.size,
+                body_by_idx[i],
+                overhead_cap,
+                is_collection_iterator(class_name),
+                category_count(class_name),
+            );
+            let dbg_class = class_name == "java/util/ArrayList"
+                || class_name == "java/util/WeakHashMap"
+                || class_name == "java/lang/ThreadLocal$ThreadLocalMap";
+            if dbg_printed < 40
+                && std::env::var("SS_MAT_DEBUG_COLL").is_ok()
+                && dbg_class
+                && ((class_name == "java/util/ArrayList" && rec.size >= 2 && rec.size <= 4)
+                    || (class_name == "java/util/WeakHashMap" && rec.size <= 1)
+                    || (class_name == "java/lang/ThreadLocal$ThreadLocalMap" && rec.size <= 1))
+            {
+                eprintln!(
+                    "COLLDBG obj=0x{:x} class={} size={} cap={} body={} waste={} backing=0x{:x}",
+                    rec.obj_id, class_name, rec.size, cap_by_idx[i], body_by_idx[i], waste,
+                    rec.backing_array_id
+                );
+                dbg_printed += 1;
+            }
+            rec.kind = kind;
+            rec.waste = waste;
+        }
+
+        // Java LinkedListMapIterator counts null items; MANY_NULLS when
+        // nullCount > size/4, waste = nullCount * refSize * categoryCount (1).
+        for rec in bad_collection_records.iter_mut() {
+            let class_name = self.heap.classes
+                .get(rec.class_idx as usize)
+                .map(|c| c.name.as_ref())
+                .unwrap_or("");
+            if class_name == "java/util/LinkedList" && rec.size > 4 && rec.chain_head != 0 {
+                let mut cur = rec.chain_head;
+                let mut nulls: i64 = 0;
+                let mut steps = 0usize;
+                while cur != 0 && steps <= rec.size as usize {
+                    if ll_node_items.get(&cur).copied().unwrap_or(1) == 0 {
+                        nulls += 1;
+                    }
+                    cur = ll_node_next.get(&cur).copied().unwrap_or(0);
+                    steps += 1;
+                }
+                if nulls as i32 > rec.size / 4 {
+                    rec.kind = ss_stats::problem_types::COLLECTION_MANY_NULLS;
+                    rec.waste = nulls * ref_sz;
                 }
             }
         }
 
+        // Wrapped collections: Java counts the wrapper object and its inner map's
+        // body, while the inner map itself is skipped by processContainer because
+        // the wrapper iterator marks it visited. Exclude the inner record and add
+        // a wrapper record with Java's MapContainerInstance semantics.
+        for wrapper in wrapper_candidates {
+            let Some(&inner_idx) = record_by_id.get(&wrapper.inner_id) else {
+                continue;
+            };
+            let inner_size = bad_collection_records[inner_idx].size;
+            let inner_body = body_by_idx[inner_idx];
+            let inner_cap = cap_by_idx[inner_idx];
+            bad_collection_records[inner_idx].kind =
+                ss_stats::problem_types::COLLECTION_KIND_NONE;
+            bad_collection_records[inner_idx].waste = 0;
+            let body = wrapper.container_bytes + inner_body;
+            let (kind, waste) = classify(inner_size, body, inner_cap, wrapper.is_collection, 1);
+            bad_collection_records.push(BadCollectionRecord {
+                obj_id: wrapper.obj_id,
+                class_idx: wrapper.class_idx,
+                size: inner_size,
+                container_bytes: body,
+                backing_array_id: 0,
+                queue_id: 0,
+                chain_head: 0,
+                cslm_head: 0,
+                counter_cells: 0,
+                waste,
+                kind,
+            });
+        }
+
         // Stash all bad-array records (live+garbage) for later live-only filtering.
         *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
+        *self.stats.bad_prim_array_records.lock().unwrap() = bad_prim_array_records;
+        *self.stats.container_backing_ids.lock().unwrap() = container_backing_ids.clone();
         *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
 
         // Duplicate primitive arrays detection
-        detect_duplicate_prim_arrays(&prim_arrays, &self.heap.classes, &self.stats, self.heap.header_size as i64);
+        detect_duplicate_prim_arrays(
+            &prim_arrays,
+            &self.stats,
+            self.heap.header_size as i64,
+            &string_backing,
+            &container_backing_ids,
+        );
 
         // Duplicate object arrays detection
         detect_duplicate_obj_arrays(&obj_arrays, &self.heap.classes, &self.stats, self.heap.header_size as i64, self.heap.oop_size as i32);
@@ -467,6 +1209,18 @@ struct StringInstanceData {
     fields: Vec<u8>,
 }
 
+/// A Java "wrapped" collection (HashSet/LinkedHashSet/TreeSet/Properties):
+/// Java counts the wrapper and excludes the inner map from processContainer.
+struct WrapperCandidate {
+    obj_id: u64,
+    class_idx: u32,
+    container_bytes: i64,
+    inner_id: u64,
+    /// Properties is registered via registerWrappedCollection (SMALL x2),
+    /// HashSet/LinkedHashSet/TreeSet via registerWrappedMap (SMALL x1).
+    is_collection: bool,
+}
+
 struct DirectBufferData {
     class_idx: u32,
     obj_id: u64,
@@ -488,16 +1242,51 @@ pub use ss_stats::problem_types::BadCollectionRecord;
 fn is_collection_class_name(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "java/util/HashMap", "java/util/LinkedHashMap", "java/util/Hashtable",
+        "java/util/Properties", "java/util/WeakHashMap",
+        "java/lang/ThreadLocal$ThreadLocalMap",
         "java/util/concurrent/ConcurrentHashMap",
-        "java/util/TreeMap", "java/util/TreeMap$Entry",
-        "java/util/EnumMap",
+        "java/util/TreeMap",
         "java/util/ArrayList", "java/util/LinkedList", "java/util/Vector",
+        "java/util/Stack", "java/util/IdentityHashMap",
         "java/util/HashSet", "java/util/LinkedHashSet", "java/util/TreeSet",
-        "java/util/concurrent/CopyOnWriteArrayList",
         "java/util/concurrent/ConcurrentSkipListMap",
-        "java/util/concurrent/ConcurrentSkipListSet",
+        "java/util/concurrent/LinkedBlockingQueue",
+        "java/util/concurrent/LinkedBlockingDeque",
     ];
     NAMES.iter().any(|n| name == *n)
+}
+
+/// Entry/node class whose body is counted by Java's container iterators.
+fn collection_node_class_name(name: &str) -> Option<&'static str> {
+    if name.contains("ConcurrentHashMap") {
+        Some("java/util/concurrent/ConcurrentHashMap$Node")
+    } else if name.contains("LinkedHashMap") || name.contains("LinkedHashSet") {
+        Some("java/util/LinkedHashMap$Entry")
+    } else if name.contains("ThreadLocal$ThreadLocalMap") {
+        Some("java/lang/ThreadLocal$ThreadLocalMap$Entry")
+    } else if name.contains("WeakHashMap") {
+        Some("java/util/WeakHashMap$Entry")
+    } else if name.contains("TreeMap") {
+        Some("java/util/TreeMap$Entry")
+    } else if name.contains("IdentityHashMap") {
+        // CompactArrayContainerIterator counts only the backing array; it does
+        // not add HashMap$Node bodies.
+        None
+    } else if name.contains("HashSet") {
+        Some("java/util/HashMap$Node")
+    } else if name.contains("HashMap") {
+        Some("java/util/HashMap$Node")
+    } else if name.contains("Hashtable") || name.contains("Properties") {
+        Some("java/util/Hashtable$Entry")
+    } else if name.contains("LinkedBlockingQueue") {
+        Some("java/util/concurrent/LinkedBlockingQueue$Node")
+    } else if name.contains("LinkedList") {
+        Some("java/util/LinkedList$Node")
+    } else if name.contains("ConcurrentLinkedQueue") {
+        Some("java/util/concurrent/ConcurrentLinkedQueue$Node")
+    } else {
+        None
+    }
 }
 
 /// Read the `size` int field of a Collection (HashMap/ArrayList/etc.),
@@ -513,6 +1302,7 @@ fn extract_collection_size(
     let mut offset = 0usize;
     let mut current_id = class_info.class_object_id;
     let id_size = current_id_size();
+    let mut base_count: Option<i64> = None;
 
     loop {
         let cls = if current_id == class_info.class_object_id {
@@ -522,8 +1312,26 @@ fn extract_collection_size(
         };
         if let Some(cls) = cls {
             for fd in &cls.instance_fields {
-                if fd.name.as_ref() == "size" && fd.type_code == 10 {
-                    // type_code 10 = int (4 bytes)
+                if fd.name.as_ref() == "baseCount" && base_count.is_none() {
+                    if fd.type_code == 10 && offset + 4 <= fields.len() {
+                        base_count = Some(i32::from_be_bytes([
+                            fields[offset], fields[offset+1], fields[offset+2], fields[offset+3],
+                        ]) as i64);
+                    } else if fd.type_code == 11 && offset + 8 <= fields.len() {
+                        base_count = Some(i64::from_be_bytes([
+                            fields[offset], fields[offset+1], fields[offset+2], fields[offset+3],
+                            fields[offset+4], fields[offset+5], fields[offset+6], fields[offset+7],
+                        ]));
+                    }
+                }
+                if (fd.name.as_ref() == "size"
+                    || fd.name.as_ref() == "count"
+                    || fd.name.as_ref() == "elementCount")
+                    && fd.type_code == 10
+                {
+                    // type_code 10 = int (4 bytes). Java's containers use
+                    // `size` (HashMap/ArrayList), `count` (Hashtable/queue),
+                    // or `elementCount` (Vector/Stack).
                     if offset + 4 <= fields.len() {
                         return i32::from_be_bytes([
                             fields[offset], fields[offset+1], fields[offset+2], fields[offset+3],
@@ -542,7 +1350,9 @@ fn extract_collection_size(
             break;
         }
     }
-    -1
+    base_count
+        .map(|v| v.clamp(0, i32::MAX as i64) as i32)
+        .unwrap_or(-1)
 }
 
 /// Read the backing-array object reference of a Collection, walking the class
@@ -559,14 +1369,19 @@ fn extract_backing_array_id(
 ) -> u64 {
     // Determine candidate backing-field names from the class name.
     let candidates: &[&str] = match class_info.name.as_ref() {
-        "java/util/ArrayList" | "java/util/Vector" | "java/util/concurrent/CopyOnWriteArrayList" =>
+        "java/util/ArrayList" | "java/util/Vector" | "java/util/Stack"
+        | "java/util/concurrent/CopyOnWriteArrayList" =>
             &["elementData"],
         "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/Hashtable"
-        | "java/util/WeakHashMap" | "java/util/EnumMap"
+        | "java/util/Properties" | "java/util/WeakHashMap"
+        | "java/lang/ThreadLocal$ThreadLocalMap" | "java/util/IdentityHashMap"
+        | "java/util/EnumMap"
         | "java/util/concurrent/ConcurrentHashMap" =>
             &["table", "nextTable"],
         "java/util/HashSet" | "java/util/LinkedHashSet" =>
             &["map"],
+        "java/util/TreeSet" =>
+            &["m"],
         "java/util/LinkedList" | "java/util/concurrent/ConcurrentSkipListMap" =>
             &["first", "head"],
         _ => return 0,
@@ -628,6 +1443,11 @@ struct PrimArrayData {
     element_size: i32,
     raw_body: Vec<u8>,
     prim_type: PrimitiveArrayType,
+    /// Identity of the HPROF primitive-array class (`[I`, `[B`, ...), matching
+    /// Java's `getJavaClass() == getJavaClass()` comparison. Groups must never
+    /// be keyed by class index or name: two different primitive array types can
+    /// hold identical bytes.
+    array_class_id: u64,
 }
 
 struct ObjArrayData {
@@ -637,19 +1457,26 @@ struct ObjArrayData {
     element_refs: Vec<u64>,
 }
 
-struct StringHashEntry {
+struct StringSpan {
     content: String,
-    hash: u64,
-    index: usize,
+    /// Java `char[]` contents (UTF-16 code units) used by hashCharArray.
+    chars: Vec<u16>,
+    array_id: u64,
+    array_len: i32,
+    element_size: i64,
+    /// Java StringDeduplicationStats backingArrayWastedBytes contribution.
+    backing_size: i64,
 }
 
-/// Extract String content from instance field bytes using primitive array body data.
-fn extract_string_content_with_body(
+/// Extract String content plus the backing-array identity and the size
+/// contribution used by Java's StringContentDeduplicator.
+fn extract_string_content_meta(
     fields: &[u8],
     class_info: &JavaClassInfo,
     id_size: IdSize,
     prim_body_map: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
-) -> Option<String> {
+    header_size: i64,
+) -> Option<StringSpan> {
     let id_bytes = match id_size {
         IdSize::U32 => 4usize,
         IdSize::U64 => 8usize,
@@ -690,48 +1517,82 @@ fn extract_string_content_with_body(
     }
 
     let value_id = value_ref?;
-
-    // Look up the backing array body
     let (body, prim_type) = prim_body_map.get(&value_id)?;
+    let start = str_offset.max(0) as usize;
 
-    // Extract string content based on coder / array type
-    // Java 9+: coder=0 -> LATIN1 (byte[]), coder=1 -> UTF16 (byte[])
-    // Java 8: uses char[]
-    if *prim_type == PrimitiveArrayType::Char {
-        // Java 8 style: char[] backing
-        let chars: Vec<u16> = body.chunks(2)
+    // Java 9+: coder=0 -> LATIN1 (byte[]), coder=1 -> UTF16 (byte[]).
+    // Java 8: char[] backing.
+    let (chars, array_len, element_size) = if *prim_type == PrimitiveArrayType::Char {
+        let all: Vec<u16> = body
+            .chunks(2)
             .filter_map(|c| Some(u16::from_be_bytes(c.try_into().ok()?)))
             .collect();
-        let start = str_offset.max(0) as usize;
-        let end = (str_offset + str_count.min(chars.len() as i32)).min(chars.len() as i32) as usize;
-        if start >= end || start >= chars.len() {
+        let take = take_count(str_count, all.len().saturating_sub(start));
+        if start > all.len() {
             return None;
         }
-        chars[start..end].iter().map(|&c| char::from_u32(c as u32)).collect()
+        (all[start..start + take].to_vec(), all.len() as i64, 2i64)
     } else if *prim_type == PrimitiveArrayType::Byte {
         if coder == 0 {
-            // LATIN1 encoding (Java 9+)
-            let bytes = &body[..];
-            let start = str_offset.max(0) as usize;
-            let end = (str_count.min(bytes.len() as i32)) as usize;
-            if start >= end || start >= bytes.len() {
+            let take = take_count(str_count, body.len().saturating_sub(start));
+            if start > body.len() {
                 return None;
             }
-            Some(bytes[start..end].iter().map(|&b| b as char).collect())
+            (
+                body[start..start + take].iter().map(|&b| b as u16).collect::<Vec<u16>>(),
+                body.len() as i64,
+                1i64,
+            )
         } else {
-            // UTF16 encoding (Java 9+)
-            let chars: Vec<u16> = body.chunks(2)
-                .filter_map(|c| Some(u16::from_be_bytes(c.try_into().ok()?)))
+            let all: Vec<u16> = body
+                .chunks(2)
+                .filter_map(|c| Some(u16::from_le_bytes(c.try_into().ok()?)))
                 .collect();
-            let start = str_offset.max(0) as usize;
-            let end = (str_count.min(chars.len() as i32)) as usize;
-            if start >= end || start >= chars.len() {
+            let take = take_count(str_count, all.len().saturating_sub(start));
+            if start > all.len() {
                 return None;
             }
-            chars[start..end].iter().map(|&c| char::from_u32(c as u32)).collect()
+            // array_len must be the byte[] length (2 bytes per UTF-16 unit),
+            // not the char count: Java compares array.length == chars.length.
+            (all[start..start + take].to_vec(), body.len() as i64, 1i64)
         }
     } else {
-        None
+        return None;
+    };
+
+    let content = String::from_utf16_lossy(&chars);
+    let content_len = chars.len() as i64;
+    let backing_size = if array_len == content_len {
+        array_shallow_size(array_len as i32, element_size as i32, header_size)
+    } else {
+        element_size * content_len as i64
+    };
+    Some(StringSpan {
+        content,
+        chars,
+        array_id: value_id,
+        array_len: array_len as i32,
+        element_size,
+        backing_size,
+    })
+}
+
+/// Content-only wrapper used by callers that do not need backing-array stats.
+fn extract_string_content_with_body(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    id_size: IdSize,
+    prim_body_map: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
+) -> Option<String> {
+    extract_string_content_meta(fields, class_info, id_size, prim_body_map, 12)
+        .map(|span| span.content)
+}
+
+fn take_count(count: i32, remaining: usize) -> usize {
+    if count == i32::MAX {
+        remaining
+    } else {
+        (count.max(0) as usize).min(remaining)
     }
 }
 
@@ -768,32 +1629,6 @@ fn field_type_size(type_code: u8, id_bytes: usize) -> usize {
     }
 }
 
-fn compute_string_hash(s: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn find_duplicate_strings(entries: &[(u64, StringHashEntry)]) -> Vec<(String, usize, Vec<u64>)> {
-    let mut groups: HashMap<u64, Vec<&(u64, StringHashEntry)>> = HashMap::new();
-    for pair in entries {
-        groups.entry(pair.1.hash).or_default().push(pair);
-    }
-
-    let mut dups = Vec::new();
-    for (_, group) in groups {
-        if group.len() > 1 {
-            // Collect up to 5 sample obj IDs per group (for ref chain rendering).
-            let samples: Vec<u64> = group.iter().take(5).map(|(obj_id, _)| *obj_id).collect();
-            dups.push((group[0].1.content.clone(), group.len(), samples));
-        }
-    }
-    dups.sort_by(|a, b| b.1.cmp(&a.1));
-    dups
-}
-
 fn prim_type_size(pt: PrimitiveArrayType) -> usize {
     match pt {
         PrimitiveArrayType::Boolean => 1,
@@ -805,6 +1640,162 @@ fn prim_type_size(pt: PrimitiveArrayType) -> usize {
         PrimitiveArrayType::Double => 8,
         PrimitiveArrayType::Long => 8,
     }
+}
+
+/// Java's primitive type code order (`JavaClassInfo.PRIM_TYPE_CLASSES`):
+/// boolean, byte, char, short, int, float, long, double.
+fn prim_type_code_index(pt: PrimitiveArrayType) -> usize {
+    match pt {
+        PrimitiveArrayType::Boolean => 0,
+        PrimitiveArrayType::Byte => 1,
+        PrimitiveArrayType::Char => 2,
+        PrimitiveArrayType::Short => 3,
+        PrimitiveArrayType::Int => 4,
+        PrimitiveArrayType::Float => 5,
+        PrimitiveArrayType::Long => 6,
+        PrimitiveArrayType::Double => 7,
+    }
+}
+
+fn prim_type_display_name(pt: PrimitiveArrayType) -> &'static str {
+    match pt {
+        PrimitiveArrayType::Boolean => "boolean[]",
+        PrimitiveArrayType::Byte => "byte[]",
+        PrimitiveArrayType::Char => "char[]",
+        PrimitiveArrayType::Short => "short[]",
+        PrimitiveArrayType::Int => "int[]",
+        PrimitiveArrayType::Float => "float[]",
+        PrimitiveArrayType::Long => "long[]",
+        PrimitiveArrayType::Double => "double[]",
+    }
+}
+
+fn prim_array_signature(pt: PrimitiveArrayType) -> &'static str {
+    match pt {
+        PrimitiveArrayType::Boolean => "[Z",
+        PrimitiveArrayType::Byte => "[B",
+        PrimitiveArrayType::Char => "[C",
+        PrimitiveArrayType::Short => "[S",
+        PrimitiveArrayType::Int => "[I",
+        PrimitiveArrayType::Float => "[F",
+        PrimitiveArrayType::Long => "[J",
+        PrimitiveArrayType::Double => "[D",
+    }
+}
+
+/// The HPROF CLASS_DUMP object id of the primitive array class. Java compares
+/// `JavaClassInfo` identity, i.e. exactly one class per primitive type. The
+/// `PRIMITIVE_ARRAY_DUMP` record itself carries no class id, so resolve it
+/// through the class registry and fall back to a stable per-type id when the
+/// dump has no CLASS_DUMP record for that array class.
+fn prim_array_class_id(heap: &HeapDump, pt: PrimitiveArrayType) -> u64 {
+    if let Some(&idx) = heap.class_by_name.get(prim_array_signature(pt)) {
+        if let Some(cls) = heap.classes.get(idx as usize) {
+            if cls.class_object_id != 0 {
+                return cls.class_object_id;
+            }
+        }
+    }
+    0xffff_ffff_0000_0000u64 | (prim_type_code_index(pt) as u64 + 1)
+}
+
+/// Java's `VirtualStackTraverser.hashByteArray`: 32-bit wrapping Murmur-ish
+/// hash over the raw HPROF body bytes. Four-byte words are little-endian and
+/// unsigned; trailing bytes are passed as signed Java bytes.
+fn java_hash_byte_array(bytes: &[u8]) -> i32 {
+    let mut h: i32 = 0;
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let k = ((bytes[i + 3] as i32) << 24)
+            | ((bytes[i + 2] as i32) << 16)
+            | ((bytes[i + 1] as i32) << 8)
+            | (bytes[i] as i32);
+        h = java_mix_h1(h, java_mix_k1(k));
+        i += 4;
+    }
+    while i < len {
+        h = java_mix_h1(h, java_mix_k1(bytes[i] as i8 as i32));
+        i += 1;
+    }
+    java_fmix(h, len as i32)
+}
+
+
+/// Sum the aligned bodies of a CSLM's Index/Node objects reachable from
+/// `head`. Java's ConcurrentSkipListMapIterator adds these objects' bodies in
+/// addition to the container itself.
+fn cslm_structure_body(
+    head: u64,
+    index_map: &HashMap<u64, (u64, u64, u64)>,
+    node_map: &HashMap<u64, (u64, u64)>,
+    class_by_name: &HashMap<std::sync::Arc<str>, u32>,
+    class_aligned: &[i64],
+) -> i64 {
+    let index_cidx = class_by_name.get("java/util/concurrent/ConcurrentSkipListMap$Index").copied();
+    let node_cidx = class_by_name.get("java/util/concurrent/ConcurrentSkipListMap$Node").copied();
+    let mut body = 0i64;
+    let mut seen_i: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_n: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut istack = vec![head];
+    let mut nstack: Vec<u64> = Vec::new();
+    while let Some(id) = istack.pop() {
+        if id == 0 || !seen_i.insert(id) {
+            continue;
+        }
+        if let Some(idx) = index_cidx {
+            body += class_aligned.get(idx as usize).copied().unwrap_or(0);
+        }
+        if let Some(&(node, down, right)) = index_map.get(&id) {
+            if node != 0 { nstack.push(node); }
+            if down != 0 { istack.push(down); }
+            if right != 0 { istack.push(right); }
+        }
+    }
+    while let Some(id) = nstack.pop() {
+        if id == 0 || !seen_n.insert(id) {
+            continue;
+        }
+        if let Some(idx) = node_cidx {
+            body += class_aligned.get(idx as usize).copied().unwrap_or(0);
+        }
+        if let Some(&(next, _)) = node_map.get(&id) {
+            if next != 0 { nstack.push(next); }
+        }
+    }
+    body
+}
+
+/// Java `VirtualStackTraverser.hashCharArray`.
+fn java_hash_char_array(chars: &[u16]) -> i32 {
+    let mut h: i32 = 0;
+    let mut i = 1usize;
+    while i < chars.len() {
+        let k = (chars[i - 1] as i32) | ((chars[i] as i32) << 16);
+        h = java_mix_h1(h, java_mix_k1(k));
+        i += 2;
+    }
+    if chars.len() % 2 == 1 {
+        h ^= java_mix_k1(chars[chars.len() - 1] as i32);
+    }
+    java_fmix(h, (chars.len() as i32) << 1)
+}
+
+fn java_mix_k1(k: i32) -> i32 {
+    k.wrapping_mul(-862048943).rotate_left(15).wrapping_mul(461845907)
+}
+
+fn java_mix_h1(h: i32, k: i32) -> i32 {
+    (h ^ k).rotate_left(13).wrapping_mul(5).wrapping_sub(430675100)
+}
+
+fn java_fmix(h: i32, len: i32) -> i32 {
+    let mut h = h ^ len;
+    h ^= ((h as u32) >> 16) as i32;
+    h = h.wrapping_mul(-2048144789);
+    h ^= ((h as u32) >> 13) as i32;
+    h = h.wrapping_mul(-1028477387);
+    h ^ ((h as u32) >> 16) as i32
 }
 
 fn count_prim_elements(arr: &heap_dump::PrimitiveArray) -> i32 {
@@ -885,109 +1876,318 @@ fn boxed_primitive_size(name: &str) -> i32 {
     }
 }
 
-fn detect_duplicate_prim_arrays(
-    prim_arrays: &[PrimArrayData],
-    classes: &[JavaClassInfo],
-    stats: &StatsEngine,
-    header_size: i64,
-) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+#[derive(Clone, Copy)]
+struct PrimDupNode {
+    /// Representative array: the one that created this node.
+    array_idx: u32,
+    count: u32,
+    group_id: u64,
+    next: i32,
+}
 
-    // Group by (class_idx, body_hash) -> count
-    let mut groups: HashMap<(u32, u64), Vec<&PrimArrayData>> = HashMap::new();
-    for arr in prim_arrays {
-        if arr.raw_body.len() > 32 {
-            // Only check arrays > 32 bytes (skip tiny)
-            let mut hasher = DefaultHasher::new();
-            arr.raw_body.hash(&mut hasher);
-            let hash = hasher.finish();
-            groups.entry((arr.class_idx, hash)).or_default().push(arr);
+/// One `PrimitiveArraySizeAccumulator`: pending first-seen hashes plus the
+/// hash -> node chain map, exactly as in the Java reference.
+struct PrimDupAccumulator {
+    group_map: HashMap<i32, u32>,
+    pending: HashMap<i32, u32>,
+    nodes: Vec<PrimDupNode>,
+    /// Members of hash-0 nodes, kept for the opt-in forensic dump only.
+    hash0_members: HashMap<u32, Vec<u64>>,
+    per_type_total: [u32; 8],
+    per_type_distinct: [u32; 8],
+    per_type_waste: [i64; 8],
+}
+
+impl PrimDupAccumulator {
+    fn new() -> Self {
+        Self {
+            group_map: HashMap::new(),
+            pending: HashMap::new(),
+            nodes: Vec::new(),
+            hash0_members: HashMap::new(),
+            per_type_total: [0; 8],
+            per_type_distinct: [0; 8],
+            per_type_waste: [0; 8],
         }
     }
 
-    // Verify actual body equality and build per-class stats
-    let mut per_class: HashMap<u32, (usize, usize, i64)> = HashMap::new(); // class_idx -> (total, unique, wasted)
-    let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
-    let mut total_count: usize = 0;
+    fn add_node(
+        &mut self,
+        array_idx: u32,
+        group_id: u64,
+        count: u32,
+        hash: i32,
+        members: &[u64],
+    ) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(PrimDupNode { array_idx, count, group_id, next: -1 });
+        if hash == 0 {
+            self.hash0_members.insert(idx, members.to_vec());
+        }
+        idx
+    }
 
-    for ((class_idx, _), arrs) in &groups {
-        if arrs.len() < 2 { continue; }
+    fn add_member(&mut self, node_idx: u32, obj_id: u64) {
+        if let Some(members) = self.hash0_members.get_mut(&node_idx) {
+            members.push(obj_id);
+        }
+    }
+}
 
-        // Verify actual body equality within the hash bucket
-        let mut confirmed_groups: Vec<Vec<&PrimArrayData>> = Vec::new();
-        for arr in arrs {
-            let mut placed = false;
-            for group in confirmed_groups.iter_mut() {
-                if group[0].raw_body == arr.raw_body {
-                    group.push(arr);
-                    placed = true;
-                    break;
-                }
+/// Mirror of `PrimitiveArraySizeAccumulator.processArray`.
+fn process_prim_dup_array(
+    acc: &mut PrimDupAccumulator,
+    prim_arrays: &[PrimArrayData],
+    idx: usize,
+    hash: i32,
+    group_ids: &mut [u64],
+    group_counter: &mut u64,
+) {
+    let arr = &prim_arrays[idx];
+    let type_idx = prim_type_code_index(arr.prim_type);
+    acc.per_type_total[type_idx] += 1;
+
+    if let Some(first_idx) = acc.pending.remove(&hash) {
+        let first = &prim_arrays[first_idx as usize];
+        let equal = first.array_class_id == arr.array_class_id
+            && first.length == arr.length
+            && first.raw_body == arr.raw_body;
+        if equal {
+            let gid = group_ids[first_idx as usize];
+            group_ids[idx] = gid;
+            let node = acc.add_node(
+                idx as u32,
+                gid,
+                2,
+                hash,
+                &[first.obj_id, arr.obj_id],
+            );
+            acc.group_map.insert(hash, node);
+        } else {
+            let gid1 = group_ids[first_idx as usize];
+            let first_node =
+                acc.add_node(first_idx, gid1, 1, hash, &[first.obj_id]);
+            *group_counter += 1;
+            let gid2 = *group_counter;
+            group_ids[idx] = gid2;
+            let second_node = acc.add_node(idx as u32, gid2, 1, hash, &[arr.obj_id]);
+            acc.nodes[first_node as usize].next = second_node as i32;
+            acc.per_type_distinct[type_idx] += 1;
+            acc.group_map.insert(hash, first_node);
+        }
+        return;
+    }
+
+    if let Some(&head) = acc.group_map.get(&hash) {
+        let mut cur = head as i32;
+        let mut last: i32 = -1;
+        loop {
+            let node = acc.nodes[cur as usize];
+            let rep = &prim_arrays[node.array_idx as usize];
+            if rep.array_class_id == arr.array_class_id
+                && rep.length == arr.length
+                && rep.raw_body == arr.raw_body
+            {
+                acc.nodes[cur as usize].count += 1;
+                acc.add_member(cur as u32, arr.obj_id);
+                group_ids[idx] = node.group_id;
+                return;
             }
-            if !placed {
-                confirmed_groups.push(vec![*arr]);
+            last = cur;
+            if node.next < 0 {
+                break;
+            }
+            cur = node.next;
+        }
+        *group_counter += 1;
+        let gid = *group_counter;
+        group_ids[idx] = gid;
+        let node = acc.add_node(idx as u32, gid, 1, hash, &[arr.obj_id]);
+        acc.nodes[last as usize].next = node as i32;
+        acc.per_type_distinct[type_idx] += 1;
+        return;
+    }
+
+    // First array with this hash: remember it, no group node yet.
+    *group_counter += 1;
+    group_ids[idx] = *group_counter;
+    acc.pending.insert(hash, idx as u32);
+    acc.per_type_distinct[type_idx] += 1;
+}
+
+/// Java's per-primitive-type display names, indexed by Java's primitive type
+/// code order (`boolean, byte, char, short, int, float, long, double`).
+const PRIM_TYPE_DISPLAY: [&str; 8] = [
+    "boolean[]",
+    "byte[]",
+    "char[]",
+    "short[]",
+    "int[]",
+    "float[]",
+    "long[]",
+    "double[]",
+];
+
+fn detect_duplicate_prim_arrays(
+    prim_arrays: &[PrimArrayData],
+    stats: &StatsEngine,
+    header_size: i64,
+    string_backing: &std::collections::HashSet<u64>,
+    container_backing: &std::collections::HashSet<u64>,
+) {
+    let debug_on = ss_stats::debug_dump::enabled();
+    let mut group_ids = vec![0u64; prim_arrays.len()];
+    // Java starts the shared AtomicInteger at 1 and uses incrementAndGet().
+    let mut group_counter: u64 = 1;
+    let mut pass2 = PrimDupAccumulator::new();
+    let mut pass1 = PrimDupAccumulator::new();
+
+    // Pass 2: every non-char primitive array.
+    for (idx, arr) in prim_arrays.iter().enumerate() {
+        if arr.prim_type == PrimitiveArrayType::Char {
+            continue;
+        }
+        let hash = java_hash_byte_array(&arr.raw_body);
+        process_prim_dup_array(
+            &mut pass2,
+            prim_arrays,
+            idx,
+            hash,
+            &mut group_ids,
+            &mut group_counter,
+        );
+    }
+
+    // Pass 1: char arrays that String/StringBuilder processing did not claim.
+    for (idx, arr) in prim_arrays.iter().enumerate() {
+        if arr.prim_type != PrimitiveArrayType::Char || string_backing.contains(&arr.obj_id) {
+            continue;
+        }
+        let hash = java_hash_byte_array(&arr.raw_body);
+        process_prim_dup_array(
+            &mut pass1,
+            prim_arrays,
+            idx,
+            hash,
+            &mut group_ids,
+            &mut group_counter,
+        );
+    }
+
+    // Java's mergeAndBuildReport() iterates only the first bucket of each
+    // groupMap. fastutil stores key 0 in slot 0, so the first bucket is the
+    // hash-0 chain (all empty arrays hash to 0).
+    let mut per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = Vec::new();
+    let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
+    let mut debug_groups: Vec<ss_stats::debug_dump::DupPrimGroupDebug> = Vec::new();
+    let mut iterated_nodes: usize = 0;
+    let mut arrays_in_groups: usize = 0;
+    let mut waste_total: i64 = 0;
+
+    for acc in [&pass2, &pass1] {
+        let mut type_waste = acc.per_type_waste;
+        if let Some(&head) = acc.group_map.get(&0) {
+            let mut cur = head as i32;
+            while cur >= 0 {
+                iterated_nodes += 1;
+                let node = acc.nodes[cur as usize];
+                if node.count > 1 {
+                    let rep = &prim_arrays[node.array_idx as usize];
+                    let type_idx = prim_type_code_index(rep.prim_type);
+                    let body = array_shallow_size(rep.length, rep.element_size, header_size);
+                    let wasted = body * (node.count as i64 - 1);
+                    waste_total += wasted;
+                    arrays_in_groups += node.count as usize;
+                    type_waste[type_idx] += wasted;
+
+                    let class_name = prim_type_display_name(rep.prim_type).to_string();
+                    if debug_on {
+                        let members = acc.hash0_members.get(&(cur as u32));
+                        debug_groups.push(ss_stats::debug_dump::DupPrimGroupDebug {
+                            class_name: class_name.clone(),
+                            array_length: rep.length,
+                            element_size: rep.element_size,
+                            body_size: body,
+                            count: node.count as usize,
+                            wasted_bytes: wasted,
+                            content_hash: ss_stats::debug_dump::fnv1a64(&rep.raw_body),
+                            members: members
+                                .map(|ids| {
+                                    ids.iter()
+                                        .map(|obj_id| ss_stats::debug_dump::DupPrimMemberDebug {
+                                            obj_id: *obj_id,
+                                            string_backing: string_backing.contains(obj_id),
+                                            container_backing: container_backing.contains(obj_id),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        });
+                    }
+
+                    top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
+                        class_name,
+                        count: node.count as usize,
+                        wasted_bytes: wasted,
+                        size_bytes: body,
+                        description: format!(
+                            "{}[{}]",
+                            PRIM_TYPE_DISPLAY[type_idx].trim_end_matches("[]"),
+                            rep.length
+                        ),
+                        sample_obj_ids: vec![rep.obj_id],
+                    });
+                }
+                cur = node.next;
             }
         }
 
-        for group in confirmed_groups {
-            if group.len() < 2 { continue; }
-            let count = group.len();
-            total_count += count;
-            let size = array_shallow_size(group[0].length, group[0].element_size, header_size);
-            let wasted = size * (count as i64 - 1);
-
-            let class_name = if (*class_idx as usize) < classes.len() {
-                classes[*class_idx as usize].name.replace('/', ".")
-            } else {
-                "unknown".to_string()
-            };
-
-            let (total, unique, waste) = per_class.entry(*class_idx).or_insert((0, 0, 0));
-            *total += count;
-            *unique += 1;
-            *waste += wasted;
-
-            if wasted > 1024 {
-                let samples: Vec<u64> = group.iter().take(5).map(|a| a.obj_id).collect();
-                top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
-                    class_name: class_name.clone(),
-                    count,
-                    wasted_bytes: wasted,
-                    size_bytes: size,
-                    description: format!("byte[{}]", group[0].length),
-                    sample_obj_ids: samples,
+        // Java's DuplicateClassEntry.instanceCount is the class' total
+        // instance count, available to both accumulators; only types with
+        // duplicateSize > 0 are reported.
+        for type_idx in 0..8 {
+            if type_waste[type_idx] > 0 {
+                per_class_entries.push(ss_stats::duplicate_arrays::DupArrayClassEntry {
+                    class_name: PRIM_TYPE_DISPLAY[type_idx].to_string(),
+                    instance_count: acc.per_type_total[type_idx] as usize,
+                    unique_count: acc.per_type_distinct[type_idx] as usize,
+                    wasted_bytes: type_waste[type_idx],
                 });
             }
         }
     }
 
-    let per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = per_class
-        .iter()
-        .filter(|(_, (total, _, _))| *total > 1)
-        .map(|(class_idx, (total, unique, waste))| {
-            let name = if (*class_idx as usize) < classes.len() {
-                classes[*class_idx as usize].name.replace('/', ".")
-            } else {
-                "unknown".to_string()
-            };
-            ss_stats::duplicate_arrays::DupArrayClassEntry {
-                class_name: name,
-                instance_count: *total,
-                unique_count: *unique,
-                wasted_bytes: *waste,
-            }
-        })
-        .collect();
+    // Java's totalArrayCount only counts arrays that entered an accumulator:
+    // all non-char arrays + char arrays not claimed by String/StringBuilder.
+    let total_processed: usize = pass2.per_type_total.iter().map(|&v| v as usize).sum::<usize>()
+        + pass1.per_type_total.iter().map(|&v| v as usize).sum::<usize>();
 
-    let unique_total: usize = per_class_entries.iter().map(|e| e.unique_count).sum();
+    // report.totalGroupCount = enumerated nodes + both pending maps.
+    let unique_count = iterated_nodes + pass2.pending.len() + pass1.pending.len();
+
     eprintln!(
-        "Duplicate prim arrays: {} total in {} groups",
-        total_count,
-        per_class_entries.len()
+        "Duplicate prim arrays: {} processed, {} unique/group count, {} reported groups, {} bytes waste",
+        total_processed,
+        unique_count,
+        top_groups.len(),
+        waste_total
     );
 
-    stats.dup_prim_arrays.set_results(total_count, unique_total, per_class_entries, top_groups);
+    if debug_on {
+        ss_stats::debug_dump::record_dup_prim_totals(ss_stats::debug_dump::DupPrimScanTotals {
+            scanned_arrays: total_processed,
+            eligible_arrays: total_processed,
+            arrays_in_groups,
+            groups: debug_groups.len(),
+            waste_bytes: waste_total,
+            unique_count,
+        });
+        ss_stats::debug_dump::record_dup_prim_groups(debug_groups);
+    }
+
+    stats
+        .dup_prim_arrays
+        .set_results(total_processed, unique_count, per_class_entries, top_groups);
 }
 
 fn detect_duplicate_obj_arrays(
@@ -1139,6 +2339,7 @@ fn extract_address_field(
     let mut offset = 0usize;
     let mut current_id = class_info.class_object_id;
     let id_size = current_id_size();
+    let mut base_count: Option<i64> = None;
 
     loop {
         let cls = if current_id == class_info.class_object_id {
@@ -1221,6 +2422,7 @@ fn ref_field_nonnull(
     let mut offset = 0usize;
     let mut current_id = class_info.class_object_id;
     let id_size = current_id_size();
+    let mut base_count: Option<i64> = None;
 
     loop {
         let cls = if current_id == class_info.class_object_id {
@@ -1352,28 +2554,94 @@ fn push_sample(samples: &Mutex<Vec<u64>>, obj_id: u64) {
     }
 }
 
-/// Check if a primitive array has trailing zero elements (>50% of elements are zero at the tail).
-fn has_trailing_zero_elements(raw_body: &[u8], element_size: i32) -> bool {
-    if raw_body.is_empty() || element_size <= 0 {
-        return false;
+/// Java's PrimitiveArrayInstance.computeZeroStats():
+/// (trailing zero elements, elements where every byte is zero,
+///  elements whose high half is all zero).
+fn compute_zero_stats(raw_body: &[u8], element_size: usize) -> (usize, usize, usize) {
+    if element_size == 0 {
+        return (0, 0, 0);
     }
-    let esz = element_size as usize;
-    let total_elements = raw_body.len() / esz;
-    if total_elements < 2 {
-        return false;
-    }
-    // Count trailing zero elements
-    let mut trailing = 0usize;
-    for i in (0..total_elements).rev() {
-        let start = i * esz;
-        let end = start + esz;
-        if end <= raw_body.len() && raw_body[start..end].iter().all(|&b| b == 0) {
-            trailing += 1;
+    let mut trailing_bytes = 0usize;
+    for &b in raw_body.iter().rev() {
+        if b == 0 {
+            trailing_bytes += 1;
         } else {
             break;
         }
     }
-    trailing * 2 > total_elements // more than 50% trailing zeros
+    let trailing = trailing_bytes / element_size;
+
+    let mut zero_elements = 0usize;
+    let mut high_bits_zero = 0usize;
+    for chunk in raw_body.chunks_exact(element_size) {
+        if chunk.iter().all(|&b| b == 0) {
+            zero_elements += 1;
+        }
+        if element_size > 1 {
+            let half = element_size / 2;
+            if chunk[..half].iter().all(|&b| b == 0) {
+                high_bits_zero += 1;
+            }
+        }
+    }
+    (trailing, zero_elements, high_bits_zero)
+}
+
+/// Java's `JavaClassInfo.isPrimitiveArrayType()`: name is one or more '['
+/// followed by a single primitive type code. `[I` and `[[I` both match; the
+/// latter is also `arrayDimensions > 1`, so `isObjectArray()` is false.
+fn is_primitive_array_class_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'[' {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b'[' {
+        i += 1;
+    }
+    i + 1 == bytes.len()
+        && matches!(bytes[i], b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
+}
+
+/// Classify a primitive array using Java's processPrimitiveArray order and
+/// waste formulas. Returns (kind, waste) for the first matching category.
+fn classify_prim_array(
+    length: i32,
+    raw_body: &[u8],
+    element_size: i32,
+    config: &ScanConfig,
+    full_size: i64,
+) -> Option<(u8, i64)> {
+    use ss_stats::problem_types::*;
+    if length < 0 || element_size <= 0 {
+        return None;
+    }
+    if length == 0 {
+        return Some((PRIM_ARRAY_LEN_ZERO, full_size));
+    }
+    if length == 1 {
+        return Some((PRIM_ARRAY_LEN_ONE, full_size));
+    }
+
+    let len = length as usize;
+    let esz = element_size as i64;
+    let (trailing, zero_elements, high_bits_zero) = compute_zero_stats(raw_body, element_size as usize);
+
+    if trailing >= len {
+        return Some((PRIM_ARRAY_ALL_ZERO, full_size));
+    }
+    if (trailing as f64) > (config.min_trailing_zeroes_percent / 100.0) * len as f64 {
+        return Some((PRIM_ARRAY_TRAIL_ZEROES, trailing as i64 * esz));
+    }
+    if (zero_elements as f64) > (config.min_sparse_zeroes_percent / 100.0) * len as f64 {
+        return Some((PRIM_ARRAY_SPARSE, zero_elements as i64 * esz));
+    }
+    if element_size > 1
+        && (high_bits_zero as f64) > (config.min_unused_hi_bits_percent / 100.0) * len as f64
+    {
+        return Some((PRIM_ARRAY_ZERO_HIGH_BITS, high_bits_zero as i64 * esz / 2));
+    }
+    None
 }
 
 impl LinearScanCoordinator {
@@ -2713,26 +3981,71 @@ mod tests {
         assert_eq!(boxed_primitive_size("java/lang/String"), 0); // not boxed
     }
 
-    // ---- has_trailing_zero_elements ----
+    // ---- compute_zero_stats / classify_prim_array ----
 
     #[test]
-    fn trailing_zeros_detected() {
-        // int[4] = {1, 0, 0, 0} — 3/4 trailing zeros > 50%
-        let body: Vec<u8> = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec();
-        assert!(has_trailing_zero_elements(&body, 4));
+    fn zero_stats_detects_trailing_and_high_bits() {
+        // int[4], big-endian: {0x00000001, 0, 0, 0}
+        let body: Vec<u8> = [
+            0, 0, 0, 1,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]
+        .to_vec();
+        let (trailing, zero_elements, high_bits_zero) = compute_zero_stats(&body, 4);
+        assert_eq!(trailing, 3);
+        assert_eq!(zero_elements, 3);
+        assert_eq!(high_bits_zero, 4);
     }
 
     #[test]
-    fn no_trailing_zeros() {
-        // int[4] = {1, 2, 3, 4} — no trailing zeros
-        let body: Vec<u8> = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0].to_vec();
-        assert!(!has_trailing_zero_elements(&body, 4));
+    fn classify_primitive_array_categories() {
+        let config = ScanConfig::default();
+        // int[1] -> 1-length, waste is the full body (24 bytes).
+        assert_eq!(
+            classify_prim_array(1, &[0, 0, 0, 0], 4, &config, 24),
+            Some((ss_stats::problem_types::PRIM_ARRAY_LEN_ONE, 24))
+        );
+        // int[4] all zero -> all-zero, waste is the full body.
+        let zeros = vec![0u8; 16];
+        assert_eq!(
+            classify_prim_array(4, &zeros, 4, &config, 32),
+            Some((ss_stats::problem_types::PRIM_ARRAY_ALL_ZERO, 32))
+        );
     }
 
     #[test]
-    fn trailing_zeros_short_array() {
-        // int[1] — too short to evaluate
-        let body: Vec<u8> = [0, 0, 0, 0].to_vec();
-        assert!(!has_trailing_zero_elements(&body, 4));
+    fn classify_trailing_sparse_and_high_bits() {
+        let config = ScanConfig::default();
+
+        // int[8]: four non-zero elements followed by four zeros.
+        let mut trailing = Vec::new();
+        for _ in 0..4 {
+            trailing.extend_from_slice(&[1, 0, 0, 0]);
+        }
+        trailing.extend(std::iter::repeat(0).take(16));
+        assert_eq!(
+            classify_prim_array(8, &trailing, 4, &config, 48),
+            Some((ss_stats::problem_types::PRIM_ARRAY_TRAIL_ZEROES, 16))
+        );
+
+        // int[10]: eight zero elements, then two non-zero elements.
+        let mut sparse = vec![0u8; 32];
+        sparse.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            classify_prim_array(10, &sparse, 4, &config, 56),
+            Some((ss_stats::problem_types::PRIM_ARRAY_SPARSE, 32))
+        );
+
+        // int[10]: all elements use only the low half (high bits zero).
+        let mut high_bits = Vec::new();
+        for _ in 0..10 {
+            high_bits.extend_from_slice(&[0, 0, 0, 1]);
+        }
+        assert_eq!(
+            classify_prim_array(10, &high_bits, 4, &config, 56),
+            Some((ss_stats::problem_types::PRIM_ARRAY_ZERO_HIGH_BITS, 20))
+        );
     }
 }

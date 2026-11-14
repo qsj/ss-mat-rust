@@ -48,7 +48,7 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 数据准确性（vs Java 参考实现，同一 heap dump）：
 - heap 总字节：178,326KB（**精确匹配**）
 - DirectByteBuffer：96,927KB 总量 / 94,786KB unreachable（**精确匹配**，address 去重 + fd/att 跳过）
-- 可达性分类（live/garbage）：差 <1%（不遍历 Reference.referent）
+- 可达性分类（live/garbage）：Rust 2,034,362 live / 731,149 garbage；仅比 Java 多 1 个 TreeSet.PRESENT（容器感知遍历差异）
 - 压缩 oop 自动推导（address-overlap 验证，不信任 heapOopSize）
 - 报告体积对齐 Java（encoded-string 去重 `|*/c|*/s` + JS 解码器）
 - SecHdr 35/35、Reference Chains 10/10、easy-to-fix 2/2
@@ -80,10 +80,10 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 - 完整的类层级字段引用提取（concrete class → superclass → ... → Object）
 - ClassDump 记录作为 GC root 目标（SystemClass roots 指向 class object）
 - 静态字段引用从 ClassDump 记录提取（跳过 Finalizer/Cleaner 等引用处理链）
-- 弱引用 `referent` 字段跳过（不跟随弱引用链）
+- 实例字段只跳过 `Finalizer.prev`（Java 的 LinkedListLinks 语义）；弱引用对象延迟到第二趟，第二趟跟随全部字段（含 `Reference.referent`）
 - 弱/终结器/清理器对象延迟遍历（先遍历强引用，再处理弱引用）
 - ClassDump 对象（kind=3）从 live/garbage 计数中排除
-- 结果: 2,768,888 对象, 2,581,208 live (6.8% garbage), 5,814,331 outgoing refs
+- 结果: 2,765,511 对象, 2,034,362 live / 731,149 garbage
 
 ### Advisor 摘要
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Mutex;
 
@@ -31,9 +32,17 @@ pub struct StatsEngine {
     /// the report can filter to live-only using BFS `visited` (matching Java,
     /// which only counts bad arrays reached during the live traversal).
     pub bad_array_records: Mutex<Vec<crate::problem_types::BadArrayRecord>>,
+    /// Bad primitive arrays, captured during scan and filtered to live objects
+    /// after BFS. Uses Java's six categories and per-category waste formulas.
+    pub bad_prim_array_records: Mutex<Vec<crate::problem_types::BadPrimArrayRecord>>,
     /// Bad collections (EMPTY/SINGLE_ELEM), captured during scan for live-only
     /// filtering and wasted-capacity summation (Java's processContainer).
     pub bad_collection_records: Mutex<Vec<crate::problem_types::BadCollectionRecord>>,
+    /// All backing arrays/elementData objects consumed by recognized containers,
+    /// regardless of whether the container is "bad". Java's container traversal
+    /// marks these visited before processObjectArray/processPrimitiveArray, so
+    /// they must be excluded from Sections 10/11.
+    pub container_backing_ids: Mutex<HashSet<u64>>,
     pub jvm_info: JvmInfoCollector,
     pub thread_info: Mutex<Vec<ThreadInfo>>,
     pub oom_frame_locals: Mutex<Vec<FrameLocals>>,
@@ -95,7 +104,9 @@ impl StatsEngine {
             dup_obj_arrays: DupArrayCollector::new(),
             direct_buffers: DirectBufferCollector::new(),
             bad_array_records: Mutex::new(Vec::new()),
+            bad_prim_array_records: Mutex::new(Vec::new()),
             bad_collection_records: Mutex::new(Vec::new()),
+            container_backing_ids: Mutex::new(HashSet::new()),
             jvm_info: JvmInfoCollector::new(),
             thread_info: Mutex::new(Vec::new()),
             oom_frame_locals: Mutex::new(Vec::new()),

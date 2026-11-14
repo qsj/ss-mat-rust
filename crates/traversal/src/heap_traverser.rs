@@ -119,14 +119,13 @@ impl HeapObjectTraverser {
             .filter_map(|name| self.heap.class_by_name.get(*name).copied())
             .collect();
 
-        // For deferred (weak reference) classes, skip the "referent" field — it's a weak pointer,
-        // not a strong one. Also skip "next" in finalizer/cleaner chains.
+        // Instance fields skipped on every traversal pass. Java only zeroes one:
+        // JavaClassInfo gives java.lang.ref.Finalizer a LinkedListLinks, and the
+        // worker thread clears its "prev" field (TraversalWorkerThread). Weak
+        // references are handled by the deferred second pass, which follows all
+        // fields — including Reference.referent — so referent/discovered/pending
+        // must NOT be skipped here.
         let skip_instance_field_pairs: Vec<(&str, &str)> = vec![
-            // Weak/soft/phantom reference internal fields are not strong
-            // reachability edges — following them over-marks live objects.
-            ("java/lang/ref/Reference", "referent"),
-            ("java/lang/ref/Reference", "discovered"),
-            ("java/lang/ref/Reference", "pending"),
             ("java/lang/ref/Finalizer", "prev"),
         ];
 
@@ -214,6 +213,7 @@ impl HeapObjectTraverser {
                                         file_offset: 0,
                                         body_size,
                                         kind: 0,
+                                        element_size: 0,
                                         array_length: 0,
                                     });
 
@@ -244,6 +244,7 @@ impl HeapObjectTraverser {
                                         file_offset: 0,
                                         body_size: 0,
                                         kind: 1,
+                                        element_size: elem_size as u8,
                                         array_length: length,
                                     });
 
@@ -267,6 +268,7 @@ impl HeapObjectTraverser {
                                         file_offset: 0,
                                         body_size: 0,
                                         kind: 2,
+                                        element_size: oop_size as u8,
                                         array_length: length,
                                     });
 
@@ -295,6 +297,7 @@ impl HeapObjectTraverser {
                                         file_offset: 0,
                                         body_size: 16,
                                         kind: 3, // class object
+                                        element_size: 0,
                                         array_length: 0,
                                     });
 
@@ -435,6 +438,12 @@ impl HeapObjectTraverser {
         let mut root_of: Vec<u32> = vec![GC_ROOT_GARBAGE_SENTINEL; objects.len()];
         let mut root_metas: HashMap<u32, ss_stats::ref_chain::GcRootMeta> = HashMap::new();
         let mut queue: VecDeque<u32> = VecDeque::with_capacity(65536);
+        // Java TreeSet wrapper: backing TreeMap entries are live, but their
+        // `value` fields (e.g. TreeSet.PRESENT) are not traversed.
+        let tree_set_idx = self.heap.class_by_name.get("java/util/TreeSet").copied();
+        let tree_map_idx = self.heap.class_by_name.get("java/util/TreeMap").copied();
+        let mut set_backing_maps: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut set_entries: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         // Pre-compute which classes are subclasses of java.lang.Thread
         let is_thread_subclass = {
@@ -505,35 +514,78 @@ impl HeapObjectTraverser {
             -1 // normal priority
         };
 
+        // Forensic root capture is inert unless SS_MAT_DEBUG_DIR is set.
+        let debug_on = ss_stats::debug_dump::enabled();
+        let debug_dir = ss_stats::debug_dump::debug_dir();
+        let mut root_rows: Vec<crate::debug_dump::RootRow> = if debug_on {
+            Vec::with_capacity(self.heap.roots.len())
+        } else {
+            Vec::new()
+        };
+
         // Seed from GC roots with priority filtering
-        for root in &self.heap.roots {
-            if let Some(&idx) = addr_to_idx.get(&root.object_id) {
-                let priority = classify_root_priority(root, idx);
-                if priority == 0 {
-                    continue;
-                }
-                if !visited[idx as usize] {
-                    visited[idx as usize] = true;
-                    root_of[idx as usize] = idx;
-                    if priority == 1 {
-                        deferred_queue.push_back(idx);
-                    } else {
-                        queue.push_back(idx);
-                    }
-                }
-                use ss_stats::ref_chain::GcRootMeta;
-                root_metas.entry(idx).and_modify(|m| {
-                    if !m.root_types.contains(&root.root_type) {
-                        m.root_types.push(root.root_type);
-                    }
-                }).or_insert_with(|| GcRootMeta {
-                    root_obj_idx: idx,
-                    obj_id: root.object_id,
-                    class_idx: objects[idx as usize].class_idx,
-                    class_name: get_class_display(objects[idx as usize].class_idx, &self.heap),
-                    root_types: vec![root.root_type],
+        for (root_index, root) in self.heap.roots.iter().enumerate() {
+            let mut row = if debug_on {
+                Some(crate::debug_dump::RootRow {
+                    root_index,
+                    root_type: root.root_type,
+                    java_category: crate::debug_dump::java_root_category(root.root_type),
+                    object_id: root.object_id,
                     thread_serial: root.thread_serial,
-                });
+                    frame_index: root.frame_index,
+                    obj_idx: -1,
+                    class_name: String::new(),
+                    priority: -2,
+                    action: "unresolved",
+                })
+            } else {
+                None
+            };
+
+            if let Some(idx) = addr_to_idx.get(&root.object_id).copied() {
+                let priority = classify_root_priority(root, idx);
+                if let Some(r) = row.as_mut() {
+                    r.obj_idx = idx as i64;
+                    r.class_name = get_class_display(objects[idx as usize].class_idx, &self.heap);
+                    r.priority = priority;
+                }
+                if priority != 0 {
+                    if !visited[idx as usize] {
+                        visited[idx as usize] = true;
+                        root_of[idx as usize] = idx;
+                        if priority == 1 {
+                            deferred_queue.push_back(idx);
+                            if let Some(r) = row.as_mut() {
+                                r.action = "seeded_deferred";
+                            }
+                        } else {
+                            queue.push_back(idx);
+                            if let Some(r) = row.as_mut() {
+                                r.action = "seeded_normal";
+                            }
+                        }
+                    } else if let Some(r) = row.as_mut() {
+                        r.action = "already_visited";
+                    }
+                    use ss_stats::ref_chain::GcRootMeta;
+                    root_metas.entry(idx).and_modify(|m| {
+                        if !m.root_types.contains(&root.root_type) {
+                            m.root_types.push(root.root_type);
+                        }
+                    }).or_insert_with(|| GcRootMeta {
+                        root_obj_idx: idx,
+                        obj_id: root.object_id,
+                        class_idx: objects[idx as usize].class_idx,
+                        class_name: get_class_display(objects[idx as usize].class_idx, &self.heap),
+                        root_types: vec![root.root_type],
+                        thread_serial: root.thread_serial,
+                    });
+                } else if let Some(r) = row.as_mut() {
+                    r.action = "dropped_priority0";
+                }
+            }
+            if let Some(r) = row {
+                root_rows.push(r);
             }
         }
 
@@ -562,7 +614,7 @@ impl HeapObjectTraverser {
                         ((header_size + obj.body_size + 7) & !7) as i64
                     }
                 } else if obj.kind == 1 {
-                    array_shallow_size(obj.array_length, 1, header_size as i64)
+                    compute_obj_shallow(obj, oop_size as i32, header_size as i64)
                 } else {
                     array_shallow_size(obj.array_length, oop_size as i32, header_size as i64)
                 };
@@ -577,7 +629,16 @@ impl HeapObjectTraverser {
             // class objects in its ObjectIndex. Static field reachability is handled by
             // the synthetic JAVA_STATIC root seeding above.
             if obj.kind != 3 {
+                prepare_tree_set_entries(
+                    obj_idx, obj.class_idx, tree_set_idx, tree_map_idx,
+                    &outgoing_refs, &field_pool, &mut set_backing_maps, &mut set_entries,
+                );
                 for edge in &outgoing_refs[obj_idx as usize] {
+                    if set_entries.contains(&obj_idx)
+                        && field_pool.get(edge.field_key) == "value"
+                    {
+                        continue;
+                    }
                     let child_idx = edge.target;
                     // Skip edges targeting ClassDump objects
                     if objects[child_idx as usize].kind == 3 { continue; }
@@ -617,7 +678,7 @@ impl HeapObjectTraverser {
                             ((header_size + obj.body_size + 7) & !7) as i64
                         }
                     } else if obj.kind == 1 {
-                        array_shallow_size(obj.array_length, 1, header_size as i64)
+                        compute_obj_shallow(obj, oop_size as i32, header_size as i64)
                     } else {
                         array_shallow_size(obj.array_length, oop_size as i32, header_size as i64)
                     };
@@ -626,7 +687,16 @@ impl HeapObjectTraverser {
                     }
                 }
 
+                prepare_tree_set_entries(
+                    deferred_idx, obj.class_idx, tree_set_idx, tree_map_idx,
+                    &outgoing_refs, &field_pool, &mut set_backing_maps, &mut set_entries,
+                );
                 for edge in &outgoing_refs[deferred_idx as usize] {
+                    if set_entries.contains(&deferred_idx)
+                        && field_pool.get(edge.field_key) == "value"
+                    {
+                        continue;
+                    }
                     let child_idx = edge.target;
                     if objects[child_idx as usize].kind == 3 { continue; }
                     if (child_idx as usize) < visited.len() && !visited[child_idx as usize] {
@@ -659,7 +729,7 @@ impl HeapObjectTraverser {
                             ((header_size + obj.body_size + 7) & !7) as i64
                         }
                     } else if obj.kind == 1 {
-                        array_shallow_size(obj.array_length, 1, header_size as i64)
+                        compute_obj_shallow(obj, oop_size as i32, header_size as i64)
                     } else {
                         array_shallow_size(obj.array_length, oop_size as i32, header_size as i64)
                     };
@@ -668,7 +738,16 @@ impl HeapObjectTraverser {
                     }
                 }
 
+                prepare_tree_set_entries(
+                    obj_idx, obj.class_idx, tree_set_idx, tree_map_idx,
+                    &outgoing_refs, &field_pool, &mut set_backing_maps, &mut set_entries,
+                );
                 for edge in &outgoing_refs[obj_idx as usize] {
+                    if set_entries.contains(&obj_idx)
+                        && field_pool.get(edge.field_key) == "value"
+                    {
+                        continue;
+                    }
                     let child_idx = edge.target;
                     if objects[child_idx as usize].kind == 3 { continue; }
                     if (child_idx as usize) < visited.len() && !visited[child_idx as usize] {
@@ -734,7 +813,7 @@ impl HeapObjectTraverser {
                         ((header_size + obj.body_size + 7) & !7) as i64
                     }
                 } else if obj.kind == 1 {
-                    array_shallow_size(obj.array_length, 1, header_size as i64)
+                    compute_obj_shallow(obj, oop_size as i32, header_size as i64)
                 } else {
                     array_shallow_size(obj.array_length, oop_size as i32, header_size as i64)
                 };
@@ -754,9 +833,35 @@ impl HeapObjectTraverser {
         }
         self.stats.total_garbage_bytes.store(garbage_bytes, Relaxed);
 
+        // Opt-in forensics: dump roots + the full object table right after the
+        // BFS has finalised the live set. No effect when the switch is off.
+        if let Some(dir) = debug_dir.as_deref() {
+            if let Err(e) = crate::debug_dump::write_roots(dir, &root_rows) {
+                eprintln!("Debug: failed to write roots.tsv: {}", e);
+            }
+            if let Err(e) = crate::debug_dump::write_roots_summary(dir, &root_rows) {
+                eprintln!("Debug: failed to write roots_summary.txt: {}", e);
+            }
+            if let Err(e) = crate::debug_dump::write_objects(
+                dir,
+                &objects,
+                &visited,
+                &self.heap,
+                &class_aligned_body,
+                visited_count - class_object_visited,
+                garbage_count,
+            ) {
+                eprintln!("Debug: failed to write objects.tsv: {}", e);
+            }
+            eprintln!(
+                "Debug: wrote roots.tsv, roots_summary.txt, objects.tsv to {}",
+                dir.display()
+            );
+        }
+
         // Phase 3c: Build GC root trees for Section 4
         eprintln!("BFS Phase 3c: building GC root trees...");
-        let gc_root_store = build_gc_root_trees(
+        let mut gc_root_store = build_gc_root_trees(
             &objects,
             &root_of,
             &visited,
@@ -767,6 +872,31 @@ impl HeapObjectTraverser {
             &self.heap,
             &field_pool,
         );
+
+        // Section 4's garbage row must use the same accounting as Section 5.
+        // The root-tree walk uses a slightly different instance-size source, so
+        // rebuild the garbage summary from the per-class garbage counters.
+        gc_root_store.garbage.count = garbage_count;
+        gc_root_store.garbage.bytes = garbage_bytes;
+        let mut garbage_top: Vec<(String, u64, i64)> = self
+            .stats
+            .per_class
+            .iter()
+            .filter_map(|pc| {
+                let count = pc.instance_garbage_count.load(Relaxed) as u64
+                    + pc.array_garbage_count.load(Relaxed) as u64;
+                let bytes = pc.instance_garbage_bytes.load(Relaxed)
+                    + pc.array_garbage_bytes.load(Relaxed);
+                if count == 0 {
+                    None
+                } else {
+                    Some((pc.class_name.replace('/', "."), count, bytes))
+                }
+            })
+            .collect();
+        garbage_top.sort_by(|a, b| b.2.cmp(&a.2));
+        gc_root_store.garbage.top_classes = garbage_top.into_iter().take(20).collect();
+
         eprintln!("BFS: built {} GC root tree entries", gc_root_store.entries.len());
         *self.stats.gc_roots.lock().expect("stats mutex poisoned") = gc_root_store;
 
@@ -834,6 +964,59 @@ impl HeapObjectTraverser {
 /// Extract outgoing object references from an instance's field bytes.
 /// Walks the full class hierarchy (this class + superclasses) since HPROF
 /// stores fields in order: concrete class fields first, then superclass, etc.
+/// Collect all red-black-tree entry indices reachable from a TreeMap's `root`.
+/// Java's TreeSet wrapper traverses the backing TreeMap's entries and enqueues
+/// only keys; entry `value` fields are never followed.
+fn collect_tree_map_entries(
+    map_idx: u32,
+    outgoing_refs: &[Vec<OutEdge>],
+    field_pool: &FieldPool,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    let mut stack: Vec<u32> = Vec::new();
+    for edge in &outgoing_refs[map_idx as usize] {
+        if field_pool.get(edge.field_key) == "root" {
+            stack.push(edge.target);
+        }
+    }
+    while let Some(idx) = stack.pop() {
+        if !out.insert(idx) {
+            continue;
+        }
+        if let Some(edges) = outgoing_refs.get(idx as usize) {
+            for edge in edges {
+                let name = field_pool.get(edge.field_key);
+                if name == "left" || name == "right" {
+                    stack.push(edge.target);
+                }
+            }
+        }
+    }
+}
+
+fn prepare_tree_set_entries(
+    obj_idx: u32,
+    class_idx: u32,
+    tree_set_idx: Option<u32>,
+    tree_map_idx: Option<u32>,
+    outgoing_refs: &[Vec<OutEdge>],
+    field_pool: &FieldPool,
+    set_backing_maps: &mut std::collections::HashSet<u32>,
+    set_entries: &mut std::collections::HashSet<u32>,
+) {
+    if Some(class_idx) == tree_set_idx {
+        for edge in &outgoing_refs[obj_idx as usize] {
+            let name = field_pool.get(edge.field_key);
+            if name == "m" || name == "backingMap" {
+                set_backing_maps.insert(edge.target);
+            }
+        }
+    }
+    if Some(class_idx) == tree_map_idx && set_backing_maps.contains(&obj_idx) {
+        collect_tree_map_entries(obj_idx, outgoing_refs, field_pool, set_entries);
+    }
+}
+
 fn extract_instance_refs(
     fields: &[u8],
     class_info: &ss_heap_model::class_info::JavaClassInfo,
@@ -941,9 +1124,11 @@ fn count_prim_elements(arr: &heap_dump::PrimitiveArray) -> i32 {
     else { 0 }
 }
 
-fn array_shallow_size(length: i32, element_size: i32, header_size: i64) -> i64 {
+pub(crate) fn array_shallow_size(length: i32, element_size: i32, header_size: i64) -> i64 {
+    // Java's ObjectArrayInstance/PrimitiveArrayInstance.getBodySize() uses
+    // objectAlignBase = header + Object fields + the 4-byte array length field.
     let data_size = length as i64 * element_size as i64;
-    let raw = header_size + data_size;
+    let raw = header_size + 4 + data_size;
     (raw + 7) & !7
 }
 
@@ -977,7 +1162,7 @@ fn analyze_ref_chains(
         let mut total: i64 = 0;
         for (i, obj) in objects.iter().enumerate() {
             if obj.class_idx == idx && visited[i] && obj.kind != 3 {
-                total += compute_obj_shallow(obj, oop_size as i32, header_size);
+                total += compute_obj_shallow(obj, oop_size as i32, header_size as i64);
             }
         }
         if total > 0 {
@@ -999,7 +1184,7 @@ fn analyze_ref_chains(
         let mut live_objs: Vec<(i64, u32)> = Vec::new(); // (effective_size, obj_index)
         for (i, obj) in objects.iter().enumerate() {
             if obj.class_idx == class_idx && visited[i] && obj.kind != 3 {
-                let mut sz = compute_obj_shallow(obj, oop_size as i32, header_size);
+                let mut sz = compute_obj_shallow(obj, oop_size as i32, header_size as i64);
                 // For instance objects (especially String), add referenced children's shallow sizes
                 // to get a more meaningful ranking. This is similar to impl-inclusive size.
                 if obj.kind == 0 {
@@ -1062,13 +1247,11 @@ fn analyze_ref_chains(
                 .sum();
             let sample_count_in_group = obj_indices.len() as u64;
 
-            let scale = if sample_count_in_group > 0 {
-                live_objs.len() as f64 / samples.len() as f64
-            } else {
-                1.0
-            };
-            let extrapolated_bytes = (total_bytes as f64 * scale) as i64;
-            let extrapolated_count = (sample_count_in_group as f64 * scale) as u64;
+            // Report the size of the actual sampled group. Scaling the
+            // top-by-size samples by live_objs/samples over-counts large
+            // arrays by orders of magnitude (e.g. 12.3 GB for byte[]).
+            let extrapolated_bytes = total_bytes;
+            let extrapolated_count = sample_count_in_group;
 
             let path: Vec<ChainStep> = path_keys.iter().rev().map(|&(cls_idx, fld_key)| {
                 let class_name = if (cls_idx as usize) < heap.classes.len() {
@@ -1145,7 +1328,7 @@ fn analyze_humongous_chains(
     let mut humongous_objs: Vec<u32> = Vec::new();
     for (i, obj) in objects.iter().enumerate() {
         if obj.kind == 3 { continue; }
-        let size = compute_obj_shallow(obj, oop_size as i32, header_size);
+        let size = compute_obj_shallow(obj, oop_size as i32, header_size as i64);
         if size >= humongous_threshold {
             humongous_objs.push(i as u32);
         }
@@ -1650,10 +1833,10 @@ fn trace_humongous_chain(
 }
 
 /// Compute shallow size of an object entry.
-fn compute_obj_shallow(obj: &ObjectEntry, oop_size: i32, header_size: i64) -> i64 {
+pub(crate) fn compute_obj_shallow(obj: &ObjectEntry, oop_size: i32, header_size: i64) -> i64 {
     match obj.kind {
         0 => (header_size + obj.body_size as i64 + 7) & !7,
-        1 => array_shallow_size(obj.array_length, 1, header_size),
+        1 => array_shallow_size(obj.array_length, obj.element_size as i32, header_size),
         2 => array_shallow_size(obj.array_length, oop_size, header_size),
         _ => 0,
     }
@@ -2034,4 +2217,36 @@ fn build_single_root_tree(
     }
 
     node
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitive_array_shallow_size_uses_element_width() {
+        let int_array = ObjectEntry {
+            obj_id: 1,
+            class_idx: 0,
+            file_offset: 0,
+            body_size: 0,
+            kind: 1,
+            element_size: 4,
+            array_length: 100,
+        };
+        // align8(header 12 + 4 bytes * 100) = 416
+        assert_eq!(compute_obj_shallow(&int_array, 4, 12), 416);
+
+        let byte_array = ObjectEntry {
+            obj_id: 2,
+            class_idx: 0,
+            file_offset: 0,
+            body_size: 0,
+            kind: 1,
+            element_size: 1,
+            array_length: 100,
+        };
+        // align8(header 12 + 4-byte length + 1 byte * 100) = 120
+        assert_eq!(compute_obj_shallow(&byte_array, 4, 12), 120);
+    }
 }

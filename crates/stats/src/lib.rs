@@ -9,6 +9,7 @@ pub mod boxed_numbers;
 pub mod humongous;
 pub mod collections;
 pub mod direct_buffer;
+pub mod debug_dump;
 pub mod weak_hashmap;
 pub mod jvm_info;
 pub mod gc_type;

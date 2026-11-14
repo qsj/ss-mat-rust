@@ -20,6 +20,39 @@ use crate::table_formatter::{
     severity_med,
 };
 
+/// Java's `JavaClassInfo.isObjectArray()`: any array whose element type is not
+/// a primitive. Multi-dimensional primitive arrays (`[[I`, `[[B`) are primitive
+/// arrays in Java and must be excluded from Section 10's total.
+fn is_object_array_class_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'[' {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b'[' {
+        i += 1;
+    }
+    i < bytes.len() && bytes[i] == b'L'
+}
+
+/// Java's ContainerRegistry class list (exact-class match). Used for the
+/// "Total collections" denominator, which is the sum of instanceCount for all
+/// classes registered as containers.
+fn is_collection_class_name_for_report(name: &str) -> bool {
+    matches!(name,
+        "java/util/ArrayList" | "java/util/Vector" | "java/util/Stack"
+        | "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/Hashtable"
+        | "java/util/Properties" | "java/util/WeakHashMap"
+        | "java/lang/ThreadLocal$ThreadLocalMap"
+        | "java/util/concurrent/ConcurrentHashMap"
+        | "java/util/TreeMap" | "java/util/HashSet" | "java/util/LinkedHashSet"
+        | "java/util/TreeSet" | "java/util/LinkedList"
+        | "java/util/IdentityHashMap"
+        | "java/util/concurrent/ConcurrentSkipListMap"
+        | "java/util/concurrent/LinkedBlockingQueue"
+        | "java/util/concurrent/LinkedBlockingDeque")
+}
+
 /// Format a field value as an HTML string matching Java report style.
 fn format_field_value(val: &FieldValue) -> String {
     match val {
@@ -666,20 +699,23 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
 
-        // Filter: only classes with non-zero shallow size, sorted descending, top 500
-        // Note: total_instance_bytes already includes both instance and array shallow sizes
-        // (set by BFS heap_traverser), so we don't add array_live_bytes here.
-        let mut classes: Vec<_> = self
+        // Include both instances and arrays. `total_instance_bytes` covers
+        // instances only; arrays are accumulated separately by the linear scan.
+        let mut classes: Vec<(i64, i64, &ss_stats::per_class::PerClassStats)> = self
             .stats
             .per_class
             .iter()
-            .filter(|pc| pc.total_instance_bytes.load(Relaxed) > 0)
+            .map(|pc| {
+                let inst_bytes = pc.total_instance_bytes.load(Relaxed);
+                let arr_bytes = pc.array_live_bytes.load(Relaxed);
+                let shallow = inst_bytes + arr_bytes;
+                let live = (inst_bytes - pc.instance_garbage_bytes.load(Relaxed)).max(0)
+                    + (arr_bytes - pc.array_garbage_bytes.load(Relaxed)).max(0);
+                (shallow, live, pc)
+            })
+            .filter(|(shallow, _, _)| *shallow > 0)
             .collect();
-        classes.sort_by(|a, b| {
-            b.total_instance_bytes
-                .load(Relaxed)
-                .cmp(&a.total_instance_bytes.load(Relaxed))
-        });
+        classes.sort_by(|a, b| b.0.cmp(&a.0));
         let display_count = classes.len().min(500);
 
         let headers: &[(&str, &str)] = &[
@@ -696,8 +732,8 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 "Implementation-inclusive size. This is bigger than shallow size for collections, Strings and a few other classes. It includes the size of implementation, for example memory used by internal HashMap$Node objects in HashMap, internal char[] array in String, etc.",
             ),
             (
-                "Retained memory",
-                "How much memory is used by instances of the given class, plus all other objects that those instances reference, transitively.",
+                "Live shallow",
+                "Shallow size of reachable (live) instances and arrays of this class. Full dominator-based retained size is not implemented yet.",
             ),
             ("Class name", ""),
         ];
@@ -705,10 +741,8 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         let ref_chains = self.stats.ref_chains.lock().unwrap();
 
-        for (class_rank, pc) in classes.iter().take(500).enumerate() {
+        for (class_rank, &(shallow, live_shallow, pc)) in classes.iter().take(500).enumerate() {
             let inst = pc.instance_count.load(Relaxed) + pc.array_live_count.load(Relaxed) as u64;
-            let shallow = pc.total_instance_bytes.load(Relaxed);
-            let retained = pc.retained_size.load(Relaxed);
             // Impl-incl. size: shallow + duplicate string bytes overhead for this class
             let impl_incl = shallow + pc.duplicate_string_bytes.load(Relaxed).max(0);
             let class_name = pc.class_name.replace('/', ".");
@@ -717,7 +751,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 &format_count(inst),
                 &format_with_percent(shallow, total_bytes),
                 &format_with_percent(impl_incl, total_bytes),
-                &format_with_percent(retained, total_bytes),
+                &format_with_percent(live_shallow, total_bytes),
                 &format!("<t-c>{}</t-c>", class_name),
             ]);
 
@@ -1214,25 +1248,15 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         // traversal. We captured EMPTY/SINGLE_ELEM collections during the scan
         // (each contributing its full shallow body as waste). Filter to live.
         let records = self.stats.bad_collection_records.lock().unwrap().clone();
-        let live_ids: std::collections::HashSet<u64> = {
-            let guard = self.stats.traversal_data.lock().unwrap();
-            match guard.as_ref() {
-                Some(data) => data.objects.iter().enumerate()
-                    .filter(|(i, _)| data.visited.get(*i).copied().unwrap_or(false))
-                    .map(|(_, o)| o.obj_id).collect(),
-                None => std::collections::HashSet::new(),
-            }
-        };
 
-        // Aggregate live bad-collection waste per class.
+        // Java's processContainer runs for both live and garbage objects
+        // (the second traversal pass), so do not filter to live here.
+        // Aggregate bad-collection waste per class.
         let mut per_class: std::collections::HashMap<u32, (u64, i64)> = std::collections::HashMap::new();
         let mut total_collection_bytes: i64 = 0;
         let mut total_bad_count: u64 = 0;
         for r in &records {
-            if r.waste <= 0 {
-                continue;
-            }
-            if !live_ids.contains(&r.obj_id) {
+            if r.kind == ss_stats::problem_types::COLLECTION_KIND_NONE {
                 continue;
             }
             let (c, b) = per_class.entry(r.class_idx).or_insert((0, 0));
@@ -1241,6 +1265,10 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             total_collection_bytes += r.waste;
             total_bad_count += 1;
         }
+        let total_collections: u64 = self.stats.per_class.iter()
+            .filter(|pc| is_collection_class_name_for_report(&pc.class_name))
+            .map(|pc| pc.instance_count.load(Relaxed))
+            .sum();
         let mut entries: Vec<(String, u64, i64)> = per_class.iter()
             .map(|(&idx, &(c, b))| {
                 let name = self.heap.classes.get(idx as usize)
@@ -1263,7 +1291,15 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         self.begin_section(html, "Bad Collections", false, &indicator);
 
         if total_bad_count > 0 {
-            // Summary table
+            html.begin_table(false, 0, &["Total collections", "Bad collections", "Overhead:"]);
+            html.append_table_row(&[
+                &format_count(total_collections),
+                &format_count(total_bad_count),
+                &format_with_percent(total_collection_bytes, total_bytes),
+            ]);
+            html.end_table();
+
+            // Per-class table
             html.begin_table(true, 0, &["# instances", "Wasted bytes", "% of heap", "Class name"]);
             for (name, count, bytes) in entries.iter().take(30) {
                 html.append_table_row(&[
@@ -1375,16 +1411,29 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         // traversal (processingLiveObjects=true). The linear scan captured ALL
         // bad arrays (live+garbage); filter to live-only here using BFS `visited`.
         let records = self.stats.bad_array_records.lock().unwrap().clone();
-        let live_ids: std::collections::HashSet<u64> = {
-            let guard = self.stats.traversal_data.lock().unwrap();
-            match guard.as_ref() {
-                Some(data) => data.objects.iter().enumerate()
-                    .filter(|(i, _)| data.visited.get(*i).copied().unwrap_or(false))
-                    .map(|(_, o)| o.obj_id).collect(),
-                None => std::collections::HashSet::new(),
-            }
-        };
-        let live_records: Vec<_> = records.iter().filter(|r| live_ids.contains(&r.obj_id)).collect();
+        // Java's container traversal marks every container backing array visited
+        // before processObjectArray(); those arrays never enter Section 10.
+        let container_backing: std::collections::HashSet<u64> = self
+            .stats
+            .container_backing_ids
+            .lock()
+            .unwrap()
+            .clone();
+        let live_records: Vec<_> = records
+            .iter()
+            .filter(|r| !container_backing.contains(&r.obj_id))
+            .collect();
+
+        // Java S10's total = sum of instanceCount for classes with
+        // problemObjectCount==2, i.e. object arrays excluding multi-dimensional
+        // primitive arrays like [[I / [[B.
+        let total_object_arrays: u64 = self
+            .stats
+            .per_class
+            .iter()
+            .filter(|pc| is_object_array_class_name(&pc.class_name))
+            .map(|pc| pc.array_live_count.load(Relaxed) as u64)
+            .sum();
 
         let empty_count = live_records.iter().filter(|r| r.kind == 0).count() as u64;
         let empty_bytes: i64 = live_records.iter().filter(|r| r.kind == 0).map(|r| r.size).sum();
@@ -1411,6 +1460,14 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         self.begin_section(html, "Bad Object Arrays", false, &indicator);
 
         if total_bad > 0 {
+            html.begin_table(false, 0, &["Total object arrays", "Bad object arrays", "Overhead"]);
+            html.append_table_row(&[
+                &format_count(total_object_arrays),
+                &format_count(total_bad),
+                &format_with_percent(total_bad_bytes, total_bytes),
+            ]);
+            html.end_table();
+
             html.begin_table(true, 0, &["Problem type", "# arrays", "Size"]);
             if empty_count > 0 {
                 html.append_table_row(&[
@@ -1484,15 +1541,31 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
     fn section_bad_prim_arrays(&mut self, html: &mut HtmlStringBuilder) {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
-        let empty_count = self.stats.empty_prim_array_count.load(Relaxed);
-        let empty_bytes = self.stats.empty_prim_array_bytes.load(Relaxed);
-        let trailing_count = self.stats.trailing_zero_prim_array_count.load(Relaxed);
-        let trailing_bytes = self.stats.trailing_zero_prim_array_bytes.load(Relaxed);
-        let total_bad = empty_count + trailing_count;
-        let total_bad_bytes = empty_bytes + trailing_bytes;
+        let records = self.stats.bad_prim_array_records.lock().unwrap().clone();
+        let total_bad = records.len() as u64;
+        let total_bad_bytes: i64 = records.iter().map(|r| r.waste).sum();
+
+        let is_primitive_array = |name: &str| {
+            matches!(
+                name,
+                "boolean[]" | "byte[]" | "char[]" | "short[]" | "int[]" | "long[]"
+                    | "float[]" | "double[]"
+            )
+        };
+        let total_prim_arrays: u64 = self
+            .stats
+            .per_class
+            .iter()
+            .filter(|pc| is_primitive_array(&pc.class_name))
+            .map(|pc| pc.array_live_count.load(Relaxed) as u64)
+            .sum();
 
         let indicator = if total_bad > 0 && calc_percent(total_bad_bytes, total_bytes) >= 1.0 {
-            severity_low(&format!("Overhead {:.1}% ({})", calc_percent(total_bad_bytes, total_bytes), format_bytes(total_bad_bytes)))
+            severity_low(&format!(
+                "Overhead {:.1}% ({})",
+                calc_percent(total_bad_bytes, total_bytes),
+                format_bytes(total_bad_bytes)
+            ))
         } else if total_bad > 0 {
             severity_low(&format!("{}", format_bytes(total_bad_bytes)))
         } else {
@@ -1502,59 +1575,85 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         self.begin_section(html, "Bad Primitive Arrays", false, &indicator);
 
         if total_bad > 0 {
+            html.begin_table(
+                true,
+                0,
+                &["Total primitive arrays", "Bad primitive arrays", "Overhead"],
+            );
+            html.append_table_row(&[
+                &format_count(total_prim_arrays),
+                &format_count(total_bad),
+                &format_with_percent(total_bad_bytes, total_bytes),
+            ]);
+            html.end_table();
+
+            // Java's processPrimitiveArray categories, sorted by waste.
+            let mut categories: Vec<(u8, u64, i64)> = (0u8..=5)
+                .map(|kind| {
+                    let count = records.iter().filter(|r| r.kind == kind).count() as u64;
+                    let bytes = records
+                        .iter()
+                        .filter(|r| r.kind == kind)
+                        .map(|r| r.waste)
+                        .sum();
+                    (kind, count, bytes)
+                })
+                .filter(|(_, count, _)| *count > 0)
+                .collect();
+            categories.sort_by(|a, b| b.2.cmp(&a.2));
+
             html.begin_table(true, 0, &["Problem type", "# arrays", "Size"]);
-            if empty_count > 0 {
+            for (kind, count, bytes) in &categories {
                 html.append_table_row(&[
-                    "Empty primitive arrays (length=0)",
-                    &format_count(empty_count),
-                    &format_with_percent(empty_bytes, total_bytes),
-                ]);
-            }
-            if trailing_count > 0 {
-                html.append_table_row(&[
-                    "Trailing-zero primitive arrays (>50% tail zeros)",
-                    &format_count(trailing_count),
-                    &format_with_percent(trailing_bytes, total_bytes),
+                    ss_stats::problem_types::prim_array_problem_name(*kind),
+                    &format_count(*count),
+                    &format_with_percent(*bytes, total_bytes),
                 ]);
             }
             html.end_table();
 
-            // Per-class breakdown: aggregate sample obj_ids by class_idx.
-            let per_class = self.aggregate_bad_prim_array_by_class();
-            if !per_class.is_empty() {
-                html.append_raw("<details><summary>Per-class breakdown</summary><div class=\"scroll-wrap\">");
-                html.begin_table(true, 0, &["Class name", "Sample count", "Extrapolated size"]);
-                for (name, count, bytes) in per_class.iter().take(50) {
-                    html.append_table_row(&[
-                        name,
-                        &format_count(*count),
-                        &format_bytes(*bytes),
-                    ]);
-                }
-                html.end_table();
-                html.append_raw("</div></details>");
+            // Per-class + per-problem breakdown.
+            let mut groups: std::collections::HashMap<(u32, u8), (u64, i64)> =
+                std::collections::HashMap::new();
+            for record in &records {
+                let entry = groups.entry((record.class_idx, record.kind)).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += record.waste;
             }
+            let mut groups: Vec<((u32, u8), (u64, i64))> = groups.into_iter().collect();
+            groups.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+
+            html.append_raw(
+                "<details><summary>Per-class breakdown</summary><div class=\"scroll-wrap\">",
+            );
+            html.begin_table(true, 0, &["Overhead", "Problem", "# objects", "Class name"]);
+            for ((class_idx, kind), (count, bytes)) in groups.iter().take(50) {
+                html.append_table_row(&[
+                    &format_with_percent(*bytes, total_bytes),
+                    ss_stats::problem_types::prim_array_problem_name(*kind),
+                    &format_count(*count),
+                    &self.get_class_display(*class_idx),
+                ]);
+            }
+            html.end_table();
+            html.append_raw("</div></details>");
 
             html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
             html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
                 Empty primitive arrays waste memory due to object headers. Use null references or shared empty arrays.<br>\
-                Trailing-zero arrays (where more than 50% of elements at the end are zero) indicate that the array was \
-                allocated larger than needed. Consider sizing arrays more precisely, or using data structures that \
-                compress or sparse-encode the data.\
+                Trailing-zero arrays (where more than the configured share of elements at the end are zero) indicate \
+                that the array was allocated larger than needed. Consider sizing arrays more precisely, or using data \
+                structures that compress or sparse-encode the data.<br>\
+                Arrays with many zero elements or unused high bits can often be replaced by sparse structures or \
+                smaller element types.\
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
 
-            // Per-instance ref chain for sample bad primitive arrays.
-            let mut sample_ids: Vec<u64> = Vec::new();
-            for cat in [
-                &self.stats.empty_prim_array_samples,
-                &self.stats.trailing_zero_prim_array_samples,
-            ] {
-                let v = cat.lock().unwrap();
-                for &id in v.iter().take(5) {
-                    sample_ids.push(id);
-                }
-            }
+            // Per-instance reference chains for the largest problem arrays.
+            let mut samples: Vec<(i64, u64)> =
+                records.iter().map(|r| (r.waste, r.obj_id)).collect();
+            samples.sort_by(|a, b| b.0.cmp(&a.0));
+            let sample_ids: Vec<u64> = samples.iter().take(10).map(|(_, id)| *id).collect();
             self.render_instance_ref_chains(
                 html,
                 "Per-instance reference chains for sample bad primitive arrays",
@@ -1808,14 +1907,30 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 }
                 html.end_table();
                 html.append_raw("</div></details>");
-
-                // Typical reference paths for the top duplicate class.
-                if let Some(top) = per_class.first() {
-                    let _ = html.append_raw(&self.render_class_ref_chain_panel(&top.class_name, total_bytes));
-                }
             }
 
-            // Per-instance reference chains for sample duplicate arrays.
+            if !report.top_groups.is_empty() {
+                html.append_raw("<details><summary>Top duplicate arrays</summary><div class=\"scroll-wrap\">");
+                html.begin_table(true, 0, &["Overhead", "# objects", "Value"]);
+                for g in report.top_groups.iter().take(100) {
+                    let value = if g.class_name == "char[]" {
+                        format!("{}{{''}}", g.description)
+                    } else {
+                        format!("{}{{}}", g.description)
+                    };
+                    html.append_table_row(&[
+                        &format_with_percent(g.wasted_bytes, total_bytes),
+                        &format_count(g.count as u64),
+                        &value,
+                    ]);
+                }
+                html.end_table();
+                html.append_raw("</div></details>");
+            }
+
+            // Per-instance reference chains for the sample duplicate arrays.
+            // Do not use the class-wide chain panel here: it extrapolates all
+            // byte[] chains and can produce impossible percentages.
             let mut sample_ids: Vec<u64> = Vec::new();
             for g in report.top_groups.iter().take(10) {
                 for &id in g.sample_obj_ids.iter().take(2) {
@@ -2497,39 +2612,6 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         } else {
             "unknown".to_string()
         }
-    }
-
-    /// Aggregate bad primitive array samples by class for Section 11
-    /// per-class breakdown. Returns (class_name, sample_count, extrapolated_bytes)
-    /// sorted by sample count descending. The extrapolation uses total bad-array
-    /// bytes / total samples as a simple scaling factor.
-    fn aggregate_bad_prim_array_by_class(&self) -> Vec<(String, u64, i64)> {
-        use std::collections::HashMap;
-
-        let guard = self.stats.traversal_data.lock().unwrap();
-        let data = match guard.as_ref() {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-
-        let empty_samples = self.stats.empty_prim_array_samples.lock().unwrap();
-        let trailing_samples = self.stats.trailing_zero_prim_array_samples.lock().unwrap();
-
-        let mut per_class: HashMap<u32, (u64, i64)> = HashMap::new();
-        for &id in empty_samples.iter().chain(trailing_samples.iter()) {
-            if let Some(obj) = data.objects.iter().find(|o| o.obj_id == id) {
-                let entry = per_class.entry(obj.class_idx).or_insert((0, 0));
-                entry.0 += 1;
-                // Approximate size using body_size + header.
-                entry.1 += obj.body_size as i64 + self.heap.header_size as i64;
-            }
-        }
-
-        let mut v: Vec<(String, u64, i64)> = per_class.into_iter()
-            .map(|(idx, (count, bytes))| (self.get_class_display(idx), count, bytes))
-            .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v
     }
 
     fn section_thread_stacks(&mut self, html: &mut HtmlStringBuilder) {

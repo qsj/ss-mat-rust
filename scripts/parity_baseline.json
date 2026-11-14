@@ -1,0 +1,70 @@
+{
+  "heap_total_kb": {
+    "value": 178326,
+    "tolerance_pct": 0.0
+  },
+  "instances": {
+    "value": 2135318,
+    "tolerance_pct": 0.0
+  },
+  "object_arrays": {
+    "value": 247623,
+    "tolerance_pct": 0.0
+  },
+  "primitive_arrays": {
+    "value": 382570,
+    "tolerance_pct": 0.0
+  },
+  "total_objects": {
+    "value": 2765511,
+    "tolerance_pct": 0.0
+  },
+  "live_objects": {
+    "value": 2034361,
+    "tolerance_pct": 0.0
+  },
+  "garbage_objects": {
+    "value": 731150,
+    "tolerance_pct": 0.0
+  },
+  "live_bytes_kb": {
+    "value": 98239,
+    "tolerance_pct": 0.0
+  },
+  "garbage_bytes_kb": {
+    "value": 80087,
+    "tolerance_pct": 0.0
+  },
+  "s8_overhead_kb": {
+    "value": 9698,
+    "tolerance_pct": 0.0
+  },
+  "s9_overhead_kb": {
+    "value": 11110,
+    "tolerance_pct": 0.0
+  },
+  "s10_overhead_kb": {
+    "value": 4959,
+    "tolerance_pct": 0.0
+  },
+  "s11_overhead_kb": {
+    "value": 6873,
+    "tolerance_pct": 0.0
+  },
+  "s12_overhead_kb": {
+    "value": 1092,
+    "tolerance_pct": 0.0
+  },
+  "s14_overhead_kb": {
+    "value": 147,
+    "tolerance_pct": 0.0
+  },
+  "s18_offheap_kb": {
+    "value": 96927,
+    "tolerance_pct": 0.0
+  },
+  "s18_unreachable_kb": {
+    "value": 94786,
+    "tolerance_pct": 0.0
+  }
+}

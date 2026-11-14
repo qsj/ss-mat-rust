@@ -6,6 +6,7 @@ pub mod heap_traverser;
 pub mod virtual_stack;
 pub mod post_aggregator;
 pub mod garbage_scanner;
+pub mod debug_dump;
 
 // Re-export the public field-value resolution API for downstream crates
 // (notably `ss-report`, which needs per-object field values at render time

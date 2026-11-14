@@ -6,6 +6,9 @@ pub struct ObjectEntry {
     pub body_size: i32,
     /// Object type: 0=instance, 1=primitive array, 2=object array, 3=class object
     pub kind: u8,
+    /// Bytes per array element: primitive width for kind=1, oop size for kind=2,
+    /// 0 for instances and class objects.
+    pub element_size: u8,
     pub array_length: i32,
 }
 
