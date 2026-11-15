@@ -12,9 +12,9 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 
 测试：`cargo test --workspace`（34 个测试：15 traversal + 9 record_reader + 6 support + 3 parser + 1 objdir）。`SS_MAT_BIG_DUMP=<dump>` 时 ss-hprof-parser 会额外走一遍真实 dump 校验记录走查器。
 
-回归检查：`python3 scripts/parity.py <report.html>`，基线 `scripts/parity_baseline.json` **全部 tolerance=0（严格模式）**；当前 17/17 精确 PASS。`Cargo.lock` 已不再被 `.gitignore` 忽略。
+回归检查：`python3 scripts/parity.py <report.html>`，基线 `scripts/parity_baseline.json` **全部 tolerance=0（严格模式）**；当前 17/17 精确 PASS。`Cargo.lock` 已不再被 `.gitignore` 忽略。S15 已按 Java 两阶段语义复刻（两个真实 dump 均为空报告），`problem_stats.tsv` / `boxed_summary.tsv` / `s8_summary.tsv` / `s15_dup_obj_arrays.tsv` 与 Java 排序后 0 diff。
 
-取证开关（默认关闭）：`SS_MAT_DEBUG_DIR=<dir>` 输出 roots/objects/S14 TSV，以及 Java 同 schema 的 `problem_stats.tsv` / `s8_summary.tsv` / `s8_groups.tsv` / `boxed_summary.tsv`（S8–S12 聚合），用于和 Java 逐对象/逐类 diff。
+取证开关（默认关闭）：`SS_MAT_DEBUG_DIR=<dir>` 输出 roots/objects/S14/S15 TSV，以及 Java 同 schema 的 `problem_stats.tsv` / `s8_summary.tsv` / `s8_groups.tsv` / `boxed_summary.tsv`（S8–S12 聚合）、`s15_dup_obj_arrays.tsv`（S15 汇总/阈值/候选类/class/group 明细）、`bad_collections.tsv`（S9 逐实例），用于和 Java 逐对象/逐类 diff。
 
 ## 架构
 
@@ -63,6 +63,7 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 - Section 18 DirectByteBuffer 对象数 65、off-heap 96,927KB / 94,786KB 精确对齐
 - Section 10 坏对象数组与 Java **逐类逐 kind 精确对齐**：246,380 total / 107,388 bad / 5,078,276B（4,959KB）；复刻了 ClassDump resolveIndex 当 null 的 Java bug，排除多维基本类型数组与全部容器 backing array
 - Section 9 坏集合：overhead **11,110KB 精确**；Total collections 178,615、bad collections **141,862 均精确**。已复刻 wrapper 语义、SMALL 公式、isCollection ×2、WeakHashMap ReferenceQueue+lock、ThreadLocalMap entry、LinkedList MANY_NULLS、LBQ/CSLM 空集合与 CSLM 的 head.node.next 计数（唯一残差：CSLM 那个 small 的 body 少 152B，不影响 KB 显示）
+- Section 15 已按 Java 两阶段语义复刻：线性扫描 `ArrayCollectionScanner`（候选类 `isObjectArray && !isFinalizable && refChainOverhead > dupThreshold`，raw 引用字节含 null 的 Java hash/相等，按类 0.1% 阈值，fastutil `C0093aj` 只枚举 values 迭代器第一个 bucket 链）产生报告；若非 null，再由 BFS 阶段 `ClassDominatedSizeComputer.finalizeReports` 用 `ObjectArrayInstance.getBodySize()` 重算并覆盖（class duplicateCount = 组数 + 未枚举组的实例数，totalGroupCount 同语义）。task_dump 与 appauditd 的线性阶段报告均为 null，因此 S15 与 Java 一样只渲染空 section
 - Section 14 已移除按 top-by-size 样本外推的类级链面板，不再出现 `12.3 GB (7203.2%)`
 - Section 14 重复原始数组与 Java `PrimitiveArraySizeAccumulator` 同构：382,570 total / 122,965 unique / 8 duplicate values / 151,360B（147KB）精确对齐；per-type 8 行（waste / 总实例 / distinct content）与 Java 完全一致。merge 只枚举 fastutil groupMap 的第一个 bucket（hash 0 chain），pending 大小 122,588 + 369
 - SecHdr 35/35、Reference Chains 10/10、easy-to-fix 2/2
@@ -134,6 +135,10 @@ Section 22: 全部线程栈可折叠显示（OOM 线程优先）
 - S14：`PrimitiveArraySizeAccumulator.mergeAndBuildReport` 只枚举 groupMap 第一个 bucket；空数组 hash=0 且 fastutil key=0 优先返回，因此报告只显示 8 个零长度数组组 / 147KB。Rust 按同构行为输出。
 - S10：`HeapDump.resolveIndex()` 对 ClassDump 地址返回 0，导致 `Class[]`/`Type[]` 元素全部被当作 null；Rust 用 `address_to_index` 复刻，S10 才得以逐类精确。
 - S9：wrapper 迭代器把内层 map 标记 visited，导致 HashSet/LinkedHashSet/TreeSet/Properties 的内层 map 不计入 bad collections；Rust 已按 wrapper 记录复刻。
+- S9：CSLM 迭代器实现的是 `CollectionContainerInstance`（`isCollection()==true`），SMALL 公式用 x2；Rust 原先按 map 的 x1 计算，已修正（task CSLM 416B、appauditd 384B，与 Java bad_collections 逐实例一致）。
+- S15：`buildDupReport` 的 class 级 waste 用 `alignedBodySize`，但最终 S15 报告被 `ClassDominatedSizeComputer` 用真实 array body 覆盖；Rust 已复刻两阶段。
+- S15：`ClassDominatedSizeComputer` 只对线性阶段 groupEntries（fastutil 第一个 bucket 链）中的 groupId 建 ClassSizeRecord；其余实例逐个累加 class.duplicateCount，不进入 group 明细。
+- S15：`ContainerRegistry` 会把 HashTable 系容器的 entry 类的数组类（`getClassByElementType`）标记 finalizable，因此 `HashMap$Node[]` 不是 S15 候选；Rust 已按注册条件复刻（见 `finalizable_array_classes`）。
 - JavaStaticRoot 的目标地址是 protection domain 而非静态字段值；Rust 不参与可达性。
 
 ## 已知限制
@@ -141,8 +146,10 @@ Section 22: 全部线程栈可折叠显示（OOM 线程优先）
 - Section 3 的 "Live shallow" 是 live shallow，不是 dominator retained；列名已改，避免误导
 - `ss-containers` 与 `ss-support` 尚未被主流程引用；`traversal/stats` 仍有若干 stub 模块
 - HPROF 仍会被完整重解析多次，GB 级 dump 需要后续性能优化
-- 内存优化进行中：已完成度量、零算法瘦身、对象目录/外部排序/窗口化 mmap/记录走查器等基础设施（均带单测），BFS 边表已扁平化为 `EdgeTable`；未完成的部分（BFS 去图化、流式线性扫描、窗口化 mmap 接入、替换两张地址表）与实测数据见 `docs/memory-reduction-status.md`
+- 内存优化：对象目录、记录走查器、流式线性扫描、BFS 去图化、窗口化 mmap 均已落地；task_dump 峰值 live heap 188.5 MB / footprint 230 MB / 18.0 s，appauditd 401.2 MB / 472 MB / 61.9 s；仍保留约 18 B/对象（`sorted_addresses`、BFS dump 序表、链采样），实测与复现见 `docs/memory-reduction-status.md`
 - `JAVA_BFS_VISITED_BEFORE_STRING` 是 Java BFS live/garbage 访问顺序的兼容表，目前含 task_dump 的 2 个和 appauditd 的 1 个 `String.value` 数组；新 dump 若出现同类顺序差异，需要按 Java 实际访问顺序补充或改为完整 BFS 调度复刻
+- `JAVA_BFS_VISITED_BEFORE_CONTAINER` 是同一类兼容表：Java `addInstanceBodySize` 只统计未被 BFS 访问过的对象，appauditd 的 WeakHashMap `0x604bec478` 的 entry/ReferenceQueue/lock 已被访问，SINGLE_ELEM body 少 88B；Rust 在 compute_body 中显式扣除。新 dump 若出现同类差异需补充
+- S15 非空时 group 行的 representative 地址取决于 Java BFS 访问顺序（Rust 用扫描顺序），因此逐组 representative 地址可能不同；totals/class/group count/waste/body/长度均对齐
 
 ## 与 Java 版对比参考
 

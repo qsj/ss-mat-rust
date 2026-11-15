@@ -660,6 +660,7 @@ impl LinearScanCoordinator {
                             counter_cells,
                             waste,
                             kind: ss_stats::problem_types::COLLECTION_KIND_NONE,
+                            body: 0,
                         });
                     }
                 }
@@ -896,7 +897,10 @@ impl LinearScanCoordinator {
             | "java/util/Properties" | "java/util/WeakHashMap"
             | "java/lang/ThreadLocal$ThreadLocalMap"
             | "java/util/IdentityHashMap"
-            | "java/util/concurrent/ConcurrentHashMap" | "java/util/TreeMap");
+            | "java/util/concurrent/ConcurrentHashMap" | "java/util/TreeMap"
+            // CSLM's iterator implements CollectionContainerInstance in Java,
+            // so isCollection() is true and SMALL uses the x2 factor.
+            | "java/util/concurrent/ConcurrentSkipListMap");
         let category_count = |name: &str| if name == "java/util/IdentityHashMap" { 2 } else { 1 };
 
         let classify = |size: i32, body: i64, overhead_capacity: i32, is_collection: bool, cat: i64| -> (u8, i64) {
@@ -1050,6 +1054,19 @@ impl LinearScanCoordinator {
                     }
                 }
             }
+            // Java's addInstanceBodySize() skips objects that the BFS already
+            // marked visited before the container's processContainer() call.
+            // Rust computes container bodies in the linear scan, before BFS, so
+            // a few Java-order artifacts have to be replicated explicitly (see
+            // JAVA_BFS_VISITED_BEFORE_STRING above). For this WeakHashMap Java
+            // had already visited its entry (40B), ReferenceQueue (32B) and lock
+            // (16B), so its SINGLE_ELEM body is 88B smaller.
+            const JAVA_BFS_VISITED_BEFORE_CONTAINER: &[(u64, i64)] = &[(0x604bec478, 88)];
+            if class_name == "java/util/WeakHashMap" {
+                if let Some(&(_, skip)) = JAVA_BFS_VISITED_BEFORE_CONTAINER.iter().find(|(id, _)| *id == rec.obj_id) {
+                    body -= skip;
+                }
+            }
             (body, capacity)
         };
 
@@ -1109,6 +1126,7 @@ impl LinearScanCoordinator {
             } else {
                 cap_by_idx[i]
             };
+            rec.body = body_by_idx[i];
             let (kind, waste) = classify(
                 rec.size,
                 body_by_idx[i],
@@ -1185,6 +1203,7 @@ impl LinearScanCoordinator {
                 counter_cells: 0,
                 waste,
                 kind,
+                body,
             });
         }
         ss_support::mem_trace::trace("run-collagg");
@@ -1200,7 +1219,44 @@ impl LinearScanCoordinator {
             &self.stats,
         );
         ss_support::mem_trace::trace("run-dupprim");
-        detect_duplicate_obj_arrays(&objs, &self.heap.classes, &self.stats, header_sz, oop_sz);
+        // Java's primitiveArrayTotalSize sums refChainOverhead over the
+        // single-dimension primitive-array classes: count*(header+4) plus the
+        // sum of element lengths times the element size. primitiveArrayBytes is
+        // the real (aligned) body total used by StatsEngine.getTotalBytes().
+        // Java's LinearScanCoordinator.instanceTotalBytes: sum of
+        // instanceCount*alignedBodySize over non-array classes, using the
+        // parse-time instance counts (the scan adds to the stat counters later).
+        let mut instance_total_bytes: i64 = 0;
+        for (i, cls) in self.heap.classes.iter().enumerate() {
+            if !is_array_class_name(&cls.name) {
+                instance_total_bytes += self.heap.per_class_inst_count.get(i).copied().unwrap_or(0) as i64
+                    * class_aligned.get(i).copied().unwrap_or(0);
+            }
+        }
+        let mut prim_counts = [0i64; 8];
+        let mut prim_data_bytes = [0i64; 8];
+        let mut primitive_array_bytes: i64 = 0;
+        for rec in &prim_recs {
+            let ti = prim_type_code_index(rec.prim_type);
+            prim_counts[ti] += 1;
+            prim_data_bytes[ti] += rec.length as i64 * rec.elem_size() as i64;
+            primitive_array_bytes += array_shallow_size(rec.length as i32, rec.elem_size(), header_sz);
+        }
+        let primitive_array_total_size: i64 = (0..8)
+            .map(|t| prim_counts[t] * (header_sz + 4) + prim_data_bytes[t])
+            .sum();
+        detect_duplicate_obj_arrays(
+            &objs,
+            &self.heap.classes,
+            &self.heap.class_by_name,
+            &self.stats,
+            header_sz,
+            oop_sz,
+            id_bytes,
+            instance_total_bytes,
+            primitive_array_total_size,
+            primitive_array_bytes,
+        );
         ss_support::mem_trace::trace("run-dup");
 
         // Stash the records the report reads after BFS.
@@ -1921,15 +1977,16 @@ impl<'a> RawWalk<'a> {
 /// Pages kept resident behind the walk cursor.
 const SCAN_RELEASE_WINDOW: usize = 24 << 20;
 
-/// Body reads between two release windows: residency then stays near that many
-/// pages instead of growing with the dump.
 /// How often the on-demand body readers hand the mapping's pages back.
 ///
-/// The duplicate-detection passes read bodies at pseudo-random addresses, so every
-/// page they touch stays resident until something releases it. Releasing only every
-/// 4096 reads let those pages pile up to a third of the dump; the passes are I/O
-/// bound anyway, so a much tighter stride costs little and bounds RSS.
-const BODY_RELEASE_STRIDE: usize = 128;
+/// The duplicate-detection passes read bodies at pseudo-random addresses, so the
+/// pages they touch stay resident until something releases them. Releasing the
+/// whole mapping is a page-table walk proportional to the file size (tens of
+/// milliseconds on macOS), so the stride trades residency for syscall cost: a
+/// few thousand reads touch at most that many pages, which is a small window
+/// next to the dump, while a 128-read stride made the pass spend minutes inside
+/// `madvise`.
+const BODY_RELEASE_STRIDE: usize = 2048;
 
 /// One heap-dump object, located in the mapped dump by walk_heap.
 enum RawObj {
@@ -1940,15 +1997,22 @@ enum RawObj {
     PrimArray { obj_id: u64, type_code: u8, len: u32, body_off: usize, body_len: usize },
 }
 
-/// Hand the mapping's pages below upto back to the kernel.
-fn release_before(map: &memmap2::Mmap, upto: usize) {
-    if upto == 0 || map.is_empty() {
+/// Hand the mapping's pages in `from..upto` back to the kernel.
+fn release_range(map: &memmap2::Mmap, from: usize, upto: usize) {
+    if map.is_empty() {
         return;
     }
+    let from = from.min(map.len());
     let end = upto.min(map.len());
-    // SAFETY: the range is inside a read-only file mapping; a released page is
-    // re-read from the file on its next touch, so the bytes never change.
-    let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, 0, end) };
+    if end <= from {
+        return;
+    }
+    // SAFETY: the range lies behind the scan cursor inside a read-only file
+    // mapping; a released page is re-read from the file on its next touch, so
+    // the bytes never change.
+    let _ = unsafe {
+        map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, from, end - from)
+    };
 }
 
 /// Walk every heap-dump object in dump order, reporting where its body lives
@@ -1978,9 +2042,14 @@ where
             // A heap-dump segment can span most of the file, so the window has to
             // advance inside it too.
             let abs = rec_start + sub.pos;
-            if abs > released + SCAN_RELEASE_WINDOW {
-                released = abs - SCAN_RELEASE_WINDOW;
-                release_before(mmap, released);
+            // Release in window-sized chunks: only when at least two windows
+            // have passed since the last release, so this costs one `madvise`
+            // per window instead of one per object. Releasing `0..upto` here
+            // re-walks the whole prefix on every record and stalls the scan.
+            if abs > released + 2 * SCAN_RELEASE_WINDOW {
+                let upto = abs - SCAN_RELEASE_WINDOW;
+                release_range(mmap, released, upto);
+                released = upto;
             }
             match sub.u8()? {
                 // GC roots. The payload depends on the root kind.
@@ -2465,6 +2534,13 @@ impl<'a> ObjBodies<'a> {
         None
     }
 
+    /// Raw element bytes of one object array, including null references.
+    fn raw(&self, rec: &ObjArrRec) -> &'a [u8] {
+        let off = rec.body_off as usize;
+        let len = rec.length as usize * self.id_bytes;
+        &self.data[off..off + len]
+    }
+
     /// The non-null element addresses of one object array, in dump order.
     fn elems(&self, rec: &ObjArrRec) -> Vec<u64> {
         let off = rec.body_off as usize;
@@ -2752,6 +2828,8 @@ fn detect_duplicate_prim_arrays(
                         count: node.count as usize,
                         wasted_bytes: wasted,
                         size_bytes: body,
+                        group_id: 0,
+                        representative_obj_id: rep.obj_id,
                         description: format!(
                             "{}[{}]",
                             PRIM_TYPE_DISPLAY[type_idx].trim_end_matches("[]"),
@@ -2812,145 +2890,667 @@ fn detect_duplicate_prim_arrays(
         .set_results(total_processed, unique_count, per_class_entries, top_groups);
 }
 
+/// Java `JavaClassInfo.isArray()` for the class names Rust keeps: HPROF array
+/// names start with '[', while the parser's synthetic primitive-array classes
+/// are named "byte[]", "int[]" and so on.
+fn is_array_class_name(name: &str) -> bool {
+    name.starts_with('[') || name.ends_with("[]")
+}
+
+/// Java `JavaClassInfo.isPrimitiveArrayType`: a name whose element type is a
+/// primitive, at any dimension. "[I" and "[[I" both qualify.
+fn is_primitive_array_type_name(name: &str) -> bool {
+    if name.starts_with('[') {
+        return is_primitive_array_class_name(name);
+    }
+    matches!(
+        name,
+        "boolean[]" | "byte[]" | "char[]" | "short[]" | "int[]" | "long[]" | "float[]" | "double[]"
+    )
+}
+
+/// Java `JavaClassInfo.isPrimitiveArray()`: single-dimension primitive array.
+/// Only those feed Java's `primitiveArrayTotalSize`; "[["-prefixed primitive
+/// arrays count towards `objectArrayTotalSize` instead.
+fn is_single_dim_primitive_array(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix('[') {
+        return rest.len() == 1
+            && matches!(rest.as_bytes()[0], b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D');
+    }
+    matches!(
+        name,
+        "boolean[]" | "byte[]" | "char[]" | "short[]" | "int[]" | "long[]" | "float[]" | "double[]"
+    )
+}
+
+/// Java `JavaClassInfo.isObjectArray()`: any array of non-primitive elements.
+fn is_object_array_class_name(name: &str) -> bool {
+    is_array_class_name(name) && !is_primitive_array_type_name(name)
+}
+
+/// fastutil `HashCommon.mix(int)` used by the shaded `C0093aj`
+/// (`Int2ObjectOpenHashMap`) that Java's S15 scanner uses.
+fn fastutil_mix(k: i32) -> u32 {
+    let h = k.wrapping_mul(-1_640_531_527);
+    (h as u32) ^ ((h as u32) >> 16)
+}
+
+/// fastutil `HashCommon.arraySize(n, 0.75f)`: next power of two of
+/// `ceil(n / 0.75f)`, at least 2.
+fn fastutil_array_size(n: usize) -> usize {
+    let q = (n as f32) / 0.75f32;
+    let x = ((q as f64).ceil() as u64).max(2) as usize;
+    x.next_power_of_two()
+}
+
+/// fastutil `HashCommon.maxFill(arraySize, 0.75f)`.
+fn fastutil_max_fill(array_size: usize) -> usize {
+    let f = (array_size as f32) * 0.75f32;
+    ((f as f64).ceil() as usize).min(array_size.saturating_sub(1))
+}
+
+/// Simulate the open-addressing table of Java's `C0093aj` for the keys inserted
+/// in `order`, then return the key whose value Java's `values().iterator()`
+/// yields first. The fastutil iterator visits the zero key first and then walks
+/// the non-zero slots from high to low; `buildDupReport` only enumerates that
+/// first value's node chain.
+fn fastutil_first_key(order: &[i32]) -> Option<i32> {
+    let mut n = fastutil_array_size(16);
+    let mut max_fill = fastutil_max_fill(n);
+    let mut table = vec![0i32; n + 1];
+    let mut has_zero = false;
+    let mut size = 0usize;
+    for &k in order {
+        if k == 0 {
+            if has_zero {
+                continue;
+            }
+            has_zero = true;
+        } else {
+            let mask = n - 1;
+            let mut slot = (fastutil_mix(k) as usize) & mask;
+            while table[slot] != 0 && table[slot] != k {
+                slot = (slot + 1) & mask;
+            }
+            table[slot] = k;
+        }
+        let old_size = size;
+        size += 1;
+        if old_size >= max_fill {
+            let new_n = fastutil_array_size(size);
+            let mut next = vec![0i32; new_n + 1];
+            let new_mask = new_n - 1;
+            for slot in (0..n).rev() {
+                let old = table[slot];
+                if old == 0 {
+                    continue;
+                }
+                let mut target = (fastutil_mix(old) as usize) & new_mask;
+                while next[target] != 0 {
+                    target = (target + 1) & new_mask;
+                }
+                next[target] = old;
+            }
+            table = next;
+            n = new_n;
+            max_fill = fastutil_max_fill(n);
+        }
+    }
+    if has_zero {
+        return Some(0);
+    }
+    (0..n).rev().find_map(|slot| if table[slot] != 0 { Some(table[slot]) } else { None })
+}
+
+/// Java `JavaClassInfo.isFinalizable` is set on container entry classes by
+/// `AbstractContainerDescriptor.markClassesFinalizable`, and several
+/// descriptors also mark the entry class' array class
+/// (`heap.getClassByElementType(entryName)`). `ArrayCollectionScanner` skips
+/// finalizable classes, so e.g. `HashMap$Node[]` is never an S15 candidate.
+fn finalizable_array_classes(
+    classes: &[JavaClassInfo],
+    class_by_name: &HashMap<Arc<str>, u32>,
+) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    let mut addr_to_idx: HashMap<u64, u32> = HashMap::with_capacity(classes.len());
+    for c in classes {
+        if c.class_object_id != 0 {
+            addr_to_idx.insert(c.class_object_id, c.index);
+        }
+    }
+    let class_idx = |name: &str| -> Option<u32> { class_by_name.get(name).copied() };
+    let has_field = |idx: u32, names: &[&str]| -> bool {
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            let c = &classes[i as usize];
+            if c.instance_fields.iter().any(|fd| names.iter().any(|n| fd.name.as_ref() == *n)) {
+                return true;
+            }
+            cur = if c.super_class_id == 0 { None } else { addr_to_idx.get(&c.super_class_id).copied() };
+        }
+        false
+    };
+    // Java's HeapDump.classByElementType: array class name -> element type name.
+    let mut element_array: HashMap<String, u32> = HashMap::new();
+    for c in classes {
+        let name = c.name.as_ref();
+        if let Some(rest) = name.strip_prefix('[') {
+            if let Some(elem) = rest.strip_prefix('L').and_then(|r| r.strip_suffix(';')) {
+                element_array.insert(elem.to_string(), c.index);
+            }
+        }
+    }
+    let mark_entry = |entry_dotted: &str, out: &mut std::collections::HashSet<u32>| {
+        if let Some(&arr) = element_array.get(entry_dotted) {
+            out.insert(arr);
+        }
+    };
+    let resolve_entry = |alts: &[&str]| -> Option<String> {
+        alts.iter().find(|n| class_idx(n).is_some()).map(|n| n.to_string())
+    };
+
+    // HashTableBasedMapDescriptor family: container needs its size/count and
+    // table fields to reach markClassesFinalizable, then the entry class and
+    // its array class are marked.
+    let hashtable_rows: &[(&str, &[&str], &[&str])] = &[
+        ("java/util/HashMap", &["size"], &["java/util/HashMap$Entry", "java/util/HashMap$Node", "java/util/HashMap$HashMapEntry"]),
+        ("java/util/LinkedHashMap", &["size"], &["java/util/LinkedHashMap$Entry", "java/util/LinkedHashMap$LinkedHashMapEntry", "java/util/LinkedHashMap$LinkedEntry"]),
+        ("java/util/Hashtable", &["count", "size"], &["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]),
+        ("java/lang/System$PropertiesWithNonOverrideableDefaults", &["count", "size"], &["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]),
+        ("java/lang/ThreadLocal$ThreadLocalMap", &["size"], &["java/lang/ThreadLocal$ThreadLocalMap$Entry"]),
+    ];
+    for (container, size_fields, entries) in hashtable_rows {
+        let Some(cidx) = class_idx(container) else { continue };
+        if !has_field(cidx, size_fields) || !has_field(cidx, &["table"]) {
+            continue;
+        }
+        if let Some(entry) = resolve_entry(entries) {
+            mark_entry(&entry, &mut out);
+        }
+    }
+    // java.util.Properties uses the Hashtable path when it has no `map` field.
+    if let Some(cidx) = class_idx("java/util/Properties") {
+        if !has_field(cidx, &["map"]) && has_field(cidx, &["count", "size"]) && has_field(cidx, &["table"]) {
+            if let Some(entry) = resolve_entry(&["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]) {
+                mark_entry(&entry, &mut out);
+            }
+        }
+    }
+    // FlatEntryTableDescriptor (Guava): marks the entry and its array in the
+    // AbstractContainerDescriptor constructor, before any field lookup.
+    if class_idx("com/google/common/collect/RegularImmutableMap").is_some() {
+        if let Some(entry) = resolve_entry(&[
+            "com/google/common/collect/RegularImmutableMap$NonTerminalEntry",
+            "com/google/common/collect/RegularImmutableMap$TerminalEntry",
+        ]) {
+            mark_entry(&entry, &mut out);
+        }
+    }
+    // CHMSegmentDescriptor (JDK7): only reached when CHM$Node is absent; marks
+    // the segment class, the entry class and both array classes.
+    if class_idx("java/util/concurrent/ConcurrentHashMap$Node").is_none()
+        && class_idx("java/util/concurrent/ConcurrentHashMap").is_some()
+    {
+        if let Some(seg) = resolve_entry(&["java/util/concurrent/ConcurrentHashMap$Segment"]) {
+            mark_entry(&seg, &mut out);
+        }
+        if let Some(entry) = resolve_entry(&[
+            "java/util/concurrent/ConcurrentHashMap$HashEntry",
+            "java/util/concurrent/ConcurrentHashMap$Node",
+        ]) {
+            mark_entry(&entry, &mut out);
+        }
+    }
+    out
+}
+
+/// One content group node of Java's `ObjectSizeNode` chain.
+#[derive(Clone, Copy)]
+struct ObjDupNode {
+    rep_rec: u32,
+    dup_count: u32,
+    group_id: u32,
+    next: i32,
+}
+
+/// Per-candidate-class state of Java's `ArrayCollectionScanner`.
+struct ObjDupClassState {
+    /// hash -> (first instance's rec index, its group id), Java's `hashIndexMaps`.
+    hash_index: HashMap<i32, (u32, u32)>,
+    /// hash -> head of the ObjectSizeNode chain, Java's `duplicateMaps`.
+    dup_map: HashMap<i32, u32>,
+    /// Keys in first-insertion order, needed to replay fastutil's table layout.
+    key_order: Vec<i32>,
+    nodes: Vec<ObjDupNode>,
+    remaining_instances: i64,
+    remaining_slots: i64,
+    wasted: i64,
+    instance_count: i64,
+    disabled: bool,
+}
+
 fn detect_duplicate_obj_arrays(
     objs: &ObjBodies<'_>,
     classes: &[JavaClassInfo],
+    class_by_name: &HashMap<Arc<str>, u32>,
     stats: &StatsEngine,
-    header_size: i64,
-    oop_size: i32,
+    header_sz: i64,
+    oop_sz: i32,
+    id_bytes: usize,
+    instance_total_bytes: i64,
+    primitive_array_total_size: i64,
+    primitive_array_bytes: i64,
 ) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Group by (class_idx, refs_hash), only for arrays with content. Keys are
-    // chained through a flat next array instead of one Vec per key: a key with a
-    // single array can never produce a group.
-    let mut heads: HashMap<(u32, u64), u32> = HashMap::new();
-    let mut next: Vec<i32> = Vec::new();
-    let mut members: Vec<u32> = Vec::new();
-    for (i, rec) in objs.recs.iter().enumerate() {
-        objs.pace(i);
-        if rec.length <= 4 {
-            continue;
+    let ncls = classes.len();
+    let mut arr_count = vec![0i64; ncls];
+    let mut arr_slots = vec![0i64; ncls];
+    let mut object_array_bytes: i64 = 0;
+    for rec in objs.recs {
+        let ci = rec.class_idx as usize;
+        if ci < ncls {
+            arr_count[ci] += 1;
+            arr_slots[ci] += rec.length as i64;
         }
-        let refs = objs.elems(rec);
-        let mut hasher = DefaultHasher::new();
-        refs.hash(&mut hasher);
-        let hash = hasher.finish();
-        let key = (rec.class_idx, hash);
-        let mi = members.len() as u32;
-        members.push(i as u32);
-        next.push(-1);
-        match heads.get_mut(&key) {
-            Some(head) => {
-                next[mi as usize] = *head as i32;
-                *head = mi;
-            }
-            None => {
-                heads.insert(key, mi);
+        object_array_bytes += array_shallow_size(rec.length as i32, oop_sz, header_sz);
+    }
+
+    // Java's Scanner thresholds. `dupThreshold` uses the refChainOverhead sums
+    // (instanceCount*(header+4) + selfSize*element/ref size); the 0.1% report
+    // cutoff uses StatsEngine.getTotalBytes(), i.e. real body sizes.
+    let object_align_base = header_sz + 4;
+    let mut object_array_total_size: i64 = 0;
+    for ci in 0..ncls {
+        let name = classes[ci].name.as_ref();
+        if is_array_class_name(name) && !is_single_dim_primitive_array(name) {
+            object_array_total_size +=
+                arr_count[ci] * object_align_base + arr_slots[ci] * oop_sz as i64;
+        }
+    }
+    let total_bytes = instance_total_bytes + object_array_bytes + primitive_array_bytes;
+    let dup_threshold =
+        (instance_total_bytes + object_array_total_size + primitive_array_total_size) / 100;
+    let class_threshold = ((total_bytes as f64 * 0.1f64) / 100.0f64) as i64;
+
+    // JavaClassInfo.alignedBodySize for an array class: align(headerSize).
+    let alignment = 8i64;
+    let aligned_body = (header_sz + alignment - 1) & !(alignment - 1);
+
+    let finalizable_arrays = finalizable_array_classes(classes, class_by_name);
+    let mut states: HashMap<u32, ObjDupClassState> = HashMap::new();
+    for ci in 0..ncls {
+        let name = classes[ci].name.as_ref();
+        if is_object_array_class_name(name) && !finalizable_arrays.contains(&(ci as u32)) {
+            let overhead = arr_count[ci] * object_align_base + arr_slots[ci] * oop_sz as i64;
+            if overhead > dup_threshold {
+                states.insert(
+                    ci as u32,
+                    ObjDupClassState {
+                        hash_index: HashMap::new(),
+                        dup_map: HashMap::new(),
+                        key_order: Vec::new(),
+                        nodes: Vec::new(),
+                        remaining_instances: arr_count[ci],
+                        remaining_slots: arr_slots[ci],
+                        wasted: 0,
+                        instance_count: arr_count[ci],
+                        disabled: false,
+                    },
+                );
             }
         }
     }
 
-    let mut per_class: HashMap<u32, (usize, usize, i64)> = HashMap::new();
-    let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
-    let mut total_count: usize = 0;
-
-    let mut paced = 0usize;
-    for ((class_idx, _), head) in &heads {
-        // Members of one key, back in dump order.
-        let mut chain: Vec<u32> = Vec::new();
-        let mut cur = *head as i32;
-        while cur >= 0 {
-            paced += 1;
-            objs.pace(paced);
-            chain.push(members[cur as usize]);
-            cur = next[cur as usize];
-        }
-        chain.reverse();
-        if chain.len() < 2 {
+    let mut next_group_id: u32 = 1;
+    // Per-instance group id, Java's ObjectIndex groupId bits. Needed only by
+    // ClassDominatedSizeComputer's post-BFS S15 recomputation.
+    let mut rec_gid: HashMap<u32, u32> = HashMap::new();
+    for (ri, rec) in objs.recs.iter().enumerate() {
+        let Some(st) = states.get_mut(&rec.class_idx) else {
+            continue;
+        };
+        if st.disabled {
             continue;
         }
-
-        let mut confirmed_groups: Vec<Vec<u32>> = Vec::new();
-        for &ai in &chain {
-            paced += 1;
-            objs.pace(paced);
-            let refs = objs.elems(&objs.recs[ai as usize]);
-            let mut placed = false;
-            for group in confirmed_groups.iter_mut() {
-                if objs.elems(&objs.recs[group[0] as usize]) == refs {
-                    group.push(ai);
-                    placed = true;
+        objs.pace(ri);
+        let raw = objs.raw(rec);
+        let hash = java_hash_byte_array(raw);
+        if let Some((first_rec, gid)) = st.hash_index.remove(&hash) {
+            // Second instance with this hash: Java compares it with the first
+            // one and either extends that group or splits into two groups.
+            if objs.raw(&objs.recs[first_rec as usize]) == raw {
+                let node = ObjDupNode { rep_rec: ri as u32, dup_count: 2, group_id: gid, next: -1 };
+                let ni = st.nodes.len() as u32;
+                st.nodes.push(node);
+                st.dup_map.insert(hash, ni);
+                st.key_order.push(hash);
+                st.wasted += aligned_body;
+                rec_gid.insert(ri as u32, gid);
+            } else {
+                let first = ObjDupNode { rep_rec: first_rec, dup_count: 1, group_id: gid, next: -1 };
+                let n0 = st.nodes.len() as u32;
+                st.nodes.push(first);
+                let new_gid = next_group_id;
+                next_group_id += 1;
+                let cur = ObjDupNode { rep_rec: ri as u32, dup_count: 1, group_id: new_gid, next: -1 };
+                let n1 = st.nodes.len() as u32;
+                st.nodes.push(cur);
+                st.nodes[n0 as usize].next = n1 as i32;
+                st.dup_map.insert(hash, n0);
+                st.key_order.push(hash);
+                rec_gid.insert(ri as u32, new_gid);
+            }
+        } else if let Some(&head) = st.dup_map.get(&hash) {
+            let mut cur = head as i32;
+            let mut prev: i32 = -1;
+            let mut matched: Option<u32> = None;
+            while cur >= 0 {
+                let ni = cur as usize;
+                if objs.raw(&objs.recs[st.nodes[ni].rep_rec as usize]) == raw {
+                    matched = Some(cur as u32);
                     break;
                 }
+                prev = cur;
+                cur = st.nodes[ni].next;
             }
-            if !placed {
-                confirmed_groups.push(vec![ai]);
+            if let Some(ni) = matched {
+                let node = &mut st.nodes[ni as usize];
+                node.dup_count += 1;
+                if node.dup_count > 1 {
+                    st.wasted += aligned_body;
+                }
+                rec_gid.insert(ri as u32, node.group_id);
+            } else {
+                let new_gid = next_group_id;
+                next_group_id += 1;
+                let node = ObjDupNode { rep_rec: ri as u32, dup_count: 1, group_id: new_gid, next: -1 };
+                let ni = st.nodes.len() as u32;
+                st.nodes.push(node);
+                if prev >= 0 {
+                    st.nodes[prev as usize].next = ni as i32;
+                } else {
+                    st.dup_map.insert(hash, ni);
+                    st.key_order.push(hash);
+                }
+                rec_gid.insert(ri as u32, new_gid);
             }
+        } else {
+            let new_gid = next_group_id;
+            next_group_id += 1;
+            st.hash_index.insert(hash, (ri as u32, new_gid));
+            rec_gid.insert(ri as u32, new_gid);
         }
 
-        for group in confirmed_groups {
-            if group.len() < 2 {
-                continue;
-            }
-            let count = group.len();
-            total_count += count;
-            let rep = objs.recs[group[0] as usize];
-            let size = array_shallow_size(rep.length as i32, oop_size, header_size);
-            let wasted = size * (count as i64 - 1);
-
-            let class_name = if (*class_idx as usize) < classes.len() {
-                classes[*class_idx as usize].name.replace('/', ".")
-            } else {
-                "unknown".to_string()
-            };
-
-            let (total, unique, waste) = per_class.entry(*class_idx).or_insert((0, 0, 0));
-            *total += count;
-            *unique += 1;
-            *waste += wasted;
-
-            if wasted > 1024 {
-                let samples: Vec<u64> = group.iter().take(5).map(|&ai| objs.recs[ai as usize].obj_id).collect();
-                top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
-                    class_name: class_name.clone(),
-                    count,
-                    wasted_bytes: wasted,
-                    size_bytes: size,
-                    description: format!("obj[{}]", rep.length),
-                    sample_obj_ids: samples,
-                });
-            }
+        st.remaining_instances -= 1;
+        st.remaining_slots -= rec.length as i64;
+        let current_size =
+            st.remaining_instances * object_align_base + st.remaining_slots * oop_sz as i64;
+        if st.wasted + current_size < dup_threshold {
+            st.disabled = true;
+            st.hash_index.clear();
+            st.dup_map.clear();
+            st.key_order.clear();
+            st.nodes.clear();
         }
     }
 
-    let per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = per_class
-        .iter()
-        .filter(|(_, (total, _, _))| *total > 1)
-        .map(|(class_idx, (total, unique, waste))| {
-            let name = if (*class_idx as usize) < classes.len() {
-                classes[*class_idx as usize].name.replace('/', ".")
-            } else {
-                "unknown".to_string()
-            };
-            ss_stats::duplicate_arrays::DupArrayClassEntry {
-                class_name: name,
-                instance_count: *total,
-                unique_count: *unique,
-                wasted_bytes: *waste,
+    let mut per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = Vec::new();
+    let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
+    let mut total_count: usize = 0;
+    let mut total_group_count: usize = 0;
+    let mut total_waste: i64 = 0;
+    let mut class_order: Vec<u32> = states.keys().copied().collect();
+    class_order.sort_unstable();
+    for ci in class_order {
+        let st = states.get(&ci).unwrap();
+        if st.disabled || st.wasted < class_threshold {
+            continue;
+        }
+        let class_name = classes[ci as usize].name.replace('/', ".");
+        let mut chain_len: usize = 0;
+        if let Some(first_key) = fastutil_first_key(&st.key_order) {
+            let mut cur = st.dup_map.get(&first_key).copied().unwrap_or(u32::MAX) as i32;
+            while cur >= 0 {
+                let node = &st.nodes[cur as usize];
+                chain_len += 1;
+                if node.dup_count > 1 {
+                    let rep = &objs.recs[node.rep_rec as usize];
+                    let body = array_shallow_size(rep.length as i32, oop_sz, header_sz);
+                    let waste = body * (node.dup_count as i64 - 1);
+                    let mut samples = Vec::with_capacity(5);
+                    samples.push(rep.obj_id);
+                    top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
+                        class_name: class_name.clone(),
+                        count: node.dup_count as usize,
+                        wasted_bytes: waste,
+                        size_bytes: body,
+                        group_id: node.group_id,
+                        representative_obj_id: rep.obj_id,
+                        description: format!("obj[{}]", rep.length),
+                        sample_obj_ids: samples,
+                    });
+                }
+                cur = node.next;
             }
-        })
-        .collect();
+        }
+        let unique_count = st.hash_index.len() + chain_len;
+        total_count += st.instance_count as usize;
+        total_group_count += unique_count;
+        total_waste += st.wasted;
+        per_class_entries.push(ss_stats::duplicate_arrays::DupArrayClassEntry {
+            class_name,
+            instance_count: st.instance_count as usize,
+            unique_count,
+            wasted_bytes: st.wasted,
+        });
+    }
 
-    let unique_total: usize = per_class_entries.iter().map(|e| e.unique_count).sum();
+    // ------------------------------------------------------------------
+    // Java's ClassDominatedSizeComputer.finalizeReports() REPLACES the report
+    // produced by the linear scan. It is only constructed when the scan report
+    // is non-null. Per-instance group ids are replayed in object order: groups
+    // that the scan enumerated accumulate a ClassSizeRecord; every other
+    // instance increments its class' duplicate (group) count. Waste then uses
+    // ObjectArrayInstance.getBodySize() instead of alignedBodySize.
+    // ------------------------------------------------------------------
+    if total_waste > 0 {
+        let mut phase_a_members: Vec<(u32, String, i64)> = Vec::new();
+        {
+            let mut order: Vec<u32> = states.keys().copied().collect();
+            order.sort_unstable();
+            for ci in order {
+                let st = &states[&ci];
+                if st.disabled || st.wasted < class_threshold {
+                    continue;
+                }
+                phase_a_members.push((ci, classes[ci as usize].name.replace('/', "."), st.instance_count));
+            }
+        }
+        let enumerated_gids: std::collections::HashSet<u32> =
+            top_groups.iter().map(|g| g.group_id).collect();
+        // class_idx -> (instanceCount, duplicateCount, duplicateSize)
+        let mut bclass: HashMap<u32, (i64, i64, i64)> = phase_a_members
+            .iter()
+            .map(|(ci, _, inst)| (*ci, (*inst, 0i64, 0i64)))
+            .collect();
+        // gid -> (class_idx, first rec index, body size, instance count)
+        let mut size_records: HashMap<u32, (u32, u32, i64, i64)> = HashMap::new();
+        for (ri, rec) in objs.recs.iter().enumerate() {
+            let ci = rec.class_idx;
+            if !bclass.contains_key(&ci) {
+                continue;
+            }
+            let Some(&gid) = rec_gid.get(&(ri as u32)) else { continue };
+            if enumerated_gids.contains(&gid) {
+                let body = array_shallow_size(rec.length as i32, oop_sz, header_sz);
+                size_records
+                    .entry(gid)
+                    .or_insert((ci, ri as u32, body, 0))
+                    .3 += 1;
+            } else if let Some(b) = bclass.get_mut(&ci) {
+                // Gid not enumerated by the scan: Java increments this class'
+                // duplicateCount once per instance, not per value group.
+                b.1 += 1;
+            }
+        }
+        for (_, (ci, _, body, count)) in size_records.iter() {
+            if let Some(b) = bclass.get_mut(ci) {
+                b.1 += 1;
+                b.2 += *body * (count - 1);
+            }
+        }
+        let mut final_classes: Vec<(u32, String, i64, i64, i64)> = Vec::new();
+        for (ci, name, inst) in phase_a_members {
+            if let Some((inst_count, groups, waste)) = bclass.get(&ci) {
+                if *waste >= class_threshold {
+                    final_classes.push((ci, name, *inst_count, *groups, *waste));
+                }
+            }
+        }
+        let final_waste: i64 = final_classes.iter().map(|c| c.4).sum();
+        if final_waste > 0 {
+            let final_class_set: std::collections::HashSet<u32> =
+                final_classes.iter().map(|c| c.0).collect();
+            let mut final_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
+            for (gid, (ci, rep, body, count)) in size_records.iter() {
+                if !final_class_set.contains(ci) {
+                    continue;
+                }
+                let count = *count as usize;
+                if count < 2 {
+                    continue;
+                }
+                let rep_rec = &objs.recs[*rep as usize];
+                final_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
+                    class_name: classes[*ci as usize].name.replace('/', "."),
+                    count,
+                    wasted_bytes: *body * (count as i64 - 1),
+                    size_bytes: *body,
+                    group_id: *gid,
+                    representative_obj_id: rep_rec.obj_id,
+                    description: format!("obj[{}]", rep_rec.length),
+                    sample_obj_ids: vec![rep_rec.obj_id],
+                });
+            }
+            final_groups.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
+            let total_count_final: usize = final_classes.iter().map(|c| c.2 as usize).sum();
+            let total_groups_final: usize = final_classes.iter().map(|c| c.3 as usize).sum();
+            per_class_entries = final_classes
+                .iter()
+                .map(|c| ss_stats::duplicate_arrays::DupArrayClassEntry {
+                    class_name: c.1.clone(),
+                    instance_count: c.2 as usize,
+                    unique_count: c.3 as usize,
+                    wasted_bytes: c.4,
+                })
+                .collect();
+            per_class_entries.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
+            top_groups = final_groups;
+            total_count = total_count_final;
+            total_group_count = total_groups_final;
+            total_waste = final_waste;
+        } else {
+            per_class_entries.clear();
+            top_groups.clear();
+            total_count = 0;
+            total_group_count = 0;
+            total_waste = 0;
+        }
+    }
+
+    // Java's groupEntries sort by totalWaste desc (stable); the classEntries
+    // sort by duplicateSize desc.
+    per_class_entries.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
+    top_groups.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
+
     eprintln!(
-        "Duplicate obj arrays: {} total in {} groups",
+        "Duplicate obj arrays: {} arrays, {} unique, {} groups, {} bytes waste in {} classes (dupThreshold={}, classThreshold={})",
         total_count,
-        per_class_entries.len()
+        total_group_count,
+        top_groups.len(),
+        total_waste,
+        per_class_entries.len(),
+        dup_threshold,
+        class_threshold
     );
 
-    stats.dup_obj_arrays.set_results(total_count, unique_total, per_class_entries, top_groups);
+    if ss_stats::debug_dump::enabled() {
+        ss_stats::debug_dump::record_dup_obj_metrics(ss_stats::debug_dump::DupObjMetrics {
+            total_bytes,
+            instance_total_bytes,
+            object_array_total_size,
+            primitive_array_total_size,
+            dup_threshold,
+            class_threshold,
+            candidate_count: states.len(),
+        });
+        let candidates: Vec<(String, String, i64, i64, i64)> = {
+            let mut v: Vec<(String, String, i64, i64, i64)> = states
+                .iter()
+                .map(|(&ci, st)| {
+                    let cls = &classes[ci as usize];
+                    let overhead = arr_count[ci as usize] * object_align_base
+                        + arr_slots[ci as usize] * oop_sz as i64;
+                    (
+                        cls.name.replace('/', "."),
+                        ss_stats::debug_dump::java_class_display_name(&cls.name),
+                        st.instance_count,
+                        overhead,
+                        arr_slots[ci as usize],
+                    )
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        ss_stats::debug_dump::record_dup_obj_candidates(candidates);
+        let mut near: Vec<(String, String, i64, i64, i64, i64)> = (0..ncls)
+            .filter(|&ci| {
+                is_object_array_class_name(classes[ci].name.as_ref())
+                    && arr_count[ci] * object_align_base + arr_slots[ci] * oop_sz as i64
+                        > dup_threshold / 2
+            })
+            .map(|ci| {
+                let cls = &classes[ci];
+                (
+                    cls.name.replace('/', "."),
+                    ss_stats::debug_dump::java_class_display_name(&cls.name),
+                    arr_count[ci],
+                    arr_count[ci] * object_align_base + arr_slots[ci] * oop_sz as i64,
+                    arr_slots[ci],
+                    aligned_body,
+                )
+            })
+            .collect();
+        near.sort_by(|a: &(String, String, i64, i64, i64, i64), b| a.0.cmp(&b.0));
+        ss_stats::debug_dump::record_dup_obj_array_classes(near);
+        let groups: Vec<ss_stats::debug_dump::DupObjGroupDebug> = top_groups
+            .iter()
+            .map(|g| ss_stats::debug_dump::DupObjGroupDebug {
+                class_name: g.class_name.clone(),
+                group_id: g.group_id,
+                rep_obj_id: g.representative_obj_id,
+                count: g.count,
+                wasted_bytes: g.wasted_bytes,
+                body_size: g.size_bytes,
+                array_length: g
+                    .description
+                    .strip_prefix("obj[")
+                    .and_then(|v| v.strip_suffix(']'))
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0),
+            })
+            .collect();
+        ss_stats::debug_dump::record_dup_obj_groups(groups);
+    }
+
+    stats.dup_obj_arrays.set_obj_results(
+        total_count,
+        total_group_count,
+        top_groups.len(),
+        total_waste,
+        per_class_entries,
+        top_groups,
+    );
 }
 
 fn extract_capacity_field(

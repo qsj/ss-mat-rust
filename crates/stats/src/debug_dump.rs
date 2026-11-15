@@ -63,6 +63,55 @@ pub struct DupPrimScanTotals {
     pub unique_count: usize,
 }
 
+/// Threshold/candidate ground truth for Java's Section 15 scanner.
+#[derive(Clone, Copy, Default)]
+pub struct DupObjMetrics {
+    pub total_bytes: i64,
+    pub instance_total_bytes: i64,
+    pub object_array_total_size: i64,
+    pub primitive_array_total_size: i64,
+    pub dup_threshold: i64,
+    pub class_threshold: i64,
+    pub candidate_count: usize,
+}
+
+/// One Java `DuplicateGroupEntry` of the S15 report.
+#[derive(Clone)]
+pub struct DupObjGroupDebug {
+    pub class_name: String,
+    pub group_id: u32,
+    pub rep_obj_id: u64,
+    pub count: usize,
+    pub wasted_bytes: i64,
+    pub body_size: i64,
+    pub array_length: i64,
+}
+
+static DUP_OBJ_METRICS: OnceLock<Mutex<DupObjMetrics>> = OnceLock::new();
+static DUP_OBJ_CANDIDATES: OnceLock<Mutex<Vec<(String, String, i64, i64, i64)>>> = OnceLock::new();
+static DUP_OBJ_ARRAY_CLASSES: OnceLock<Mutex<Vec<(String, String, i64, i64, i64, i64)>>> = OnceLock::new();
+static DUP_OBJ_GROUPS: OnceLock<Mutex<Vec<DupObjGroupDebug>>> = OnceLock::new();
+
+fn obj_metrics_store() -> &'static Mutex<DupObjMetrics> {
+    DUP_OBJ_METRICS.get_or_init(|| Mutex::new(DupObjMetrics::default()))
+}
+
+pub fn record_dup_obj_metrics(metrics: DupObjMetrics) {
+    *obj_metrics_store().lock().unwrap() = metrics;
+}
+
+pub fn record_dup_obj_candidates(candidates: Vec<(String, String, i64, i64, i64)>) {
+    *DUP_OBJ_CANDIDATES.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap() = candidates;
+}
+
+pub fn record_dup_obj_array_classes(rows: Vec<(String, String, i64, i64, i64, i64)>) {
+    *DUP_OBJ_ARRAY_CLASSES.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap() = rows;
+}
+
+pub fn record_dup_obj_groups(groups: Vec<DupObjGroupDebug>) {
+    *DUP_OBJ_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap() = groups;
+}
+
 static DUP_PRIM_GROUPS: OnceLock<Mutex<Vec<DupPrimGroupDebug>>> = OnceLock::new();
 static DUP_PRIM_TOTALS: OnceLock<Mutex<DupPrimScanTotals>> = OnceLock::new();
 
@@ -396,27 +445,246 @@ fn is_multi_dim_prim_hprof(name: &str) -> bool {
     rest.len() == 1 && prim_char_to_name(rest.chars().next().unwrap()).is_some()
 }
 
-/// Mirrors `linear_scan::is_collection_class_name`, the set of collections the
-/// Rust scan currently classifies (Java's ContainerRegistry is broader; see
-/// README).
-fn is_collection_class_name(name: &str) -> bool {
-    const NAMES: &[&str] = &[
-        "java/util/HashMap", "java/util/LinkedHashMap", "java/util/Hashtable",
-        "java/util/concurrent/ConcurrentHashMap",
-        "java/util/TreeMap",
-        "java/util/EnumMap",
-        "java/util/ArrayList", "java/util/LinkedList", "java/util/Vector",
-        "java/util/HashSet", "java/util/LinkedHashSet", "java/util/TreeSet",
-        "java/util/concurrent/CopyOnWriteArrayList",
-        "java/util/concurrent/ConcurrentSkipListMap",
-        "java/util/concurrent/ConcurrentSkipListSet",
-    ];
-    NAMES.iter().any(|n| name == *n)
+/// Mirror of Java's `ContainerRegistry` registration: a class gets
+/// `PerClassProblemStats(..., 1)` only when the corresponding descriptor
+/// constructor completes. Field lookups follow `getFieldIndexOrThrow`, which
+/// walks the superclass chain; alternative names are tried in order.
+fn java_container_class_set(heap: &ss_heap_model::heap_dump::HeapDump) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    let mut addr_to_idx: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(heap.classes.len());
+    for c in &heap.classes {
+        if c.class_object_id != 0 {
+            addr_to_idx.insert(c.class_object_id, c.index);
+        }
+    }
+    let idx_of = |name: &str| -> Option<u32> { heap.class_by_name.get(name).copied() };
+    let find_field = |idx: u32, names: &[&str]| -> bool {
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            let c = &heap.classes[i as usize];
+            if c.instance_fields.iter().any(|fd| names.iter().any(|n| fd.name.as_ref() == *n)) {
+                return true;
+            }
+            cur = if c.super_class_id == 0 { None } else { addr_to_idx.get(&c.super_class_id).copied() };
+        }
+        false
+    };
+    let has_all = |idx: u32, groups: &[&[&str]]| -> bool {
+        groups.iter().all(|names| find_field(idx, names))
+    };
+    // Java resolveClassInfoPair: first alternative present in the dump wins.
+    let resolve = |alts: &[&str]| -> Option<u32> { alts.iter().find_map(|n| idx_of(n)) };
+    let add = |out: &mut HashSet<String>, idx: u32| {
+        out.insert(heap.classes[idx as usize].name.to_string());
+    };
+    let try_register = |out: &mut HashSet<String>,
+                        container: &str,
+                        groups: &[&[&str]],
+                        entry: Option<&[&str]>,
+                        entry_fields: &[&[&str]]| {
+        let Some(c) = idx_of(container) else { return };
+        if !has_all(c, groups) {
+            return;
+        }
+        if let Some(alts) = entry {
+            let Some(e) = resolve(alts) else { return };
+            if !has_all(e, entry_fields) {
+                return;
+            }
+        }
+        add(out, c);
+    };
+
+    // registerArrayBasedCollection / registerCompactArray.
+    try_register(&mut out, "java/util/ArrayList", &[&["size"], &["elementData", "array"]], None, &[]);
+    try_register(&mut out, "java/util/Vector", &[&["elementCount"], &["elementData"]], None, &[]);
+    try_register(&mut out, "java/util/Stack", &[&["elementCount"], &["elementData"]], None, &[]);
+    try_register(&mut out, "java/util/IdentityHashMap", &[&["size"], &["table", "elementData"]], None, &[]);
+    try_register(&mut out, "scala/collection/mutable/ArrayBuffer",
+        &[&["size0", "scala$collection$mutable$ResizableArray$$size1"], &["array"]], None, &[]);
+
+    // registerHashTableMap family.
+    try_register(&mut out, "java/util/HashMap", &[&["size"], &["table"]],
+        Some(&["java/util/HashMap$Entry", "java/util/HashMap$Node", "java/util/HashMap$HashMapEntry"]),
+        &[&["next"], &["key", "referent"], &["value"]]);
+    try_register(&mut out, "java/util/LinkedHashMap", &[&["size"], &["table"], &["header", "head"]],
+        Some(&["java/util/LinkedHashMap$Entry", "java/util/LinkedHashMap$LinkedHashMapEntry", "java/util/LinkedHashMap$LinkedEntry"]),
+        &[&["next"], &["key"], &["value"]]);
+    try_register(&mut out, "java/util/Hashtable", &[&["count", "size"], &["table"]],
+        Some(&["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]),
+        &[&["next"], &["key", "referent"], &["value"]]);
+    try_register(&mut out, "java/lang/System$PropertiesWithNonOverrideableDefaults",
+        &[&["count", "size"], &["table"]],
+        Some(&["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]),
+        &[&["next"], &["key", "referent"], &["value"]]);
+    try_register(&mut out, "java/lang/ThreadLocal$ThreadLocalMap", &[&["size"], &["table"]],
+        Some(&["java/lang/ThreadLocal$ThreadLocalMap$Entry"]),
+        &[&["key", "referent"], &["value"]]);
+
+    // java.util.Properties: Hashtable path when it has no `map` field,
+    // otherwise the wrapped-map descriptor (which needs the `map` field).
+    if let Some(p) = idx_of("java/util/Properties") {
+        if find_field(p, &["map"]) {
+            add(&mut out, p);
+        } else {
+            try_register(&mut out, "java/util/Properties", &[&["count", "size"], &["table"]],
+                Some(&["java/util/Hashtable$Entry", "java/util/Hashtable$HashtableEntry"]),
+                &[&["next"], &["key", "referent"], &["value"]]);
+        }
+    }
+
+    // ConcurrentHashMap: CHMv8 when Node exists, JDK7 segments otherwise.
+    if let Some(node) = idx_of("java/util/concurrent/ConcurrentHashMap$Node") {
+        let chm_ok = idx_of("java/util/concurrent/ConcurrentHashMap").is_some_and(|c| {
+            has_all(c, &[&["table"], &["nextTable"], &["baseCount"], &["counterCells"]])
+        });
+        let node_ok = has_all(node, &[&["next"], &["key"], &["val"]]);
+        let mut extras_ok = true;
+        if let Some(f) = idx_of("java/util/concurrent/ConcurrentHashMap$ForwardingNode") {
+            extras_ok &= find_field(f, &["nextTable"]);
+        }
+        if let Some(t) = idx_of("java/util/concurrent/ConcurrentHashMap$TreeNode") {
+            extras_ok &= has_all(t, &[&["left"], &["right"]]);
+        }
+        if let Some(t) = idx_of("java/util/concurrent/ConcurrentHashMap$TreeBin") {
+            extras_ok &= has_all(t, &[&["root"], &["first"]]);
+        }
+        if let Some(cc) = idx_of("java/util/concurrent/ConcurrentHashMap$CounterCell") {
+            extras_ok &= find_field(cc, &["value"]);
+        }
+        if chm_ok && node_ok && extras_ok {
+            add(&mut out, idx_of("java/util/concurrent/ConcurrentHashMap").unwrap());
+        }
+    } else if let Some(chm) = idx_of("java/util/concurrent/ConcurrentHashMap") {
+        let seg = idx_of("java/util/concurrent/ConcurrentHashMap$Segment");
+        let entry = resolve(&[
+            "java/util/concurrent/ConcurrentHashMap$HashEntry",
+            "java/util/concurrent/ConcurrentHashMap$Node",
+        ]);
+        if let (Some(seg), Some(entry)) = (seg, entry) {
+            if find_field(chm, &["segments"])
+                && has_all(seg, &[&["table"], &["count"], &["sync"]])
+                && has_all(entry, &[&["next"], &["key"], &["value"]])
+            {
+                add(&mut out, chm);
+            }
+        }
+    }
+
+    // Wrapped maps (HashSet/LinkedHashSet/TreeSet) and wrapped collections.
+    for (container, field) in [
+        ("java/util/HashSet", &["map", "backingMap"][..]),
+        ("java/util/LinkedHashSet", &["map", "backingMap"][..]),
+        ("java/util/TreeSet", &["m", "backingMap"][..]),
+    ] {
+        if let Some(c) = idx_of(container) {
+            if find_field(c, field) {
+                add(&mut out, c);
+            }
+        }
+    }
+
+    // Linked-list containers.
+    let linked_ok = |container: &str,
+                     size_fields: &[&str],
+                     head_fields: &[&str],
+                     node_alts: &[&str],
+                     item_fields: &[&str]| -> bool {
+        let (Some(c), Some(node)) = (idx_of(container), resolve(node_alts)) else { return false };
+        find_field(c, size_fields)
+            && find_field(c, head_fields)
+            && find_field(node, item_fields)
+            && find_field(node, &["next"])
+    };
+    if linked_ok("java/util/LinkedList", &["size"], &["first", "header", "voidLink"],
+        &["java/util/LinkedList$Node", "java/util/LinkedList$Entry", "java/util/LinkedList$Link"],
+        &["item", "element", "data"])
+    {
+        add(&mut out, idx_of("java/util/LinkedList").unwrap());
+    }
+    if idx_of("java/util/concurrent/atomic/AtomicInteger").is_some()
+        && linked_ok("java/util/concurrent/LinkedBlockingQueue", &["count"], &["head"],
+            &["java/util/concurrent/LinkedBlockingQueue$Node"], &["item"])
+    {
+        add(&mut out, idx_of("java/util/concurrent/LinkedBlockingQueue").unwrap());
+    }
+    if linked_ok("java/util/concurrent/LinkedBlockingDeque", &["count"], &["first"],
+        &["java/util/concurrent/LinkedBlockingDeque$Node"], &["item"])
+    {
+        add(&mut out, idx_of("java/util/concurrent/LinkedBlockingDeque").unwrap());
+    }
+
+    // TreeMap and its submap wrappers.
+    let mut tree_ok = false;
+    if let (Some(c), Some(e)) = (
+        idx_of("java/util/TreeMap"),
+        resolve(&["java/util/TreeMap$Entry", "java/util/TreeMap$TreeMapEntry", "java/util/TreeMap$Node"]),
+    ) {
+        if has_all(c, &[&["size"], &["root"]])
+            && has_all(e, &[&["key"], &["value"], &["left"], &["right"]])
+        {
+            tree_ok = true;
+            add(&mut out, c);
+        }
+    }
+    if tree_ok {
+        for wrapper in ["java/util/TreeMap$AscendingSubMap", "java/util/TreeMap$DescendingSubMap"] {
+            if let Some(c) = idx_of(wrapper) {
+                if find_field(c, &["m"]) {
+                    add(&mut out, c);
+                }
+            }
+        }
+    }
+
+    // WeakHashMap (needs ReferenceQueue.head).
+    if let (Some(c), Some(e), Some(q)) = (
+        idx_of("java/util/WeakHashMap"),
+        resolve(&["java/util/WeakHashMap$Entry"]),
+        idx_of("java/lang/ref/ReferenceQueue"),
+    ) {
+        if has_all(c, &[&["size", "elementCount"], &["table", "elementData"], &["queue", "referenceQueue"]])
+            && has_all(e, &[&["next"], &["referent"], &["value"]])
+            && find_field(q, &["head"])
+        {
+            add(&mut out, c);
+        }
+    }
+
+    // ConcurrentSkipListMap.
+    if let (Some(c), Some(n), Some(i)) = (
+        idx_of("java/util/concurrent/ConcurrentSkipListMap"),
+        resolve(&["java/util/concurrent/ConcurrentSkipListMap$Node"]),
+        idx_of("java/util/concurrent/ConcurrentSkipListMap$Index"),
+    ) {
+        if find_field(c, &["head"])
+            && has_all(n, &[&["key"], &["value", "val"], &["next"]])
+            && has_all(i, &[&["node"], &["down"], &["right"]])
+        {
+            add(&mut out, c);
+        }
+    }
+
+    // Guava RegularImmutableMap (FlatEntryTableDescriptor).
+    if let (Some(c), Some(e)) = (
+        idx_of("com/google/common/collect/RegularImmutableMap"),
+        resolve(&[
+            "com/google/common/collect/RegularImmutableMap$NonTerminalEntry",
+            "com/google/common/collect/RegularImmutableMap$TerminalEntry",
+        ]),
+    ) {
+        if has_all(c, &[&["entries"], &["table"]]) && has_all(e, &[&["key"], &["value"]]) {
+            add(&mut out, c);
+        }
+    }
+
+    out
 }
 
 /// Java's `PerClassProblemStats.problemObjectCount`: 1=collection,
 /// 2=object_array, 3=primitive_array, 0=other.
-fn category_of(class_name: &str) -> (u8, &'static str) {
+fn category_of(class_name: &str, containers: &HashSet<String>) -> (u8, &'static str) {
     if synthetic_to_hprof(class_name).is_some() || is_single_dim_prim_hprof(class_name) {
         (3, "primitive_array")
     } else if is_multi_dim_prim_hprof(class_name) {
@@ -424,7 +692,7 @@ fn category_of(class_name: &str) -> (u8, &'static str) {
         (0, "other")
     } else if class_name.starts_with('[') || class_name.ends_with("[]") {
         (2, "object_array")
-    } else if is_collection_class_name(class_name) {
+    } else if containers.contains(class_name) {
         (1, "collection")
     } else {
         (0, "other")
@@ -557,7 +825,7 @@ fn abbreviate_class_name(name: &str) -> String {
 
 /// Java `JavaClassInfo.displayName` for the class shapes the dump carries
 /// (regular classes, object arrays and 1-D primitive arrays).
-fn java_display_name(raw: &str) -> String {
+pub fn java_class_display_name(raw: &str) -> String {
     if raw.starts_with('[') {
         let mut dims = 0usize;
         for ch in raw.chars() {
@@ -600,11 +868,16 @@ fn java_display_name(raw: &str) -> String {
 pub fn write_problem_bundle(
     dir: &Path,
     stats: &StatsEngine,
+    heap: &ss_heap_model::heap_dump::HeapDump,
 ) -> std::io::Result<ProblemDumpSummary> {
     use std::sync::atomic::Ordering::Relaxed;
     use crate::problem_types::*;
 
     std::fs::create_dir_all(dir)?;
+
+    // Java only assigns problemObjectCount=1 to classes whose
+    // ContainerRegistry descriptor registered; derive that exact set.
+    let containers = java_container_class_set(heap);
 
     // ---- Aggregate per-class problem records (Java ordinals) ----
     // Rust keeps synthetic 1-D primitive-array classes ("byte[]") next to the
@@ -727,7 +1000,7 @@ pub fn write_problem_bundle(
 
         for (class_name, i) in &rows {
             let pc = &stats.per_class[*i];
-            let (cat_id, _) = category_of(&pc.class_name);
+            let (cat_id, _) = category_of(&pc.class_name, &containers);
             // Java's PerClassStats.instanceCount includes arrays for array
             // classes (HprofDumpReader increments it in addObjectArray /
             // addPrimitiveArray); Rust keeps them in array_live_count.
@@ -736,7 +1009,7 @@ pub fn write_problem_bundle(
                 out,
                 "{}\t{}\t{}\t{}\t{}",
                 class_name,
-                java_display_name(&pc.class_name),
+                java_class_display_name(&pc.class_name),
                 cat_id,
                 instance_count,
                 aggs[*i].bad_count,
@@ -748,6 +1021,32 @@ pub fn write_problem_bundle(
                 write!(out, "\t{}", aggs[*i].kind_size[k])?;
             }
             writeln!(out)?;
+        }
+    }
+
+    // ---- bad_collections.tsv (forensic S9 record dump) ----
+    {
+        let records = stats.bad_collection_records.lock().unwrap();
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(dir.join("bad_collections.tsv"))?);
+        writeln!(
+            out,
+            "class_name\tobj_index\tobj_address_hex\tkind\tsize\tbody_size\twaste\toverhead\tis_collection\tcategory_count"
+        )?;
+        for r in records.iter() {
+            if r.kind == crate::problem_types::COLLECTION_KIND_NONE {
+                continue;
+            }
+            let class_name = stats
+                .per_class
+                .get(r.class_idx as usize)
+                .map(|pc| java_class_name(&pc.class_name))
+                .unwrap_or_else(|| "unknown".to_string());
+            let kind = crate::problem_types::collection_problem_enum_name(r.kind);
+            writeln!(
+                out,
+                "{}\t-1\t{:x}\t{}\t{}\t{}\t{}\t-\t-\t-",
+                class_name, r.obj_id, kind, r.size, r.body, r.waste
+            )?;
         }
     }
 
@@ -820,6 +1119,98 @@ pub fn write_problem_bundle(
         }
     }
 
+    // ---- s15_dup_obj_arrays.tsv (schema mirrors Java DebugDumper) ----
+    {
+        let report = stats.dup_obj_arrays.get_report();
+        let metrics = *obj_metrics_store().lock().unwrap();
+        let mut out = BufWriter::with_capacity(1 << 16, File::create(dir.join("s15_dup_obj_arrays.tsv"))?);
+        writeln!(
+            out,
+            "row_kind\tentry_index\tclass_name\tclass_display_name\tinstance_count\tduplicate_count\twasted_bytes\trepresentative_index\trepresentative_address_hex\tgroup_id\trepresentative_class\trepresentative_body_size\trepresentative_length\treport_present\ttotal_duplicate_count\ttotal_group_count\ttotal_waste_bytes"
+        )?;
+        for (name, value) in [
+            ("total_bytes", metrics.total_bytes),
+            ("instance_total_bytes", metrics.instance_total_bytes),
+            ("object_array_total_size", metrics.object_array_total_size),
+            ("primitive_array_total_size", metrics.primitive_array_total_size),
+            ("dup_threshold", metrics.dup_threshold),
+            ("class_percent_threshold", metrics.class_threshold),
+            ("candidate_class_count", metrics.candidate_count as i64),
+        ] {
+            writeln!(out, "metric\t-1\t{}\t-\t-\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-", name, value)?;
+        }
+        let candidates = DUP_OBJ_CANDIDATES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clone();
+        for (name, display, instances, overhead, self_size) in candidates {
+            writeln!(
+                out,
+                "candidate\t-1\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+                name, display, instances, overhead, self_size
+            )?;
+        }
+        let near = DUP_OBJ_ARRAY_CLASSES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clone();
+        for (name, display, instances, overhead, self_size, aligned) in near {
+            writeln!(
+                out,
+                "obj_array_class\t-1\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+                name, display, instances, overhead, self_size, aligned
+            )?;
+        }
+        writeln!(
+            out,
+            "summary\t-1\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t{}\t{}\t{}\t{}",
+            if report.report_present { 1 } else { 0 },
+            report.total_count,
+            report.unique_count,
+            report.wasted_bytes
+        )?;
+        if report.report_present {
+            for (i, entry) in report.per_class.iter().enumerate() {
+                writeln!(
+                    out,
+                    "class\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+                    i,
+                    entry.class_name.replace('/', "."),
+                    java_class_display_name(&entry.class_name),
+                    entry.instance_count,
+                    entry.unique_count,
+                    entry.wasted_bytes
+                )?;
+            }
+            let mut groups = DUP_OBJ_GROUPS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .clone();
+            groups.sort_by(|a, b| {
+                b.wasted_bytes
+                    .cmp(&a.wasted_bytes)
+                    .then_with(|| a.class_name.cmp(&b.class_name))
+                    .then_with(|| a.rep_obj_id.cmp(&b.rep_obj_id))
+            });
+            for (i, group) in groups.iter().enumerate() {
+                writeln!(
+                    out,
+                    "group\t{}\t-\t-\t-\t{}\t{}\t-\t{:x}\t0\t{}\t{}\t{}\t-\t-\t-\t-",
+                    i,
+                    group.count,
+                    group.wasted_bytes,
+                    group.rep_obj_id,
+                    java_class_display_name(&group.class_name),
+                    group.body_size,
+                    group.array_length
+                )?;
+            }
+        }
+    }
+
     // ---- boxed_summary.tsv (schema mirrors Java DebugDumper) ----
     let mut summary = ProblemDumpSummary {
         s8_total_strings: report.total_strings,
@@ -848,12 +1239,12 @@ pub fn write_problem_bundle(
             continue;
         }
         let pc = &stats.per_class[i];
-        let (cat_id, _) = category_of(&pc.class_name);
+        let (cat_id, _) = category_of(&pc.class_name, &containers);
         if cat_id == 0 {
             continue;
         }
         let class_name = java_class_name(&pc.class_name);
-        let display = java_display_name(&pc.class_name);
+        let display = java_class_display_name(&pc.class_name);
         for k in 0..COLLECTION_KIND_COUNT {
             per_source[(cat_id - 1) as usize].push((
                 cat_id,

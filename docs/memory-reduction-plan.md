@@ -1,7 +1,6 @@
 # SS-Mat Rust 内存优化方案：从 2.0 GB 到 ~200 MB 常驻
 
-> 状态：部分实施 —— 已完成 M0/M1，M2 基础设施（对象目录/外部排序/窗口化 mmap/记录走查器）已落地并带单测，M4 边表已扁平化，M5 参数已接入。
-> 已实测数据、实施中发现的关键事实与剩余工作见 `docs/memory-reduction-status.md`。
+> 状态：**已实施（2026-11-15）** —— 对象目录、记录走查器、流式线性扫描、BFS 去图化、窗口化 mmap 均已落地；task_dump 峰值 live heap 188.5 MB、appauditd 401.2 MB，边际增长约 35.8 MB/百万对象（仍保留约 18 B/对象）。完整实测、与 Java 的对齐状态和剩余工作见 `docs/memory-reduction-status.md`。
 > 目标：分析任意大小的 `.hprof` 时，进程私有内存保持在 200 MB 量级，不随 dump 文件/对象数线性增长；可作为常驻后台服务运行。
 > 前提：所有统计结果与当前版本、Java 参考实现保持零差异（`scripts/parity.py` 17/17，tolerance=0）。
 

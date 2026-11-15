@@ -606,7 +606,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let mut oom_thread_serial: Option<u32> = None;
         let mut oom_frame_count: usize = 0;
 
-        for (&serial, st) in &self.heap.stack_traces {
+        // Iterate in serial order so ties on stack depth resolve deterministically
+        // (and match the order Java walks the thread list in).
+        let mut serials: Vec<u32> = self.heap.stack_traces.keys().copied().collect();
+        serials.sort_unstable();
+        for serial in serials {
+            let st = &self.heap.stack_traces[&serial];
             if let Some(first_frame) = st.frames.first() {
                 if first_frame.line_number == -3 {
                     let is_idle = idle_methods.iter().any(|m| first_frame.method_name == *m);
@@ -1948,6 +1953,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         self.begin_section(html, "Duplicate Object Arrays", false, &indicator);
 
+        // Java's buildDupReport returns null when no class clears the 0.1%
+        // threshold; renderDuplicateObjectsSection then emits the header only.
+        if !report.report_present {
+            return;
+        }
+
         if report.total_count > 0 {
             html.begin_table(true, 5, &["Total arrays", "Unique values", "Duplicate groups", "Overhead"]);
             html.append_table_row(&[
@@ -2635,7 +2646,10 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             let idle_methods: &[&str] = &["wait", "park", "parkNanos", "parkUntil", "sleep", "yield", "waitForReferencePendingList"];
             let mut oom_serial: Option<u32> = None;
             let mut oom_depth: usize = 0;
-            for (&serial, st) in &self.heap.stack_traces {
+            let mut trace_serials: Vec<u32> = self.heap.stack_traces.keys().copied().collect();
+            trace_serials.sort_unstable();
+            for serial in trace_serials {
+                let st = &self.heap.stack_traces[&serial];
                 if let Some(first_frame) = st.frames.first() {
                     if first_frame.line_number == -3 {
                         let is_idle = idle_methods.iter().any(|m| first_frame.method_name == *m);
@@ -2655,7 +2669,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                     .find(|(s, _, _)| *s == serial)
                     .map(|(_, n, _)| n.as_str())
                     .unwrap_or("");
-                (if is_oom { 0 } else { 1 }, name.to_string())
+                (if is_oom { 0 } else { 1 }, name.to_string(), serial)
             });
 
             for serial in &sorted_serials {

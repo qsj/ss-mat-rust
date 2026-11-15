@@ -166,4 +166,7 @@ pub struct BadCollectionRecord {
     /// MANY_NULLS), or `COLLECTION_KIND_NONE` when the post-pass found no
     /// problem. Filled by linear_scan; the report ignores it.
     pub kind: u8,
+    /// Java `ContainerInstance.getBodySize()` at classification time; forensic
+    /// only (used by the bad_collections debug dump).
+    pub body: i64,
 }

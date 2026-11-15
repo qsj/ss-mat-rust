@@ -209,7 +209,7 @@ fn main() -> Result<()> {
             ),
             Err(e) => eprintln!("Debug: failed to write S14 dump: {}", e),
         }
-        match ss_stats::debug_dump::write_problem_bundle(&debug_dir, stats_arc.as_ref()) {
+        match ss_stats::debug_dump::write_problem_bundle(&debug_dir, stats_arc.as_ref(), heap_arc.as_ref()) {
             Ok(s) => eprintln!(
                 "Debug: problem dump S8 {}/{} dup={} {}B groups={} | S9 objects={} bad={} {}B | S10 objects={} bad={} {}B | S11 objects={} bad={} {}B -> {}",
                 s.s8_total_strings,
