@@ -95,16 +95,41 @@ pub struct HeapDump {
     pub per_class_inst_count: Vec<u64>,
     /// Per-class total instance shallow bytes collected during parsing.
     pub per_class_inst_bytes: Vec<i64>,
-    /// Address-to-index map for BFS traversal (object address -> ObjectIndex entry).
-    pub address_to_index: AddressToIndexMap,
+    /// Every indexed object address (instances and arrays), sorted.
+    ///
+    /// Membership tests are a binary search here instead of a hash probe: 8 bytes
+    /// per object against roughly 24 for the map, and the pipeline only ever asks
+    /// whether an address is indexed.
+    pub sorted_addresses: Vec<u64>,
     /// Stack traces indexed by thread serial number.
     pub stack_traces: HashMap<u32, ThreadStackTrace>,
     /// Thread serial -> thread object address mapping (from GcRootThreadObj roots).
     pub thread_serial_map: HashMap<u32, u64>,
     /// Extracted thread info: name, daemon status, priority.
     pub thread_info: Vec<ThreadInfo>,
-    /// Object address -> class_idx mapping for local variable resolution.
-    pub object_to_class_idx: HashMap<u64, u32>,
     /// HPROF file timestamp in millis since epoch.
     pub timestamp_millis: u64,
+    /// On-disk object directory (address -> file offset/class/kind/length).
+    /// When present it replaces the in-memory address maps.
+    pub obj_dir: Option<ss_support::obj_dir::ObjDir>,
+}
+
+impl HeapDump {
+    /// True when the address was indexed by the parser (an instance or an array).
+    pub fn contains_object(&self, addr: u64) -> bool {
+        self.sorted_addresses.binary_search(&addr).is_ok()
+    }
+
+
+    /// Class index for an object address, resolved through the on-disk object
+    /// directory. Class-dump objects report None, matching the address map this
+    /// replaces (which only ever held instances and arrays).
+    pub fn class_idx_of(&self, addr: u64) -> Option<u32> {
+        let dir = self.obj_dir.as_ref()?;
+        let (_, rec) = dir.lookup(addr).ok()??;
+        if rec.kind == ss_support::obj_dir::KIND_CLASS_DUMP {
+            return None;
+        }
+        Some(rec.class_idx)
+    }
 }

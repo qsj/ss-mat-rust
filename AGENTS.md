@@ -10,7 +10,7 @@ cargo build --release
 cargo run --release -- <heap_dump.hprof> [report.html]
 ```
 
-测试：`cargo test`（17 个单元测试：15 traversal + 2 parser）。
+测试：`cargo test --workspace`（34 个测试：15 traversal + 9 record_reader + 6 support + 3 parser + 1 objdir）。`SS_MAT_BIG_DUMP=<dump>` 时 ss-hprof-parser 会额外走一遍真实 dump 校验记录走查器。
 
 回归检查：`python3 scripts/parity.py <report.html>`，基线 `scripts/parity_baseline.json` **全部 tolerance=0（严格模式）**；当前 17/17 精确 PASS。`Cargo.lock` 已不再被 `.gitignore` 忽略。
 
@@ -141,6 +141,7 @@ Section 22: 全部线程栈可折叠显示（OOM 线程优先）
 - Section 3 的 "Live shallow" 是 live shallow，不是 dominator retained；列名已改，避免误导
 - `ss-containers` 与 `ss-support` 尚未被主流程引用；`traversal/stats` 仍有若干 stub 模块
 - HPROF 仍会被完整重解析多次，GB 级 dump 需要后续性能优化
+- 内存优化进行中：已完成度量、零算法瘦身、对象目录/外部排序/窗口化 mmap/记录走查器等基础设施（均带单测），BFS 边表已扁平化为 `EdgeTable`；未完成的部分（BFS 去图化、流式线性扫描、窗口化 mmap 接入、替换两张地址表）与实测数据见 `docs/memory-reduction-status.md`
 - `JAVA_BFS_VISITED_BEFORE_STRING` 是 Java BFS live/garbage 访问顺序的兼容表，目前含 task_dump 的 2 个和 appauditd 的 1 个 `String.value` 数组；新 dump 若出现同类顺序差异，需要按 Java 实际访问顺序补充或改为完整 BFS 调度复刻
 
 ## 与 Java 版对比参考

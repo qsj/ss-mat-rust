@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,246 @@ impl Default for ScanConfig {
 
 /// Configure rayon's global pool when a thread limit is requested.
 /// Returns an error if the pool was already initialized by another caller.
+
+/// Hand the mapped dump's pages back to the kernel.
+///
+/// The scan keeps the whole dump mapped so object bodies can be borrowed instead
+/// of copied, which is what makes the phase cheap; but those file pages otherwise
+/// stay resident and dominate RSS. Releasing them is safe: any later access simply
+/// faults the page back in from the read-only mapping.
+fn release_mapped_pages(map: &memmap2::Mmap) {
+    if map.is_empty() {
+        return;
+    }
+    // SAFETY: the range is the whole read-only file mapping; re-reading a released
+    // page only re-faults it from the file, and no writer is involved.
+    let _ = unsafe {
+        map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, 0, map.len())
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Random access to object bodies
+// ---------------------------------------------------------------------------
+//
+// The extraction walks below ask for a handful of objects by address: a thread
+// and the Strings it names, the Properties object graph, an OOM thread's locals,
+// and the objects one reference chain renders. Those bodies are read with pread
+// into a small buffer instead of mapping the dump, so the dump's pages never land
+// in this process's resident set and no per-object payload outlives the call that
+// used it.
+
+/// Object kinds stored in the object directory.
+const DI_KIND_INSTANCE: u8 = 0;
+const DI_KIND_OBJ_ARRAY: u8 = 1;
+const DI_KIND_PRIM_ARRAY: u8 = 2;
+const DI_KIND_CLASS: u8 = 3;
+
+/// Bytes read at once for one class dump; every dump is far smaller.
+const CLASS_DUMP_WINDOW: usize = 64 << 10;
+
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read from the heap dump",
+                ))
+            }
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn read_some_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
+/// One object's payload, read out of the dump.
+struct Body {
+    /// Class index the parser assigned (u32::MAX when unresolved).
+    class_idx: u32,
+    /// One of DI_KIND_INSTANCE / DI_KIND_OBJ_ARRAY / DI_KIND_PRIM_ARRAY.
+    kind: u8,
+    /// Element width in bytes for arrays.
+    elem: u8,
+    /// Element count for arrays.
+    len: u32,
+    /// HPROF basic type code for primitive arrays.
+    prim_type: u8,
+    /// Instance field bytes, or the array's raw payload.
+    bytes: Vec<u8>,
+}
+
+/// Address to body lookups backed by the on-disk object directory.
+struct AddrBodies<'a> {
+    heap: &'a HeapDump,
+    dir: &'a ss_support::obj_dir::ObjDir,
+    file: std::fs::File,
+    id_bytes: usize,
+}
+
+impl<'a> AddrBodies<'a> {
+    /// Open the dump for random body reads; None when the run has no object
+    /// directory or the dump cannot be reopened.
+    fn open(heap: &'a HeapDump, hprof_path: &Path) -> Option<Self> {
+        let dir = heap.obj_dir.as_ref()?;
+        let file = std::fs::File::open(hprof_path).ok()?;
+        Some(Self { heap, dir, file, id_bytes: heap.identifier_size as usize })
+    }
+
+    /// Read one object's payload. Class dumps have no payload and report None.
+    fn get(&self, addr: u64) -> Option<Body> {
+        let rec = self.dir.lookup(addr).ok()??.1;
+        let bytes = self.body_bytes(&rec)?;
+        Some(Body {
+            class_idx: rec.class_idx,
+            kind: rec.kind,
+            elem: rec.elem,
+            len: rec.len,
+            prim_type: rec.flags as u8,
+            bytes,
+        })
+    }
+
+    fn body_bytes(&self, rec: &ss_support::obj_dir::ObjRec) -> Option<Vec<u8>> {
+        let len = match rec.kind {
+            DI_KIND_INSTANCE => {
+                // The declared field-byte count sits immediately before the body.
+                if rec.file_offset < 4 {
+                    return None;
+                }
+                let mut head = [0u8; 4];
+                read_exact_at(&self.file, &mut head, rec.file_offset - 4).ok()?;
+                u32::from_be_bytes(head) as u64
+            }
+            DI_KIND_OBJ_ARRAY => rec.len as u64 * self.id_bytes as u64,
+            DI_KIND_PRIM_ARRAY => rec.len as u64 * rec.elem as u64,
+            _ => return None,
+        };
+        let len = usize::try_from(len).ok()?;
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let mut buf = vec![0u8; len];
+        read_exact_at(&self.file, &mut buf, rec.file_offset).ok()?;
+        Some(buf)
+    }
+
+    /// Object id held by the static field field_name of the class dump at
+    /// class_obj_id. The same pass that builds the object directory records the
+    /// class-dump body offset, so this is one small read instead of a scan.
+    fn class_static_ref(
+        &self,
+        class_obj_id: u64,
+        field_name: &str,
+        string_table: &HashMap<u64, String>,
+    ) -> Option<u64> {
+        let rec = self.dir.lookup(class_obj_id).ok()??.1;
+        if rec.kind != DI_KIND_CLASS || rec.file_offset == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; CLASS_DUMP_WINDOW];
+        let got = read_some_at(&self.file, &mut buf, rec.file_offset).ok()?;
+        buf.truncate(got);
+        let id_size = self.id_bytes as u8;
+        let mut cur = WindowCursor::new(&buf, id_size);
+        cur.id()?; // class object id
+        cur.u32()?; // stack trace serial
+        cur.id()?; // super class
+        cur.skip(5 * id_size as u64)?; // loader, signers, protection domain, 2 reserved
+        cur.u32()?; // instance size
+        for _ in 0..cur.u16()? {
+            cur.skip(2)?;
+            let ty = cur.u8()?;
+            cur.skip(field_type_size(ty, id_size as usize) as u64)?;
+        }
+        // The last matching static field wins, matching the streaming collector.
+        let mut found: Option<Option<u64>> = None;
+        for _ in 0..cur.u16()? {
+            let name_id = cur.id()?;
+            let ty = cur.u8()?;
+            let width = field_type_size(ty, id_size as usize);
+            let value = cur.take(width)?;
+            if ty == 2 && string_table.get(&name_id).map(|s| s.as_str()) == Some(field_name) {
+                let id = if width == 4 {
+                    let mut b = [0u8; 4];
+                    b.copy_from_slice(value);
+                    u32::from_be_bytes(b) as u64
+                } else {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(value);
+                    u64::from_be_bytes(b)
+                };
+                found = Some(if id == 0 { None } else { Some(id) });
+            }
+        }
+        found.flatten()
+    }
+}
+
+/// Bounds-checked big-endian cursor over a read window.
+struct WindowCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    id_size: u8,
+}
+
+impl<'a> WindowCursor<'a> {
+    fn new(data: &'a [u8], id_size: u8) -> Self {
+        Self { data, pos: 0, id_size }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+
+    fn skip(&mut self, n: u64) -> Option<()> {
+        self.take(usize::try_from(n).ok()?).map(|_| ())
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.take(2)?;
+        Some(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn id(&mut self) -> Option<u64> {
+        if self.id_size == 4 {
+            return Some(self.u32()? as u64);
+        }
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Some(u64::from_be_bytes(a))
+    }
+}
+
 pub fn configure_thread_pool(max_threads: i32) -> Result<()> {
     if max_threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -65,8 +306,14 @@ impl LinearScanCoordinator {
     }
 
     /// Run all scan passes. Re-parses the HPROF to access field-level data.
+    ///
+    /// Every pass is sequential over the mapped dump and keeps only aggregates,
+    /// the report's top-N detail lists and fixed-size buffers: per-object payloads
+    /// (string contents, array bodies, element vectors) are never materialised,
+    /// they are re-read from the mapping by offset.
     pub fn run(&self, hprof_path: &Path) -> Result<()> {
         eprintln!("Linear scan: re-parsing HPROF for field data...");
+        ss_support::mem_trace::trace("run-start");
 
         let file = std::fs::File::open(hprof_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -74,38 +321,16 @@ impl LinearScanCoordinator {
 
         let hprof = jvm_hprof::parse_hprof(data)
             .map_err(|e| anyhow::anyhow!("Failed to re-parse HPROF: {:?}", e))?;
-
         let id_size = hprof.header().id_size();
         // Publish the id size so the DirectBuffer field readers can decode
         // address/long fields with the correct width.
         ID_SIZE.with(|c| c.set(match id_size { IdSize::U32 => 4, IdSize::U64 => 8 }));
+        let id_bytes = match id_size { IdSize::U32 => 4usize, IdSize::U64 => 8usize };
+        let walk_id_size = id_bytes as u8;
+        drop(hprof);
 
-        // Collect all instance and array data in a single pass
-        let mut string_instances: Vec<StringInstanceData> = Vec::new();
-        // Primitive arrays claimed as StringBuilder/StringBuffer payloads.
-        // Java's processStringBuilderOrBuffer() calls isStringData() on these,
-        // which marks them visited so they never reach processPrimitiveArray().
-        let mut string_builder_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut prim_arrays: Vec<PrimArrayData> = Vec::new();
-        let mut obj_arrays: Vec<ObjArrayData> = Vec::new();
-        let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
-        let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
-        let mut bad_prim_array_records: Vec<ss_stats::problem_types::BadPrimArrayRecord> = Vec::new();
-        let mut bad_collection_records: Vec<BadCollectionRecord> = Vec::new();
-        let mut wrapper_candidates: Vec<WrapperCandidate> = Vec::new();
-        let mut reference_queue_instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
-        let mut ll_node_items: HashMap<u64, u64> = HashMap::new();
-        let mut ll_node_next: HashMap<u64, u64> = HashMap::new();
-        let mut cslm_index: HashMap<u64, (u64, u64, u64)> = HashMap::new(); // node, down, right
-        let mut cslm_node: HashMap<u64, (u64, u64)> = HashMap::new(); // next, val
-        let mut counter_cell_values: HashMap<u64, i64> = HashMap::new();
-        let mut weak_entry_next: HashMap<u64, u64> = HashMap::new();
-        let mut container_backing_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut class_obj_ids: HashMap<u64, u32> = HashMap::new();
-
-        // Build primitive array body map for String content extraction: obj_id -> (body, elem_type)
-        let mut prim_array_bodies: HashMap<u64, (&[u8], PrimitiveArrayType)> = HashMap::new();
-
+        // Class object address -> class index.
+        let mut class_obj_ids: HashMap<u64, u32> = HashMap::with_capacity(self.heap.classes.len());
         for cls in &self.heap.classes {
             if cls.class_object_id != 0 {
                 class_obj_ids.insert(cls.class_object_id, cls.index);
@@ -134,575 +359,518 @@ impl LinearScanCoordinator {
             class_aligned[cls.index as usize] = (header_sz + field_bytes + 7) & !7;
         }
 
-        for record in hprof.records_iter() {
-            let record = match record {
-                Ok(r) => r,
-                Err(_) => continue,
+        // Primitive array classes are addressed by type, so the class index, the
+        // element width and Java's per-type class identity are all per-type.
+        let mut prim_class_idx = [u32::MAX; 8];
+        let mut prim_class_id = [0u64; 8];
+        for (ti, name) in PRIM_TYPE_DISPLAY.iter().enumerate() {
+            prim_class_idx[ti] = self.heap.class_by_name.get(*name).copied().unwrap_or(u32::MAX);
+        }
+        for pt in [
+            PrimitiveArrayType::Boolean,
+            PrimitiveArrayType::Byte,
+            PrimitiveArrayType::Char,
+            PrimitiveArrayType::Short,
+            PrimitiveArrayType::Int,
+            PrimitiveArrayType::Float,
+            PrimitiveArrayType::Long,
+            PrimitiveArrayType::Double,
+        ] {
+            prim_class_id[prim_type_code_index(pt)] = prim_array_class_id(&self.heap, pt);
+        }
+        ss_support::mem_trace::trace("run-classidx");
+
+        // ------------------------------------------------------------------
+        // Pass 1: primitive arrays, in dump order. One 24-byte record each; the
+        // body stays in the mapping and is re-read wherever it is needed.
+        // ------------------------------------------------------------------
+        let mut prim_recs: Vec<PrimRec> = Vec::new();
+        let mut prim_hashes: Vec<i32> = Vec::new();
+        walk_heap(&mmap, data, walk_id_size, |obj| {
+            if let RawObj::PrimArray { obj_id, type_code, len, body_off, body_len } = obj {
+                let Some(pt) = PrimitiveArrayType::from_type_code(type_code) else {
+                    return Ok(());
+                };
+                prim_hashes.push(java_hash_byte_array(&data[body_off..body_off + body_len]));
+                prim_recs.push(PrimRec {
+                    obj_id,
+                    body_off: body_off as u64,
+                    length: len,
+                    prim_type: pt,
+                });
+            }
+            Ok(())
+        })?;
+        let mut prim_order: Vec<u32> = (0..prim_recs.len() as u32).collect();
+        prim_order.sort_unstable_by_key(|&i| prim_recs[i as usize].obj_id);
+        let prims = PrimBodies { map: &mmap, data, recs: &prim_recs, order: &prim_order };
+        ss_support::mem_trace::trace("run-primindex");
+
+        // ------------------------------------------------------------------
+        // Pass 2: instances, in dump order. The string grouping runs here (Java
+        // deduplicates in heap order) and keeps no per-String payload.
+        // ------------------------------------------------------------------
+        let mut string_builder_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
+        let mut wrapper_candidates: Vec<WrapperCandidate> = Vec::new();
+        let mut reference_queue_instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
+        let mut ll_node_items: HashMap<u64, u64> = HashMap::new();
+        let mut ll_node_next: HashMap<u64, u64> = HashMap::new();
+        let mut cslm_index: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+        let mut cslm_node: HashMap<u64, (u64, u64)> = HashMap::new();
+        let mut counter_cell_values: HashMap<u64, i64> = HashMap::new();
+        let mut weak_entry_next: HashMap<u64, u64> = HashMap::new();
+        let mut container_backing_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut string_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut string_total: usize = 0;
+        let mut grouping = StrGrouping::new(header_sz);
+        // Collection records are one per collection instance; the per-class
+        // instance counts are already known, so the vector never doubles.
+        let mut collection_estimate = 0usize;
+        for pc in &self.stats.per_class {
+            if is_collection_class_name(&pc.class_name) {
+                collection_estimate += pc.instance_count.load(Relaxed) as usize;
+            }
+        }
+        let mut bad_collection_records: Vec<BadCollectionRecord> =
+            Vec::with_capacity(collection_estimate);
+        let debug_coll = std::env::var("SS_MAT_DEBUG_COLL").is_ok();
+
+        walk_heap(&mmap, data, walk_id_size, |obj| {
+            let RawObj::Instance { obj_id, class_ref, body_off, body_len } = obj else {
+                return Ok(());
             };
-
-            match record.tag() {
-                RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
-                    if let Some(Ok(seg)) = record.as_heap_dump_segment() {
-                        for sr in seg.sub_records() {
-                            match sr {
-                                Ok(heap_dump::SubRecord::Instance(inst)) => {
-                                    // Java's StringScanWorkerThread/container
-                                    // iterators walk heap.iterateObjects(), i.e. the
-                                    // object index. HPROF instances that were skipped
-                                    // or never indexed (e.g. some class-dump values)
-                                    // must not contribute to S8/S9/S11 here.
-                                    if !self.heap.address_to_index.contains_key(&inst.obj_id().id()) {
-                                        continue;
-                                    }
-                                    let class_idx = class_obj_ids
-                                        .get(&inst.class_obj_id().id())
-                                        .copied()
-                                        .unwrap_or(u32::MAX);
-
-                                    if class_idx < self.heap.classes.len() as u32 {
-                                        let cat = self.heap.classes[class_idx as usize].category;
-                                        if cat == ClassCategory::String {
-                                            string_instances.push(StringInstanceData {
-                                                class_idx,
-                                                obj_id: inst.obj_id().id(),
-                                                fields: inst.fields().to_vec(),
-                                            });
-                                        } else if cat == ClassCategory::DirectByteBuffer {
-                                            // Collect DirectByteBuffer instances for capacity extraction
-                                            let fields = inst.fields().to_vec();
-                                            let cls = &self.heap.classes[class_idx as usize];
-                                            let capacity = extract_capacity_field(&fields, cls, &class_obj_ids, &self.heap.classes);
-                                            let address = extract_address_field(&fields, cls, &class_obj_ids, &self.heap.classes);
-                                            // Java analyzeBuffer lines 73-78: skip buffers whose
-                                            // `fd` or `att` field is a NON-NULL reference (these
-                                            // wrap a FileDescriptor/attachment, not pure off-heap
-                                            // memory). Read the reference value and skip if set.
-                                            // Java still counts fd/att-wrapped buffers in
-                                            // directBbCount, but contributes zero capacity.
-                                            let wrapped = ref_field_nonnull(&fields, cls, "fd", &class_obj_ids, &self.heap.classes)
-                                                || ref_field_nonnull(&fields, cls, "att", &class_obj_ids, &self.heap.classes);
-                                            if let Some(pc) = self.stats.get_per_class(class_idx) {
-                                                let header = self.heap.header_size as i64;
-                                                let shallow = (header + cls.instance_size as i64 + 7) & !7;
-                                                pc.total_instance_bytes.fetch_add(shallow, Relaxed);
-                                            }
-                                            // Store for later aggregation
-                                            direct_buffer_instances.push(DirectBufferData {
-                                                class_idx,
-                                                obj_id: inst.obj_id().id(),
-                                                capacity: if wrapped { 0 } else { capacity },
-                                                address: if wrapped { 0 } else { address },
-                                            });
-                                        } else if cat == ClassCategory::BoxedNumber {
-                                            // Accumulate boxed number overhead
-                                            if let Some(pc) = self.stats.get_per_class(class_idx) {
-                                                let cls = &self.heap.classes[class_idx as usize];
-                                                let header = self.heap.header_size as i64;
-                                                let shallow = (header + cls.instance_size as i64 + 7) & !7;
-                                                let prim_size = boxed_primitive_size(&cls.name) as i64;
-                                                // Java: (alignedBodySize + referenceSize) - primitiveSize
-                                                let overhead = shallow + self.heap.oop_size as i64 - prim_size;
-                                                pc.boxed_number_overhead.fetch_add(overhead, Relaxed);
-                                                pc.total_instance_bytes.fetch_add(shallow, Relaxed);
-                                            }
-                                        } else {
-                                            // Default instance handling + Bad Collections detection.
-                                            let cls = &self.heap.classes[class_idx as usize];
-                                            // Java's StringBuilder/StringBuffer processing claims
-                                            // the value[] array (and StringBuffer.toStringCache)
-                                            // via isStringData(), so those arrays never reach
-                                            // processPrimitiveArray()/processObjectArray().
-                                            if cls.name.as_ref() == "java/lang/StringBuilder"
-                                                || cls.name.as_ref() == "java/lang/StringBuffer"
-                                            {
-                                                let id_bytes = match id_size {
-                                                    IdSize::U32 => 4usize,
-                                                    IdSize::U64 => 8usize,
-                                                };
-                                                let fields = inst.fields();
-                                                if let Some(id) = read_ref_field(
-                                                    fields,
-                                                    cls,
-                                                    "value",
-                                                    &class_obj_ids,
-                                                    &self.heap.classes,
-                                                    id_bytes,
-                                                ) {
-                                                    if id != 0 {
-                                                        string_builder_backing.insert(id);
-                                                    }
-                                                }
-                                                if cls.name.as_ref() == "java/lang/StringBuffer" {
-                                                    if let Some(id) = read_ref_field(
-                                                        fields,
-                                                        cls,
-                                                        "toStringCache",
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        id_bytes,
-                                                    ) {
-                                                        if id != 0 {
-                                                            string_builder_backing.insert(id);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if cls.name.as_ref() == "java/lang/ref/ReferenceQueue" {
-                                                reference_queue_instances.insert(
-                                                    inst.obj_id().id(),
-                                                    (class_idx, inst.fields().to_vec()),
-                                                );
-                                            }
-                                            if cls.name.as_ref() == "java/util/LinkedList$Node" {
-                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
-                                                let fields = inst.fields();
-                                                let item = read_ref_field(fields, cls, "item", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                ll_node_items.insert(inst.obj_id().id(), item);
-                                                ll_node_next.insert(inst.obj_id().id(), next);
-                                            }
-                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentSkipListMap$Index" {
-                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
-                                                let fields = inst.fields();
-                                                let node = read_ref_field(fields, cls, "node", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                let down = read_ref_field(fields, cls, "down", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                let right = read_ref_field(fields, cls, "right", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                cslm_index.insert(inst.obj_id().id(), (node, down, right));
-                                            }
-                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentSkipListMap$Node" {
-                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
-                                                let fields = inst.fields();
-                                                let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
-                                                let val = read_ref_field(fields, cls, "val", &class_obj_ids, &self.heap.classes, id_bytes)
-                                                    .or_else(|| read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes))
-                                                    .unwrap_or(0);
-                                                cslm_node.insert(inst.obj_id().id(), (next, val));
-                                            }
-                                            if cls.name.as_ref() == "java/util/WeakHashMap$Entry"
-                                                || cls.name.as_ref() == "java/lang/ref/Reference"
-                                            {
-                                                let id_bytes = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
-                                                if let Some(next) = read_ref_field(
-                                                    inst.fields(), cls, "next", &class_obj_ids, &self.heap.classes, id_bytes,
-                                                ) {
-                                                    weak_entry_next.insert(inst.obj_id().id(), next);
-                                                }
-                                            }
-                                            if cls.name.as_ref() == "java/util/concurrent/ConcurrentHashMap$CounterCell" {
-                                                // CounterCell has a single `long value` field.
-                                                let fields = inst.fields();
-                                                let mut off = 0usize;
-                                                let mut v = 0i64;
-                                                for fd in &cls.instance_fields {
-                                                    if fd.name.as_ref() == "value" && fd.type_code == 11 && off + 8 <= fields.len() {
-                                                        v = i64::from_be_bytes([
-                                                            fields[off],fields[off+1],fields[off+2],fields[off+3],
-                                                            fields[off+4],fields[off+5],fields[off+6],fields[off+7],
-                                                        ]);
-                                                    }
-                                                    off += field_type_size(fd.type_code, match id_size { IdSize::U32 => 4, IdSize::U64 => 8 });
-                                                }
-                                                counter_cell_values.insert(inst.obj_id().id(), v);
-                                            }
-                                            let header = self.heap.header_size as i64;
-                                            let shallow = (header + cls.instance_size as i64 + 7) & !7;
-                                            // Bad Collections: Java's processContainer counts
-                                            // EMPTY (size==0) / SINGLE_ELEM (size==1) as fully
-                                            // wasted, and SPARSE (size <= capacity/3) as
-                                            // (capacity-size)*refSize. Capture size + backing
-                                            // array id; resolve capacity post-pass.
-                                            if is_collection_class_name(&cls.name) {
-                                                let fields = inst.fields().to_vec();
-                                                let cname = cls.name.as_ref();
-                                                // Java's wrapped collections: the wrapper is counted,
-                                                // and its inner map is marked visited by the wrapper
-                                                // iterator, so the inner map never enters
-                                                // processContainer() as a collection.
-                                                let wrapper_field = match cname {
-                                                    "java/util/HashSet" | "java/util/LinkedHashSet" => Some("map"),
-                                                    "java/util/TreeSet" => Some("m"),
-                                                    "java/util/Properties" => Some("map"),
-                                                    _ => None,
-                                                };
-                                                if let Some(field) = wrapper_field {
-                                                    if let Some(inner_id) = read_ref_field(
-                                                        &fields,
-                                                        cls,
-                                                        field,
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
-                                                    ) {
-                                                        if inner_id != 0 {
-                                                            wrapper_candidates.push(WrapperCandidate {
-                                                                obj_id: inst.obj_id().id(),
-                                                                class_idx,
-                                                                container_bytes: class_aligned
-                                                                    .get(class_idx as usize)
-                                                                    .copied()
-                                                                    .unwrap_or(shallow),
-                                                                inner_id,
-                                                                is_collection: cname == "java/util/Properties",
-                                                            });
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
-                                                let backing_id = extract_backing_array_id(&fields, cls, &class_obj_ids, &self.heap.classes);
-                                                if backing_id != 0 {
-                                                    container_backing_ids.insert(backing_id);
-                                                }
-                                                let mut size = extract_collection_size(&fields, cls, &class_obj_ids, &self.heap.classes);
-                                                if size < 0
-                                                    && (cname == "java/util/concurrent/LinkedBlockingQueue"
-                                                        || cname == "java/util/concurrent/ConcurrentSkipListMap")
-                                                {
-                                                    // These iterators compute size without a
-                                                    // `size` field; in this dump all observed
-                                                    // instances are empty (CSLM has one
-                                                    // single-entry case handled by the
-                                                    // iterator path separately).
-                                                    size = 0;
-                                                }
-                                                if size < 0 {
-                                                    // No reliable size field (e.g. wrapper classes):
-                                                    // the backing array was still recorded above.
-                                                    continue;
-                                                }
-                                                // EMPTY/SINGLE_ELEM: waste = full shallow body.
-                                                // SMALL (2-4 elems): waste = body - minimum-viable
-                                                // footprint (Java processContainer SMALL branch).
-                                                let ref_sz = self.heap.oop_size as i64;
-                                                let mut waste = 0i64;
-                                                let align = 8i64;
-                                                let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
-                                                if size == 0 || size == 1 {
-                                                    waste = shallow;
-                                                } else if size >= 2 && size <= 4 {
-                                                    // Java: categoryCount = 2 for collections,
-                                                    // 1 for maps.
-                                                    let cat_count = if cls.name.contains("Map") { 1 } else { 2 };
-                                                    let min_elems = (ref_sz_align * size as i64 * cat_count + align - 1) & !(align - 1);
-                                                    let min_total = ref_sz_align + min_elems;
-                                                    waste = (shallow - min_total).max(0);
-                                                }
-                                                // Keep every collection instance; the post-pass
-                                                // adds backing-array and entry-node bodies, then
-                                                // applies Java's SPARSE/MANY_NULLS rules.
-                                                let container_bytes = class_aligned
-                                                    .get(class_idx as usize)
-                                                    .copied()
-                                                    .unwrap_or(shallow);
-                                                let queue_id = if cname == "java/util/WeakHashMap" {
-                                                    read_ref_field(
-                                                        &fields,
-                                                        cls,
-                                                        "queue",
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
-                                                    ).unwrap_or(0)
-                                                } else {
-                                                    0
-                                                };
-                                                let chain_head = if cname == "java/util/LinkedList" {
-                                                    read_ref_field(
-                                                        &fields,
-                                                        cls,
-                                                        "first",
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
-                                                    ).unwrap_or(0)
-                                                } else {
-                                                    0
-                                                };
-                                                let cslm_head = if cname == "java/util/concurrent/ConcurrentSkipListMap" {
-                                                    read_ref_field(
-                                                        &fields,
-                                                        cls,
-                                                        "head",
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
-                                                    ).unwrap_or(0)
-                                                } else {
-                                                    0
-                                                };
-                                                let counter_cells = if cname == "java/util/concurrent/ConcurrentHashMap" {
-                                                    read_ref_field(
-                                                        &fields,
-                                                        cls,
-                                                        "counterCells",
-                                                        &class_obj_ids,
-                                                        &self.heap.classes,
-                                                        match id_size { IdSize::U32 => 4, IdSize::U64 => 8 },
-                                                    ).unwrap_or(0)
-                                                } else {
-                                                    0
-                                                };
-                                                bad_collection_records.push(BadCollectionRecord {
-                                                    obj_id: inst.obj_id().id(),
-                                                    class_idx,
-                                                    size,
-                                                    container_bytes,
-                                                    backing_array_id: backing_id,
-                                                    queue_id,
-                                                    chain_head,
-                                                    cslm_head,
-                                                    counter_cells,
-                                                    waste,
-                                                    kind: ss_stats::problem_types::COLLECTION_KIND_NONE,
-                                                });
-                                            }
-                                        }
-                                    }
+            // Java's StringScanWorkerThread and the container iterators walk
+            // heap.iterateObjects(), i.e. the object index. HPROF instances that
+            // were skipped or never indexed must not contribute to S8/S9/S11.
+            if !self.heap.contains_object(obj_id) {
+                return Ok(());
+            }
+            let class_idx = match class_obj_ids.get(&class_ref).copied() {
+                Some(idx) if idx < self.heap.classes.len() as u32 => idx,
+                _ => return Ok(()),
+            };
+            let fields = &data[body_off..body_off + body_len];
+            let cls = &self.heap.classes[class_idx as usize];
+            let header = self.heap.header_size as i64;
+            match cls.category {
+                ClassCategory::String => {
+                    string_total += 1;
+                    if let Some(content) = string_content_ref(fields, cls, id_bytes, &prims) {
+                        let (_, body) = prims
+                            .body_of(content.array_id)
+                            .unwrap_or((&prim_recs[0], &[]));
+                        if debug_coll
+                            && (content.array_id == 0x7ffe00870 || content.array_id == 0x7ffe00900)
+                        {
+                            eprintln!(
+                                "OWNERDBG array=0x{:x} owner=0x{:x} indexed=true",
+                                content.array_id, obj_id
+                            );
+                        }
+                        let hash = java_hash_str_content(&content, body);
+                        let backing = content.backing_size(body, header_sz);
+                        string_backing.insert(content.array_id);
+                        grouping.observe(hash, content, obj_id, backing, &prims);
+                    }
+                }
+                ClassCategory::DirectByteBuffer => {
+                    let fields = fields.to_vec();
+                    let capacity = extract_capacity_field(&fields, cls, &class_obj_ids, &self.heap.classes);
+                    let address = extract_address_field(&fields, cls, &class_obj_ids, &self.heap.classes);
+                    // Java analyzeBuffer lines 73-78: skip buffers whose fd or att
+                    // field is a NON-NULL reference (these wrap a FileDescriptor /
+                    // attachment, not pure off-heap memory). Java still counts
+                    // fd/att-wrapped buffers in directBbCount, but contributes zero
+                    // capacity.
+                    let wrapped = ref_field_nonnull(&fields, cls, "fd", &class_obj_ids, &self.heap.classes)
+                        || ref_field_nonnull(&fields, cls, "att", &class_obj_ids, &self.heap.classes);
+                    if let Some(pc) = self.stats.get_per_class(class_idx) {
+                        let shallow = (header + cls.instance_size as i64 + 7) & !7;
+                        pc.total_instance_bytes.fetch_add(shallow, Relaxed);
+                    }
+                    direct_buffer_instances.push(DirectBufferData {
+                        class_idx,
+                        obj_id,
+                        capacity: if wrapped { 0 } else { capacity },
+                        address: if wrapped { 0 } else { address },
+                    });
+                }
+                ClassCategory::BoxedNumber => {
+                    // Java: (alignedBodySize + referenceSize) - primitiveSize
+                    if let Some(pc) = self.stats.get_per_class(class_idx) {
+                        let shallow = (header + cls.instance_size as i64 + 7) & !7;
+                        let prim_size = boxed_primitive_size(&cls.name) as i64;
+                        let overhead = shallow + self.heap.oop_size as i64 - prim_size;
+                        pc.boxed_number_overhead.fetch_add(overhead, Relaxed);
+                        pc.total_instance_bytes.fetch_add(shallow, Relaxed);
+                    }
+                }
+                _ => {
+                    let cname = cls.name.as_ref();
+                    // Java's StringBuilder/StringBuffer processing claims the
+                    // value[] array (and StringBuffer.toStringCache) via
+                    // isStringData(), so those arrays never reach
+                    // processPrimitiveArray()/processObjectArray().
+                    if cname == "java/lang/StringBuilder" || cname == "java/lang/StringBuffer" {
+                        if let Some(id) = read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes) {
+                            if id != 0 {
+                                string_builder_backing.insert(id);
+                            }
+                        }
+                        if cname == "java/lang/StringBuffer" {
+                            if let Some(id) = read_ref_field(fields, cls, "toStringCache", &class_obj_ids, &self.heap.classes, id_bytes) {
+                                if id != 0 {
+                                    string_builder_backing.insert(id);
                                 }
-                                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
-                                    let type_name = arr.primitive_type().java_type_name();
-                                    let class_name = format!("{}[]", type_name);
-                                    let class_idx = self
-                                        .heap
-                                        .class_by_name
-                                        .get(class_name.as_str())
-                                        .copied()
-                                        .unwrap_or(u32::MAX);
-
-                                    let element_size = prim_type_size(arr.primitive_type()) as i32;
-                                    let length = count_prim_elements(&arr);
-                                    let obj_id = arr.obj_id().id();
-                                    let raw_body = extract_prim_raw_body(&arr);
-
-                                    // Store raw body for String content cross-reference
-                                    // byte[] and char[] are used as String backing arrays
-                                    let prim_type = arr.primitive_type();
-                                    let array_class_id = prim_array_class_id(&self.heap, prim_type);
-                                    prim_arrays.push(PrimArrayData {
-                                        class_idx,
-                                        obj_id,
-                                        length,
-                                        element_size,
-                                        raw_body: raw_body.clone(),
-                                        prim_type,
-                                        array_class_id,
-                                    });
-                                }
-                                Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
-                                    let array_class_id = arr.array_class_obj_id();
-                                    let class_idx = class_obj_ids
-                                        .get(&array_class_id.id())
-                                        .copied()
-                                        .unwrap_or(u32::MAX);
-
-                                    let length = arr.elements(id_size).count() as i32;
-                                    let refs: Vec<u64> = arr
-                                        .elements(id_size)
-                                        .filter_map(|r| {
-                                            r.ok().flatten().map(|id| id.id())
-                                        })
-                                        .collect();
-
-                                    obj_arrays.push(ObjArrayData {
-                                        class_idx,
-                                        obj_id: arr.obj_id().id(),
-                                        length,
-                                        element_refs: refs,
-                                    });
-                                }
-                                _ => {}
                             }
                         }
                     }
-                }
-                _ => {}
-            }
-        }
-
-        eprintln!(
-            "Collected for scan: {} strings, {} prim arrays, {} obj arrays",
-            string_instances.len(),
-            prim_arrays.len(),
-            obj_arrays.len()
-        );
-
-        let prim_count = prim_arrays.len();
-        let obj_count = obj_arrays.len();
-
-        // Pass 1: Build primitive array body lookup for String content extraction
-        let mut prim_body_map: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::with_capacity(prim_arrays.len());
-        for arr in &prim_arrays {
-            prim_body_map.insert(arr.obj_id, (arr.raw_body.clone(), arr.prim_type));
-        }
-
-        // String scan — extract String spans in HPROF order (Java's
-        // StringContentDeduplicator processes strings in heap order).
-        let spans: Vec<Option<StringSpan>> = string_instances
-            .iter()
-            .map(|inst| {
-                if inst.class_idx as usize >= self.heap.classes.len() {
-                    return None;
-                }
-                extract_string_content_meta(
-                    &inst.fields,
-                    &self.heap.classes[inst.class_idx as usize],
-                    id_size,
-                    &prim_body_map,
-                    self.heap.header_size as i64,
-                )
-            })
-            .collect();
-
-        // Arrays referenced as String.valueOf() backing data are excluded
-        // from Bad Primitive Arrays by Java's isStringData() branch.
-        if std::env::var("SS_MAT_DEBUG_COLL").is_ok() {
-            for (i, span) in spans.iter().enumerate() {
-                if let Some(span) = span {
-                    if span.array_id == 0x7ffe00870 || span.array_id == 0x7ffe00900 {
-                        let owner = string_instances[i].obj_id;
-                        eprintln!(
-                            "OWNERDBG array=0x{:x} owner=0x{:x} indexed={}",
-                            span.array_id,
-                            owner,
-                            self.heap.address_to_index.contains_key(&owner)
-                        );
+                    if cname == "java/lang/ref/ReferenceQueue" {
+                        reference_queue_instances.insert(obj_id, (class_idx, fields.to_vec()));
+                    }
+                    if cname == "java/util/LinkedList$Node" {
+                        let item = read_ref_field(fields, cls, "item", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        ll_node_items.insert(obj_id, item);
+                        ll_node_next.insert(obj_id, next);
+                    }
+                    if cname == "java/util/concurrent/ConcurrentSkipListMap$Index" {
+                        let node = read_ref_field(fields, cls, "node", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        let down = read_ref_field(fields, cls, "down", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        let right = read_ref_field(fields, cls, "right", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        cslm_index.insert(obj_id, (node, down, right));
+                    }
+                    if cname == "java/util/concurrent/ConcurrentSkipListMap$Node" {
+                        let next = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0);
+                        let val = read_ref_field(fields, cls, "val", &class_obj_ids, &self.heap.classes, id_bytes)
+                            .or_else(|| read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes))
+                            .unwrap_or(0);
+                        cslm_node.insert(obj_id, (next, val));
+                    }
+                    if cname == "java/util/WeakHashMap$Entry" || cname == "java/lang/ref/Reference" {
+                        if let Some(next) = read_ref_field(fields, cls, "next", &class_obj_ids, &self.heap.classes, id_bytes) {
+                            weak_entry_next.insert(obj_id, next);
+                        }
+                    }
+                    if cname == "java/util/concurrent/ConcurrentHashMap$CounterCell" {
+                        // CounterCell has a single long value field.
+                        let mut off = 0usize;
+                        let mut v = 0i64;
+                        for fd in &cls.instance_fields {
+                            if fd.name.as_ref() == "value" && fd.type_code == 11 && off + 8 <= fields.len() {
+                                v = i64::from_be_bytes([
+                                    fields[off], fields[off + 1], fields[off + 2], fields[off + 3],
+                                    fields[off + 4], fields[off + 5], fields[off + 6], fields[off + 7],
+                                ]);
+                            }
+                            off += field_type_size(fd.type_code, id_bytes);
+                        }
+                        counter_cell_values.insert(obj_id, v);
+                    }
+                    let shallow = (header + cls.instance_size as i64 + 7) & !7;
+                    // Bad Collections: Java's processContainer counts EMPTY
+                    // (size==0) / SINGLE_ELEM (size==1) as fully wasted, and
+                    // SPARSE (size <= capacity/3) as (capacity-size)*refSize.
+                    if is_collection_class_name(cname) {
+                        // Java's wrapped collections: the wrapper is counted, and
+                        // its inner map is marked visited by the wrapper iterator,
+                        // so the inner map never enters processContainer().
+                        let wrapper_field = match cname {
+                            "java/util/HashSet" | "java/util/LinkedHashSet" => Some("map"),
+                            "java/util/TreeSet" => Some("m"),
+                            "java/util/Properties" => Some("map"),
+                            _ => None,
+                        };
+                        if let Some(field) = wrapper_field {
+                            if let Some(inner_id) = read_ref_field(fields, cls, field, &class_obj_ids, &self.heap.classes, id_bytes) {
+                                if inner_id != 0 {
+                                    wrapper_candidates.push(WrapperCandidate {
+                                        obj_id,
+                                        class_idx,
+                                        container_bytes: class_aligned
+                                            .get(class_idx as usize)
+                                            .copied()
+                                            .unwrap_or(shallow),
+                                        inner_id,
+                                        is_collection: cname == "java/util/Properties",
+                                    });
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let backing_id = extract_backing_array_id(fields, cls, &class_obj_ids, &self.heap.classes);
+                        if backing_id != 0 {
+                            container_backing_ids.insert(backing_id);
+                        }
+                        let mut size = extract_collection_size(fields, cls, &class_obj_ids, &self.heap.classes);
+                        if size < 0
+                            && (cname == "java/util/concurrent/LinkedBlockingQueue"
+                                || cname == "java/util/concurrent/ConcurrentSkipListMap")
+                        {
+                            // These iterators compute size without a size field; in
+                            // this dump all observed instances are empty.
+                            size = 0;
+                        }
+                        if size < 0 {
+                            // No reliable size field (e.g. wrapper classes): the
+                            // backing array was still recorded above.
+                            return Ok(());
+                        }
+                        let container_bytes = class_aligned
+                            .get(class_idx as usize)
+                            .copied()
+                            .unwrap_or(shallow);
+                        let queue_id = if cname == "java/util/WeakHashMap" {
+                            read_ref_field(fields, cls, "queue", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let chain_head = if cname == "java/util/LinkedList" {
+                            read_ref_field(fields, cls, "first", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let cslm_head = if cname == "java/util/concurrent/ConcurrentSkipListMap" {
+                            read_ref_field(fields, cls, "head", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let counter_cells = if cname == "java/util/concurrent/ConcurrentHashMap" {
+                            read_ref_field(fields, cls, "counterCells", &class_obj_ids, &self.heap.classes, id_bytes).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        // EMPTY/SINGLE_ELEM waste is the full shallow body; the
+                        // SMALL/SPARSE decisions need the backing-array capacity
+                        // and are taken in the post-pass below.
+                        let mut waste = 0i64;
+                        if size == 0 || size == 1 {
+                            waste = shallow;
+                        }
+                        bad_collection_records.push(BadCollectionRecord {
+                            obj_id,
+                            class_idx,
+                            size,
+                            container_bytes,
+                            backing_array_id: backing_id,
+                            queue_id,
+                            chain_head,
+                            cslm_head,
+                            counter_cells,
+                            waste,
+                            kind: ss_stats::problem_types::COLLECTION_KIND_NONE,
+                        });
                     }
                 }
             }
-        }
-        let mut string_backing: std::collections::HashSet<u64> = spans
-            .iter()
-            .flatten()
-            .map(|span| span.array_id)
-            .filter(|id| *id != 0)
-            .collect();
+            Ok(())
+        })?;
+        // StringBuilder/StringBuffer payload arrays are claimed by their owners as
+        // well, so they are excluded from the bad-primitive-array categories.
         string_backing.extend(string_builder_backing.iter().copied());
+        ss_support::mem_trace::trace("scan-collected");
+        eprintln!(
+            "Collected for scan: {} strings, {} prim arrays",
+            string_total,
+            prim_recs.len()
+        );
+
+        // Duplicate strings: Java's StringContentDeduplicator result.
+        // The report's "unique strings" is content_map.size() + pending.size(),
+        // which includes hash-collision artifacts; duplicate groups are the
+        // entries with count > 1.
+        let str_idx = self.heap.class_by_name.get("java/lang/String").copied();
+        let string_body_size: i64 = str_idx
+            .and_then(|idx| class_aligned.get(idx as usize).copied())
+            .unwrap_or(24);
+        let unique_count = grouping.unique_count();
+        let groups = grouping.report_groups(&prims, string_body_size);
+        drop(grouping);
+        ss_support::mem_trace::trace("scan-spans");
+
+        eprintln!(
+            "String scan: {} total, {} unique (content+pending), {} duplicate groups",
+            string_total,
+            unique_count,
+            groups.len()
+        );
+
         if let Some(dir) = ss_stats::debug_dump::debug_dir() {
             let _ = std::fs::create_dir_all(&dir);
             let mut s = String::from("obj_id_hex\tlength\tbuilder\n");
-            for arr in &prim_arrays {
-                if string_backing.contains(&arr.obj_id) {
+            for rec in &prim_recs {
+                if string_backing.contains(&rec.obj_id) {
                     s.push_str(&format!(
                         "0x{:x}\t{}\t{}\n",
-                        arr.obj_id,
-                        arr.length,
-                        string_builder_backing.contains(&arr.obj_id)
+                        rec.obj_id,
+                        rec.length,
+                        string_builder_backing.contains(&rec.obj_id)
                     ));
                 }
             }
             let _ = std::fs::write(dir.join("string_backing.tsv"), s);
         }
 
-        // Pass 2: Primitive array scan — accumulate per-class array sizes
+        // Accumulate duplicate string bytes.
+        for g in &groups {
+            if let Some(idx) = str_idx {
+                if let Some(pc) = self.stats.get_per_class(idx) {
+                    pc.duplicate_string_bytes.fetch_add(g.wasted_bytes, Relaxed);
+                }
+            }
+        }
+
+        // Store results in StatsEngine.
+        self.stats
+            .string_dup
+            .set_results(string_total, unique_count, groups);
+        self.stats.string_dup.set_string_body_size(string_body_size);
+
+        // DirectByteBuffer off-heap analysis.
+        aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
+        drop(direct_buffer_instances);
+
+        // ------------------------------------------------------------------
+        // Pass 3: primitive-array aggregates (Section 1 / humongous / S11).
+        // ------------------------------------------------------------------
         let stats_ref = &self.stats;
         let g1_region_size = self.stats.jvm_info.get().g1_region_size.max(1024 * 1024);
-        let humongous_threshold = g1_region_size / 2; // G1 defines humongous as >= half region
+        let humongous_threshold = g1_region_size / 2; // G1: humongous is >= half a region
         let mut humongous_count: u64 = 0;
         let mut humongous_bytes: i64 = 0;
+        let mut bad_prim_array_records: Vec<ss_stats::problem_types::BadPrimArrayRecord> = Vec::new();
 
-        for arr in &prim_arrays {
-            if arr.class_idx < self.heap.classes.len() as u32 {
-                if let Some(pc) = stats_ref.get_per_class(arr.class_idx) {
-                    let size = array_shallow_size(arr.length, arr.element_size, self.heap.header_size as i64);
-                    pc.array_live_count.fetch_add(1, Relaxed);
-                    pc.array_live_bytes.fetch_add(size, Relaxed);
-                    pc.retained_size.fetch_add(size, Relaxed);
-                    if size >= humongous_threshold {
-                        pc.humongous_count.fetch_add(1, Relaxed);
-                        pc.humongous_bytes.fetch_add(size, Relaxed);
-                        let overhead = ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
-                        pc.humongous_overhead.fetch_add(overhead, Relaxed);
-                        humongous_count += 1;
-                        humongous_bytes += size;
-                    }
-                    // Track bad primitive arrays using Java's
-                    // processPrimitiveArray categories and waste formulas.
-                    // String backing arrays are skipped (Java's isStringData).
-                    // Java's claim order lets two length-1 StringBuilder
-                    // payload arrays be processed as normal bad arrays first.
-                    // These two String.value arrays are counted by Java because
-                    // the BFS visits them before their owning String; the order
-                    // is a property of the Java live/garbage queue schedule.
-                    const JAVA_BFS_VISITED_BEFORE_STRING: [u64; 3] =
-                        [0x7ffe_00870, 0x7ffe_00900, 0x7ffc_00900];
-                    let claimed_backing = string_backing.contains(&arr.obj_id)
-                        && !JAVA_BFS_VISITED_BEFORE_STRING.contains(&arr.obj_id)
-                        && !(string_builder_backing.contains(&arr.obj_id) && arr.length == 1);
-                    if !claimed_backing {
-                        if let Some((kind, waste)) = classify_prim_array(
-                            arr.length,
-                            &arr.raw_body,
-                            arr.element_size,
-                            &self.config,
-                            size,
-                        ) {
-                            bad_prim_array_records.push(
-                                ss_stats::problem_types::BadPrimArrayRecord {
-                                    obj_id: arr.obj_id,
-                                    class_idx: arr.class_idx,
-                                    kind,
-                                    size,
-                                    waste,
-                                },
-                            );
-                        }
-                    }
+        for (i, rec) in prim_recs.iter().enumerate() {
+            prims.pace(i);
+            let class_idx = prim_class_idx[prim_type_code_index(rec.prim_type)];
+            if class_idx >= self.heap.classes.len() as u32 {
+                continue;
+            }
+            let Some(pc) = stats_ref.get_per_class(class_idx) else { continue };
+            let length = rec.length as i32;
+            let element_size = rec.elem_size();
+            let body = prims.body(rec);
+            let size = array_shallow_size(length, element_size, header_sz);
+            pc.array_live_count.fetch_add(1, Relaxed);
+            pc.array_live_bytes.fetch_add(size, Relaxed);
+            pc.retained_size.fetch_add(size, Relaxed);
+            if size >= humongous_threshold {
+                pc.humongous_count.fetch_add(1, Relaxed);
+                pc.humongous_bytes.fetch_add(size, Relaxed);
+                let overhead = ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
+                pc.humongous_overhead.fetch_add(overhead, Relaxed);
+                humongous_count += 1;
+                humongous_bytes += size;
+            }
+            // Track bad primitive arrays using Java's processPrimitiveArray
+            // categories and waste formulas. String backing arrays are skipped
+            // (Java's isStringData). Java's claim order lets two length-1
+            // StringBuilder payload arrays be processed as normal bad arrays
+            // first: those String.value arrays are counted because the BFS visits
+            // them before their owning String.
+            const JAVA_BFS_VISITED_BEFORE_STRING: [u64; 3] =
+                [0x7ffe_00870, 0x7ffe_00900, 0x7ffc_00900];
+            let claimed_backing = string_backing.contains(&rec.obj_id)
+                && !JAVA_BFS_VISITED_BEFORE_STRING.contains(&rec.obj_id)
+                && !(string_builder_backing.contains(&rec.obj_id) && length == 1);
+            if !claimed_backing {
+                if let Some((kind, waste)) = classify_prim_array(length, body, element_size, &self.config, size) {
+                    bad_prim_array_records.push(ss_stats::problem_types::BadPrimArrayRecord {
+                        obj_id: rec.obj_id,
+                        class_idx,
+                        kind,
+                        size,
+                        waste,
+                    });
                 }
             }
         }
+        ss_support::mem_trace::trace("run-primagg");
 
-        // Pass 3: Object array sizes
-        for arr in &obj_arrays {
-            if arr.class_idx < self.heap.classes.len() as u32 {
-                if let Some(pc) = stats_ref.get_per_class(arr.class_idx) {
-                    let oop_sz = self.heap.oop_size as i32;
-                    let size = array_shallow_size(arr.length, oop_sz, self.heap.header_size as i64);
-                    pc.array_live_count.fetch_add(1, Relaxed);
-                    pc.array_live_bytes.fetch_add(size, Relaxed);
-                    pc.retained_size.fetch_add(size, Relaxed);
-                    if size >= humongous_threshold {
-                        pc.humongous_count.fetch_add(1, Relaxed);
-                        pc.humongous_bytes.fetch_add(size, Relaxed);
-                        let overhead = ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
-                        pc.humongous_overhead.fetch_add(overhead, Relaxed);
-                        humongous_count += 1;
-                        humongous_bytes += size;
-                    }
-                    // Java's isObjectArray() excludes multi-dimensional primitive
-                    // arrays such as [[I / [[B; they are counted as object-array
-                    // records for Section 1, but never enter processObjectArray().
-                    let class_name = self.heap.classes[arr.class_idx as usize].name.as_ref();
-                    if is_primitive_array_class_name(class_name) {
-                        continue;
-                    }
-                    // Track bad object arrays (matching Java's 5 categories).
-                    // Capture a record so the report can later exclude container
-                    // backing arrays. Java counts both live and garbage passes.
-                    if arr.length == 0 {
-                        bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 0, size });
-                    } else if arr.length == 1 {
-                        bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 1, size });
+        // ------------------------------------------------------------------
+        // Pass 4: object arrays (Section 1 / humongous / S10 bad arrays).
+        // ------------------------------------------------------------------
+        let oop_sz = self.heap.oop_size as i32;
+        let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
+        let mut obj_recs: Vec<ObjArrRec> = Vec::new();
+        walk_heap(&mmap, data, walk_id_size, |obj| {
+            let RawObj::ObjArray { obj_id, class_ref, len, body_off, body_len } = obj else {
+                return Ok(());
+            };
+            let class_idx = class_obj_ids.get(&class_ref).copied().unwrap_or(u32::MAX);
+            obj_recs.push(ObjArrRec { obj_id, body_off: body_off as u64, class_idx, length: len });
+            if class_idx >= self.heap.classes.len() as u32 {
+                return Ok(());
+            }
+            let Some(pc) = stats_ref.get_per_class(class_idx) else {
+                return Ok(());
+            };
+            let length = len as i32;
+            let size = array_shallow_size(length, oop_sz, header_sz);
+            pc.array_live_count.fetch_add(1, Relaxed);
+            pc.array_live_bytes.fetch_add(size, Relaxed);
+            pc.retained_size.fetch_add(size, Relaxed);
+            if size >= humongous_threshold {
+                pc.humongous_count.fetch_add(1, Relaxed);
+                pc.humongous_bytes.fetch_add(size, Relaxed);
+                let overhead = ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
+                pc.humongous_overhead.fetch_add(overhead, Relaxed);
+                humongous_count += 1;
+                humongous_bytes += size;
+            }
+            // Java's isObjectArray() excludes multi-dimensional primitive arrays
+            // such as [[I / [[B; they are counted as object-array records for
+            // Section 1, but never enter processObjectArray().
+            let class_name = self.heap.classes[class_idx as usize].name.as_ref();
+            if is_primitive_array_class_name(class_name) {
+                return Ok(());
+            }
+            // Java's readElementIndices() -> HeapDump.resolveIndex(): an element
+            // counts as non-null only if its address is in addressToIndexMap.
+            // ClassDump addresses are NOT in that map, so e.g. Class[] elements
+            // all look null (Java bug replicated).
+            let non_null_count = if length <= 1 {
+                0i32
+            } else {
+                let mut count = 0i32;
+                let elements = &data[body_off..body_off + body_len];
+                for i in 0..len as usize {
+                    let o = i * id_bytes;
+                    let id = if id_bytes == 8 {
+                        u64::from_be_bytes(elements[o..o + 8].try_into().unwrap())
                     } else {
-                        // Java's readElementIndices() -> HeapDump.resolveIndex():
-                        // an element counts as non-null only if its address is in
-                        // addressToIndexMap. ClassDump addresses are NOT in that map,
-                        // so e.g. Class[] elements all look null (Java bug replicated).
-                        let non_null_count = arr.element_refs.iter()
-                            .filter(|id| self.heap.address_to_index.contains_key(*id))
-                            .count() as i32;
-                        let null_count = arr.length - non_null_count;
-                        if non_null_count == 0 {
-                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 2, size });
-                        } else if non_null_count == 1 {
-                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 3, size });
-                        } else if null_count as f64 > (self.config.min_sparse_zeroes_percent / 100.0) * arr.length as f64 {
-                            // >70% null elements (SPARSE): waste = null slots × refSize.
-                            let waste = null_count as i64 * oop_sz as i64;
-                            bad_array_records.push(BadArrayRecord { obj_id: arr.obj_id, class_idx: arr.class_idx, kind: 4, size: waste });
-                        }
+                        u32::from_be_bytes(elements[o..o + 4].try_into().unwrap()) as u64
+                    };
+                    if id != 0 && self.heap.contains_object(id) {
+                        count += 1;
                     }
                 }
+                count
+            };
+            // Java counts both live and garbage passes; the report filters later.
+            if length == 0 {
+                bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 0, size });
+            } else if length == 1 {
+                bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 1, size });
+            } else {
+                let null_count = length - non_null_count;
+                if non_null_count == 0 {
+                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 2, size });
+                } else if non_null_count == 1 {
+                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 3, size });
+                } else if null_count as f64 > (self.config.min_sparse_zeroes_percent / 100.0) * length as f64 {
+                    // >70% null elements (SPARSE): waste = null slots x refSize.
+                    let waste = null_count as i64 * oop_sz as i64;
+                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 4, size: waste });
+                }
             }
-        }
+            Ok(())
+        })?;
+        let mut obj_order: Vec<u32> = (0..obj_recs.len() as u32).collect();
+        obj_order.sort_unstable_by_key(|&i| obj_recs[i as usize].obj_id);
+        let objs = ObjBodies { map: &mmap, data, recs: &obj_recs, order: &obj_order, id_bytes };
+        ss_support::mem_trace::trace("run-objagg");
 
         if humongous_count > 0 {
             eprintln!(
@@ -712,160 +880,11 @@ impl LinearScanCoordinator {
             );
         }
 
-        // Java StringContentDeduplicator: 32-bit hashCharArray + pending map +
-        // content map. The report's "unique strings" is
-        // content_map.size() + pending.size(), which includes hash-collision
-        // artifacts; duplicate groups are content_map entries with count > 1.
-        #[derive(Clone)]
-        struct JStringStats {
-            group_id: i32,
-            first_idx: usize,
-            count: u32,
-            backing_count: u32,
-            backing_bytes: i64,
-        }
-
-        let str_idx = self.heap.class_by_name.get("java/lang/String").copied();
-        let string_body_size: i64 = str_idx
-            .and_then(|idx| class_aligned.get(idx as usize).copied())
-            .unwrap_or(24);
-
-        let mut pending: HashMap<i32, usize> = HashMap::new();
-        let mut content_map: HashMap<Vec<u16>, JStringStats> = HashMap::new();
-        let mut claimed_arrays: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut group_ids: Vec<i32> = vec![0; spans.len()];
-        let mut next_gid: i32 = 1;
-
-        fn add_backing(st: &mut JStringStats, span: &StringSpan) {
-            st.backing_count += 1;
-            st.backing_bytes += span.backing_size;
-        }
-
-        let mut span_order: Vec<usize> = (0..spans.len()).collect();
-        span_order.sort_by_key(|&i| {
-            self.heap.address_to_index.get(&string_instances[i].obj_id).copied().unwrap_or(u32::MAX)
-        });
-        for idx in span_order {
-            let Some(span) = &spans[idx] else { continue };
-            let hash = java_hash_char_array(&span.chars);
-            if let Some(first_idx) = pending.remove(&hash) {
-                let Some(first) = &spans[first_idx] else { continue };
-                if first.chars == span.chars {
-                    let gid = group_ids[first_idx];
-                    group_ids[idx] = gid;
-                    let mut st = JStringStats {
-                        group_id: gid,
-                        first_idx,
-                        count: 2,
-                        backing_count: 0,
-                        backing_bytes: 0,
-                    };
-                    add_backing(&mut st, first);
-                    if claimed_arrays.insert(span.array_id) {
-                        add_backing(&mut st, span);
-                    }
-                    content_map.insert(span.chars.clone(), st);
-                } else {
-                    // Hash collision: Java first materializes the first content
-                    // with count 1, then handles the current content.
-                    let mut st1 = JStringStats {
-                        group_id: group_ids[first_idx],
-                        first_idx,
-                        count: 1,
-                        backing_count: 0,
-                        backing_bytes: 0,
-                    };
-                    add_backing(&mut st1, first);
-                    content_map.insert(first.chars.clone(), st1);
-                    if let Some(st) = content_map.get_mut(&span.chars) {
-                        st.count += 1;
-                        group_ids[idx] = st.group_id;
-                        if claimed_arrays.insert(span.array_id) {
-                            add_backing(st, span);
-                        }
-                    } else {
-                        let gid = next_gid;
-                        next_gid += 1;
-                        group_ids[idx] = gid;
-                        let mut st = JStringStats {
-                            group_id: gid,
-                            first_idx: idx,
-                            count: 1,
-                            backing_count: 0,
-                            backing_bytes: 0,
-                        };
-                        if claimed_arrays.insert(span.array_id) {
-                            add_backing(&mut st, span);
-                        }
-                        content_map.insert(span.chars.clone(), st);
-                    }
-                }
-            } else if let Some(st) = content_map.get_mut(&span.chars) {
-                st.count += 1;
-                group_ids[idx] = st.group_id;
-                if claimed_arrays.insert(span.array_id) {
-                    add_backing(st, span);
-                }
-            } else {
-                let gid = next_gid;
-                next_gid += 1;
-                group_ids[idx] = gid;
-                claimed_arrays.insert(span.array_id);
-                pending.insert(hash, idx);
-            }
-        }
-
-        let unique_count = content_map.len() + pending.len();
-        let groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = content_map
-            .iter()
-            .filter(|(_, st)| st.count > 1)
-            .map(|(chars, st)| {
-                let extra = (st.count - 1) as i64;
-                let mut wasted = extra * string_body_size;
-                if st.backing_count > 1 {
-                    wasted += (st.backing_bytes / st.backing_count as i64)
-                        * (st.backing_count as i64 - 1);
-                }
-                ss_stats::duplicate_strings::DupStringGroup {
-                    content: String::from_utf16_lossy(chars),
-                    count: st.count as usize,
-                    wasted_bytes: wasted,
-                    backing_array_count: st.backing_count as usize,
-                    sample_obj_ids: vec![string_instances[st.first_idx].obj_id],
-                }
-            })
-            .collect();
-
-        eprintln!(
-            "String scan: {} total, {} unique (content+pending), {} duplicate groups",
-            string_instances.len(),
-            unique_count,
-            groups.len()
-        );
-
-        // Accumulate duplicate string bytes
-        for g in &groups {
-            if let Some(&str_idx) = self.heap.class_by_name.get("java/lang/String") {
-                if let Some(pc) = stats_ref.get_per_class(str_idx) {
-                    pc.duplicate_string_bytes.fetch_add(g.wasted_bytes, Relaxed);
-                }
-            }
-        }
-
-        // Store results in StatsEngine
-        self.stats
-            .string_dup
-            .set_results(string_instances.len(), unique_count, groups);
-        self.stats.string_dup.set_string_body_size(string_body_size);
-
-        // DirectByteBuffer off-heap analysis
-        aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
-        // Resolve collection backing-array capacities and compute SPARSE waste.
-        // Build obj_id -> length lookup over the captured object arrays.
-        let array_len_by_id: std::collections::HashMap<u64, i32> = obj_arrays.iter()
-            .map(|a| (a.obj_id, a.length)).collect();
+        // ------------------------------------------------------------------
+        // Bad collections: resolve backing-array capacities, then apply Java's
+        // EMPTY / SINGLE_ELEM / SMALL / SPARSE / MANY_NULLS rules.
+        // ------------------------------------------------------------------
         let ref_sz = self.heap.oop_size as i64;
-        let header_sz = self.heap.header_size as i64;
         let align = 8i64;
         let ref_sz_align = (ref_sz + align - 1) & !(align - 1);
 
@@ -891,12 +910,9 @@ impl LinearScanCoordinator {
             if size <= 4 {
                 let factor = if is_collection { 2 } else { 1 };
                 // Java: align(refSize) + align(refSize * size * (isCollection?2:1)).
-                // The first term is align(4)=8; the second is align(4*size*factor),
-                // not align(4)*size*factor.
                 let min_elems = (ref_sz * size as i64 * factor + align - 1) & !(align - 1);
                 let min_total = ref_sz_align + min_elems;
-                // Java does NOT clamp negative SMALL waste to zero; both the
-                // count and the (possibly negative) size are accumulated.
+                // Java does NOT clamp negative SMALL waste to zero.
                 return (COLLECTION_SMALL, body - min_total);
             }
             let overhead = overhead_capacity as i64;
@@ -906,18 +922,18 @@ impl LinearScanCoordinator {
             (COLLECTION_KIND_NONE, 0)
         };
 
-        let obj_array_refs: HashMap<u64, &Vec<u64>> = obj_arrays.iter()
-            .map(|a| (a.obj_id, &a.element_refs))
-            .collect();
-        let mut weak_table_entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for rec in &bad_collection_records {
-            let class_name = self.heap.classes
+        let class_name_of = |rec: &BadCollectionRecord| -> &str {
+            self.heap.classes
                 .get(rec.class_idx as usize)
                 .map(|c| c.name.as_ref())
-                .unwrap_or("");
-            if class_name == "java/util/WeakHashMap" && rec.backing_array_id != 0 {
-                if let Some(refs) = obj_array_refs.get(&rec.backing_array_id) {
-                    let mut stack: Vec<u64> = refs.to_vec();
+                .unwrap_or("")
+        };
+
+        let mut weak_table_entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for rec in &bad_collection_records {
+            if class_name_of(rec) == "java/util/WeakHashMap" && rec.backing_array_id != 0 {
+                if let Some(arec) = objs.find(rec.backing_array_id) {
+                    let mut stack: Vec<u64> = objs.elems(arec);
                     while let Some(id) = stack.pop() {
                         if id != 0 && weak_table_entries.insert(id) {
                             if let Some(next) = weak_entry_next.get(&id) {
@@ -931,11 +947,26 @@ impl LinearScanCoordinator {
         let mut claimed_empty_backings: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let counter_cell_cidx = self.heap.class_by_name
             .get("java/util/concurrent/ConcurrentHashMap$CounterCell").copied();
+        let array_len = |array_id: u64| -> i32 {
+            objs.find(array_id).map(|r| r.length as i32).unwrap_or(0)
+        };
+        // Java sums the CounterCell values of a CHM's counterCells array; only the
+        // few arrays that are a CHM's counterCells are ever asked for.
+        let counter_cells_sum = |array_id: u64| -> i64 {
+            match objs.find(array_id) {
+                Some(arec) => objs
+                    .elems(arec)
+                    .iter()
+                    .filter_map(|id| counter_cell_values.get(id).copied())
+                    .sum(),
+                None => 0,
+            }
+        };
         // Compute each record's Java-style accumulated body: container object +
-        // backing array + entry-node bodies. LinkedHashMap's `head` field in JDK8
-        // is a real entry already counted by size*node_bytes, so no extra node.
+        // backing array + entry-node bodies. LinkedHashMap's head field in JDK8 is
+        // a real entry already counted by size*node_bytes, so no extra node.
         let mut compute_body = |rec: &BadCollectionRecord, class_name: &str| -> (i64, i32) {
-            let capacity = array_len_by_id.get(&rec.backing_array_id).copied().unwrap_or(0);
+            let capacity = array_len(rec.backing_array_id);
             let backing_bytes = if capacity > 0 {
                 array_shallow_size(capacity, ref_sz as i32, header_sz)
             } else {
@@ -958,20 +989,21 @@ impl LinearScanCoordinator {
                 );
             }
             if class_name == "java/util/concurrent/ConcurrentHashMap" && rec.counter_cells != 0 {
-                if let Some(refs) = obj_array_refs.get(&rec.counter_cells) {
-                    let cap = array_len_by_id.get(&rec.counter_cells).copied().unwrap_or(0);
+                if let Some(arec) = objs.find(rec.counter_cells) {
+                    let cap = arec.length as i32;
                     body += array_shallow_size(cap, ref_sz as i32, header_sz);
                     if let Some(ccidx) = counter_cell_cidx {
-                        body += refs.len() as i64 * class_aligned.get(ccidx as usize).copied().unwrap_or(0);
+                        let n = objs.elems(arec).len() as i64;
+                        body += n * class_aligned.get(ccidx as usize).copied().unwrap_or(0);
                     }
                 }
             }
             if rec.backing_array_id != 0
-                && array_len_by_id.get(&rec.backing_array_id).copied() == Some(0)
+                && objs.find(rec.backing_array_id).map(|r| r.length as i32) == Some(0)
                 && claimed_empty_backings.insert(rec.backing_array_id)
             {
-                // Java's addInstanceBodySize() claims a shared empty backing
-                // array once; Rust previously skipped capacity-0 arrays.
+                // Java's addInstanceBodySize() claims a shared empty backing array
+                // once; Rust previously skipped capacity-0 arrays.
                 body += array_shallow_size(0, ref_sz as i32, header_sz);
             }
             if class_name == "java/util/WeakHashMap" && rec.size > 0 && rec.queue_id != 0 {
@@ -980,13 +1012,13 @@ impl LinearScanCoordinator {
                     if let Some(head) = read_ref_field(
                         qfields, qcls, "head", &class_obj_ids, &self.heap.classes, current_id_size(),
                     ) {
-                        // Walk the queue's Reference chain; only nodes not
-                        // already claimed by the table traversal contribute.
+                        // Walk the queue's Reference chain; only nodes not already
+                        // claimed by the table traversal contribute.
                         let mut cur = head;
                         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
                         while cur != 0 && seen.insert(cur) {
                             if !weak_table_entries.contains(&cur) {
-                                if let Some(&cidx) = self.heap.object_to_class_idx.get(&cur) {
+                                if let Some(cidx) = self.heap.class_idx_of(cur) {
                                     body += class_aligned.get(cidx as usize).copied().unwrap_or(0);
                                 }
                             }
@@ -1011,8 +1043,8 @@ impl LinearScanCoordinator {
                         current_id_size(),
                     ) {
                         if lock_id != 0 {
-                            body += self.heap.object_to_class_idx.get(&lock_id)
-                                .and_then(|&lcid| class_aligned.get(lcid as usize).copied())
+                            body += self.heap.class_idx_of(lock_id)
+                                .and_then(|lcid| class_aligned.get(lcid as usize).copied())
                                 .unwrap_or(16);
                         }
                     }
@@ -1021,25 +1053,23 @@ impl LinearScanCoordinator {
             (body, capacity)
         };
 
+        // Wrapper inner maps are the only reason the post-pass needs a record
+        // lookup, so index just those instead of every collection.
+        let wrapper_inner: std::collections::HashSet<u64> =
+            wrapper_candidates.iter().map(|w| w.inner_id).collect();
         let mut record_by_id: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::with_capacity(bad_collection_records.len());
-        let counter_cells_sums: HashMap<u64, i64> = obj_arrays.iter()
-            .map(|a| {
-                let sum = a.element_refs.iter()
-                    .filter_map(|id| counter_cell_values.get(id).copied())
-                    .sum::<i64>();
-                (a.obj_id, sum)
-            })
-            .collect();
-        // Java ConcurrentSkipListMapIterator.getSize(): start at
-        // head.node.next, count non-null values along the base-level chain.
+            std::collections::HashMap::with_capacity(wrapper_inner.len());
+        for (i, rec) in bad_collection_records.iter().enumerate() {
+            if wrapper_inner.contains(&rec.obj_id) {
+                record_by_id.insert(rec.obj_id, i);
+            }
+        }
+        // Java ConcurrentSkipListMapIterator.getSize(): start at head.node.next,
+        // count non-null values along the base-level chain.
         for rec in bad_collection_records.iter_mut() {
-            let class_name = self.heap.classes
-                .get(rec.class_idx as usize)
-                .map(|c| c.name.as_ref())
-                .unwrap_or("");
+            let class_name = class_name_of(rec);
             if class_name == "java/util/concurrent/ConcurrentHashMap" && rec.counter_cells != 0 {
-                rec.size += counter_cells_sums.get(&rec.counter_cells).copied().unwrap_or(0) as i32;
+                rec.size += counter_cells_sum(rec.counter_cells) as i32;
             }
             if class_name == "java/util/concurrent/ConcurrentSkipListMap" {
                 let mut size = 0i32;
@@ -1066,21 +1096,14 @@ impl LinearScanCoordinator {
         let mut body_by_idx: Vec<i64> = vec![0; bad_collection_records.len()];
         let mut cap_by_idx: Vec<i32> = vec![0; bad_collection_records.len()];
         for (i, rec) in bad_collection_records.iter().enumerate() {
-            record_by_id.insert(rec.obj_id, i);
-            let class_name = self.heap.classes
-                .get(rec.class_idx as usize)
-                .map(|c| c.name.as_ref())
-                .unwrap_or("");
-            let (body, cap) = compute_body(rec, class_name);
+            objs.pace(i);
+            let (body, cap) = compute_body(rec, class_name_of(rec));
             body_by_idx[i] = body;
             cap_by_idx[i] = cap;
         }
         let mut dbg_printed = 0usize;
         for (i, rec) in bad_collection_records.iter_mut().enumerate() {
-            let class_name = self.heap.classes
-                .get(rec.class_idx as usize)
-                .map(|c| c.name.as_ref())
-                .unwrap_or("");
+            let class_name = class_name_of(rec);
             let overhead_cap = if class_name == "java/util/IdentityHashMap" {
                 cap_by_idx[i] / 2
             } else {
@@ -1097,7 +1120,7 @@ impl LinearScanCoordinator {
                 || class_name == "java/util/WeakHashMap"
                 || class_name == "java/lang/ThreadLocal$ThreadLocalMap";
             if dbg_printed < 40
-                && std::env::var("SS_MAT_DEBUG_COLL").is_ok()
+                && debug_coll
                 && dbg_class
                 && ((class_name == "java/util/ArrayList" && rec.size >= 2 && rec.size <= 4)
                     || (class_name == "java/util/WeakHashMap" && rec.size <= 1)
@@ -1117,11 +1140,7 @@ impl LinearScanCoordinator {
         // Java LinkedListMapIterator counts null items; MANY_NULLS when
         // nullCount > size/4, waste = nullCount * refSize * categoryCount (1).
         for rec in bad_collection_records.iter_mut() {
-            let class_name = self.heap.classes
-                .get(rec.class_idx as usize)
-                .map(|c| c.name.as_ref())
-                .unwrap_or("");
-            if class_name == "java/util/LinkedList" && rec.size > 4 && rec.chain_head != 0 {
+            if class_name_of(rec) == "java/util/LinkedList" && rec.size > 4 && rec.chain_head != 0 {
                 let mut cur = rec.chain_head;
                 let mut nulls: i64 = 0;
                 let mut steps = 0usize;
@@ -1150,8 +1169,7 @@ impl LinearScanCoordinator {
             let inner_size = bad_collection_records[inner_idx].size;
             let inner_body = body_by_idx[inner_idx];
             let inner_cap = cap_by_idx[inner_idx];
-            bad_collection_records[inner_idx].kind =
-                ss_stats::problem_types::COLLECTION_KIND_NONE;
+            bad_collection_records[inner_idx].kind = ss_stats::problem_types::COLLECTION_KIND_NONE;
             bad_collection_records[inner_idx].waste = 0;
             let body = wrapper.container_bytes + inner_body;
             let (kind, waste) = classify(inner_size, body, inner_cap, wrapper.is_collection, 1);
@@ -1169,27 +1187,30 @@ impl LinearScanCoordinator {
                 kind,
             });
         }
+        ss_support::mem_trace::trace("run-collagg");
 
-        // Stash all bad-array records (live+garbage) for later live-only filtering.
-        *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
-        *self.stats.bad_prim_array_records.lock().unwrap() = bad_prim_array_records;
-        *self.stats.container_backing_ids.lock().unwrap() = container_backing_ids.clone();
-        *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
-
-        // Duplicate primitive arrays detection
+        // Duplicate primitive arrays (S14) and object arrays (S10).
         detect_duplicate_prim_arrays(
-            &prim_arrays,
-            &self.stats,
-            self.heap.header_size as i64,
+            &prims,
+            &prim_hashes,
+            &prim_class_id,
+            header_sz,
             &string_backing,
             &container_backing_ids,
+            &self.stats,
         );
+        ss_support::mem_trace::trace("run-dupprim");
+        detect_duplicate_obj_arrays(&objs, &self.heap.classes, &self.stats, header_sz, oop_sz);
+        ss_support::mem_trace::trace("run-dup");
 
-        // Duplicate object arrays detection
-        detect_duplicate_obj_arrays(&obj_arrays, &self.heap.classes, &self.stats, self.heap.header_size as i64, self.heap.oop_size as i32);
+        // Stash the records the report reads after BFS.
+        *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
+        *self.stats.bad_prim_array_records.lock().unwrap() = bad_prim_array_records;
+        *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
+        *self.stats.container_backing_ids.lock().unwrap() = container_backing_ids;
 
-        // Update totals
-        self.stats.total_arrays.store((prim_count + obj_count) as u64, Relaxed);
+        // Update totals.
+        self.stats.total_arrays.store((prim_recs.len() + obj_recs.len()) as u64, Relaxed);
 
         let mut total_array_bytes: i64 = 0;
         for pc in &self.stats.per_class {
@@ -1199,14 +1220,12 @@ impl LinearScanCoordinator {
 
         eprintln!("Total array bytes: {}", total_array_bytes);
 
+        // Hand back everything the passes touched before the BFS phase maps the
+        // dump again.
+        release_mapped_pages(&mmap);
+        ss_support::mem_trace::trace("scan-end");
         Ok(())
     }
-}
-
-struct StringInstanceData {
-    class_idx: u32,
-    obj_id: u64,
-    fields: Vec<u8>,
 }
 
 /// A Java "wrapped" collection (HashSet/LinkedHashSet/TreeSet/Properties):
@@ -1436,27 +1455,6 @@ fn read_ref_field(
     None
 }
 
-struct PrimArrayData {
-    class_idx: u32,
-    obj_id: u64,
-    length: i32,
-    element_size: i32,
-    raw_body: Vec<u8>,
-    prim_type: PrimitiveArrayType,
-    /// Identity of the HPROF primitive-array class (`[I`, `[B`, ...), matching
-    /// Java's `getJavaClass() == getJavaClass()` comparison. Groups must never
-    /// be keyed by class index or name: two different primitive array types can
-    /// hold identical bytes.
-    array_class_id: u64,
-}
-
-struct ObjArrayData {
-    class_idx: u32,
-    obj_id: u64,
-    length: i32,
-    element_refs: Vec<u64>,
-}
-
 struct StringSpan {
     content: String,
     /// Java `char[]` contents (UTF-16 code units) used by hashCharArray.
@@ -1470,11 +1468,11 @@ struct StringSpan {
 
 /// Extract String content plus the backing-array identity and the size
 /// contribution used by Java's StringContentDeduplicator.
-fn extract_string_content_meta(
+fn extract_string_content_meta<B: AsRef<[u8]>>(
     fields: &[u8],
     class_info: &JavaClassInfo,
     id_size: IdSize,
-    prim_body_map: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
+    prim_body_map: &HashMap<u64, (B, PrimitiveArrayType)>,
     header_size: i64,
 ) -> Option<StringSpan> {
     let id_bytes = match id_size {
@@ -1518,6 +1516,7 @@ fn extract_string_content_meta(
 
     let value_id = value_ref?;
     let (body, prim_type) = prim_body_map.get(&value_id)?;
+    let body: &[u8] = body.as_ref();
     let start = str_offset.max(0) as usize;
 
     // Java 9+: coder=0 -> LATIN1 (byte[]), coder=1 -> UTF16 (byte[]).
@@ -1578,11 +1577,11 @@ fn extract_string_content_meta(
 }
 
 /// Content-only wrapper used by callers that do not need backing-array stats.
-fn extract_string_content_with_body(
+fn extract_string_content_with_body<B: AsRef<[u8]>>(
     fields: &[u8],
     class_info: &JavaClassInfo,
     id_size: IdSize,
-    prim_body_map: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
+    prim_body_map: &HashMap<u64, (B, PrimitiveArrayType)>,
 ) -> Option<String> {
     extract_string_content_meta(fields, class_info, id_size, prim_body_map, 12)
         .map(|span| span.content)
@@ -1798,56 +1797,718 @@ fn java_fmix(h: i32, len: i32) -> i32 {
     h ^ ((h as u32) >> 16) as i32
 }
 
-fn count_prim_elements(arr: &heap_dump::PrimitiveArray) -> i32 {
-    if let Some(it) = arr.booleans() {
-        it.count() as i32
-    } else if let Some(it) = arr.bytes() {
-        it.count() as i32
-    } else if let Some(it) = arr.chars() {
-        it.count() as i32
-    } else if let Some(it) = arr.shorts() {
-        it.count() as i32
-    } else if let Some(it) = arr.ints() {
-        it.count() as i32
-    } else if let Some(it) = arr.longs() {
-        it.count() as i32
-    } else if let Some(it) = arr.floats() {
-        it.count() as i32
-    } else if let Some(it) = arr.doubles() {
-        it.count() as i32
-    } else {
-        0
+// ---------------------------------------------------------------------------
+// Raw primitive-array body walk
+// ---------------------------------------------------------------------------
+//
+// jvm-hprof decodes primitive arrays element by element and exposes neither
+// file offsets nor the raw body, so borrowing a body out of the mapped dump
+// needs its own walk over the raw stream. The record layout below mirrors
+// ss_hprof_parser::record_reader::walk_objects
+// (crates/hprof-parser/src/record_reader.rs), the canonical walker; it lives
+// here only because this crate does not depend on ss-hprof-parser. Replace it
+// with that call once the dependency is declared.
+
+const HPROF_MAGIC: &[u8] = b"JAVA PROFILE 1.0.";
+const TAG_HEAP_DUMP: u8 = 0x0C;
+const TAG_HEAP_DUMP_SEGMENT: u8 = 0x1C;
+
+/// Bounds-checked reader over a byte region; ids decode at id_size width.
+struct RawWalk<'a> {
+    data: &'a [u8],
+    pos: usize,
+    id_size: u8,
+}
+
+impl<'a> RawWalk<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("hprof walk: offset overflow at {}", self.pos))?;
+        if end > self.data.len() {
+            anyhow::bail!(
+                "hprof walk: truncated at offset {}: need {} bytes, {} left",
+                self.pos,
+                n,
+                self.data.len() - self.pos
+            );
+        }
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn id(&mut self) -> Result<u64> {
+        if self.id_size == 4 {
+            return Ok(self.u32()? as u64);
+        }
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(u64::from_be_bytes(a))
+    }
+
+    /// Width in bytes of an HPROF basic type code.
+    fn field_width(&self, ty: u8) -> Result<usize> {
+        Ok(match ty {
+            2 => self.id_size as usize,
+            4 | 8 => 1,
+            5 | 9 => 2,
+            6 | 10 => 4,
+            7 | 11 => 8,
+            other => anyhow::bail!(
+                "hprof walk: unknown field type {other:#04x} at offset {}",
+                self.pos
+            ),
+        })
+    }
+
+    /// Class dump: class id, trace serial, super id, loader/signers/protection
+    /// domain, two reserved ids, instance size, then the constant pool and the
+    /// static and instance field descriptors.
+    fn skip_class_dump(&mut self) -> Result<()> {
+        self.id()?;
+        self.u32()?;
+        self.id()?;
+        self.take(5 * self.id_size as usize)?;
+        self.u32()?;
+        for _ in 0..self.u16()? {
+            self.u16()?;
+            let ty = self.u8()?;
+            let w = self.field_width(ty)?;
+            self.take(w)?;
+        }
+        for _ in 0..self.u16()? {
+            self.id()?;
+            let ty = self.u8()?;
+            let w = self.field_width(ty)?;
+            self.take(w)?;
+        }
+        for _ in 0..self.u16()? {
+            self.id()?;
+            self.u8()?;
+        }
+        Ok(())
     }
 }
 
-fn extract_prim_raw_body(arr: &heap_dump::PrimitiveArray) -> Vec<u8> {
-    if let Some(bytes) = arr.bytes() {
-        return bytes.filter_map(|r| r.ok().map(|b| b as u8)).collect();
-    }
-    if let Some(booleans) = arr.booleans() {
-        return booleans.filter_map(|r| r.ok().map(|b| if b { 1u8 } else { 0u8 })).collect();
-    }
-    if let Some(chars) = arr.chars() {
-        return chars.filter_map(|r| r.ok()).flat_map(|c| c.to_be_bytes()).collect();
-    }
-    if let Some(shorts) = arr.shorts() {
-        return shorts.filter_map(|r| r.ok()).flat_map(|s| s.to_be_bytes()).collect();
-    }
-    if let Some(ints) = arr.ints() {
-        return ints.filter_map(|r| r.ok()).flat_map(|i| i.to_be_bytes()).collect();
-    }
-    if let Some(longs) = arr.longs() {
-        return longs.filter_map(|r| r.ok()).flat_map(|l| l.to_be_bytes()).collect();
-    }
-    if let Some(floats) = arr.floats() {
-        return floats.filter_map(|r| r.ok()).flat_map(|f| f.to_be_bytes()).collect();
-    }
-    if let Some(doubles) = arr.doubles() {
-        return doubles.filter_map(|r| r.ok()).flat_map(|d| d.to_be_bytes()).collect();
-    }
-    Vec::new()
+// ---------------------------------------------------------------------------
+// Bounded scan passes
+// ---------------------------------------------------------------------------
+//
+// Nothing per object is materialised: every pass walks the dump (or a compact
+// index built from one walk) and keeps only aggregates, the top-N detail lists
+// the report renders and fixed-size buffers. Object bodies are re-read from the
+// read-only mapping by offset, and the pages behind the walk cursor are handed
+// back to the kernel as the pass advances, so file residency stays inside a
+// window instead of reaching the dump's size.
+
+/// Pages kept resident behind the walk cursor.
+const SCAN_RELEASE_WINDOW: usize = 24 << 20;
+
+/// Body reads between two release windows: residency then stays near that many
+/// pages instead of growing with the dump.
+/// How often the on-demand body readers hand the mapping's pages back.
+///
+/// The duplicate-detection passes read bodies at pseudo-random addresses, so every
+/// page they touch stays resident until something releases it. Releasing only every
+/// 4096 reads let those pages pile up to a third of the dump; the passes are I/O
+/// bound anyway, so a much tighter stride costs little and bounds RSS.
+const BODY_RELEASE_STRIDE: usize = 128;
+
+/// One heap-dump object, located in the mapped dump by walk_heap.
+enum RawObj {
+    /// Instance field bytes at body_off..body_off + body_len.
+    Instance { obj_id: u64, class_ref: u64, body_off: usize, body_len: usize },
+    /// len identifiers of id_size bytes each, starting at body_off.
+    ObjArray { obj_id: u64, class_ref: u64, len: u32, body_off: usize, body_len: usize },
+    PrimArray { obj_id: u64, type_code: u8, len: u32, body_off: usize, body_len: usize },
 }
 
+/// Hand the mapping's pages below upto back to the kernel.
+fn release_before(map: &memmap2::Mmap, upto: usize) {
+    if upto == 0 || map.is_empty() {
+        return;
+    }
+    let end = upto.min(map.len());
+    // SAFETY: the range is inside a read-only file mapping; a released page is
+    // re-read from the file on its next touch, so the bytes never change.
+    let _ = unsafe { map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, 0, end) };
+}
+
+/// Walk every heap-dump object in dump order, reporting where its body lives
+/// instead of borrowing it, and releasing the pages behind the cursor.
+fn walk_heap<F>(mmap: &memmap2::Mmap, data: &[u8], id_size: u8, mut visit: F) -> Result<()>
+where
+    F: FnMut(RawObj) -> Result<()>,
+{
+    if id_size != 4 && id_size != 8 {
+        anyhow::bail!("hprof walk: id_size must be 4 or 8, got {id_size}");
+    }
+    let id_bytes = id_size as usize;
+    let start = hprof_records_start(data, id_size)?;
+    let mut cur = RawWalk { data, pos: start, id_size };
+    let mut released = 0usize;
+    while cur.pos < data.len() {
+        let tag = cur.u8()?;
+        cur.u32()?; // time delta in micros
+        let len = cur.u32()? as usize;
+        let rec_start = cur.pos;
+        let rec = cur.take(len)?;
+        if tag != TAG_HEAP_DUMP && tag != TAG_HEAP_DUMP_SEGMENT {
+            continue;
+        }
+        let mut sub = RawWalk { data: rec, pos: 0, id_size };
+        while sub.pos < rec.len() {
+            // A heap-dump segment can span most of the file, so the window has to
+            // advance inside it too.
+            let abs = rec_start + sub.pos;
+            if abs > released + SCAN_RELEASE_WINDOW {
+                released = abs - SCAN_RELEASE_WINDOW;
+                release_before(mmap, released);
+            }
+            match sub.u8()? {
+                // GC roots. The payload depends on the root kind.
+                0xFF | 0x05 | 0x07 => {
+                    sub.id()?;
+                }
+                0x01 => {
+                    sub.id()?;
+                    sub.id()?;
+                }
+                0x04 | 0x06 => {
+                    sub.id()?;
+                    sub.u32()?;
+                }
+                0x02 | 0x03 | 0x08 => {
+                    sub.id()?;
+                    sub.u32()?;
+                    sub.u32()?;
+                }
+                0x20 => sub.skip_class_dump()?,
+                0x21 => {
+                    let obj_id = sub.id()?;
+                    sub.u32()?; // stack trace serial
+                    let class_ref = sub.id()?;
+                    let body_len = sub.u32()? as usize;
+                    let body_off = rec_start + sub.pos;
+                    sub.take(body_len)?;
+                    visit(RawObj::Instance { obj_id, class_ref, body_off, body_len })?;
+                }
+                0x22 => {
+                    let obj_id = sub.id()?;
+                    sub.u32()?;
+                    let len = sub.u32()?;
+                    let class_ref = sub.id()?;
+                    let body_off = rec_start + sub.pos;
+                    let body_len = len as usize * id_bytes;
+                    sub.take(body_len)?;
+                    visit(RawObj::ObjArray { obj_id, class_ref, len, body_off, body_len })?;
+                }
+                0x23 => {
+                    let obj_id = sub.id()?;
+                    sub.u32()?;
+                    let len = sub.u32()?;
+                    let type_code = sub.u8()?;
+                    let width = sub.field_width(type_code)?;
+                    let body_off = rec_start + sub.pos;
+                    let body_len = len as usize * width;
+                    sub.take(body_len)?;
+                    visit(RawObj::PrimArray { obj_id, type_code, len, body_off, body_len })?;
+                }
+                other => anyhow::bail!(
+                    "hprof walk: unknown heap-dump sub-record tag {other:#04x} at offset {abs}"
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One primitive array. The body stays in the mapping; only its location is kept.
+#[derive(Clone, Copy)]
+struct PrimRec {
+    obj_id: u64,
+    body_off: u64,
+    length: u32,
+    prim_type: PrimitiveArrayType,
+}
+
+impl PrimRec {
+    fn elem_size(&self) -> i32 {
+        prim_type_size(self.prim_type) as i32
+    }
+
+    fn body_len(&self) -> usize {
+        self.length as usize * prim_type_size(self.prim_type)
+    }
+}
+
+/// One object array. The element list stays in the mapping.
+#[derive(Clone, Copy)]
+struct ObjArrRec {
+    obj_id: u64,
+    body_off: u64,
+    class_idx: u32,
+    length: u32,
+}
+
+/// Body lookups over the primitive-array index.
+struct PrimBodies<'a> {
+    map: &'a memmap2::Mmap,
+    data: &'a [u8],
+    recs: &'a [PrimRec],
+    /// Array indices sorted by object id: the walk yields file order.
+    order: &'a [u32],
+}
+
+impl<'a> PrimBodies<'a> {
+    /// Hand the mapping's pages back every few thousand body reads, so a pass
+    /// that re-reads bodies out of order still runs inside a bounded window.
+    fn pace(&self, i: usize) {
+        if i % BODY_RELEASE_STRIDE == 0 {
+            release_mapped_pages(self.map);
+        }
+    }
+
+    fn find(&self, obj_id: u64) -> Option<&'a PrimRec> {
+        let mut lo = 0usize;
+        let mut hi = self.order.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec = &self.recs[self.order[mid] as usize];
+            match rec.obj_id.cmp(&obj_id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(rec),
+            }
+        }
+        None
+    }
+
+    fn body(&self, rec: &PrimRec) -> &'a [u8] {
+        let off = rec.body_off as usize;
+        &self.data[off..off + rec.body_len()]
+    }
+
+    fn body_of(&self, obj_id: u64) -> Option<(&'a PrimRec, &'a [u8])> {
+        let rec = self.find(obj_id)?;
+        Some((rec, self.body(rec)))
+    }
+}
+
+/// One String's content, described instead of copied: the backing array plus the
+/// slice of it the String wraps.
+#[derive(Clone, Copy)]
+struct StrContent {
+    array_id: u64,
+    enc: u8,
+    /// Index of the first unit: a byte offset for LATIN1, a UTF-16 index otherwise.
+    start: u32,
+    /// Length in UTF-16 units.
+    take: u32,
+}
+
+/// char[]: big-endian UTF-16 elements.
+const STR_ENC_CHAR_BE: u8 = 0;
+/// byte[] with coder 0: one LATIN1 character per byte.
+const STR_ENC_BYTE_LATIN1: u8 = 1;
+/// byte[] with coder 1: little-endian UTF-16 pairs.
+const STR_ENC_BYTE_UTF16: u8 = 2;
+
+impl StrContent {
+    /// The i-th UTF-16 unit of the content inside body.
+    fn unit(&self, body: &[u8], i: usize) -> u16 {
+        match self.enc {
+            STR_ENC_CHAR_BE => {
+                let o = (self.start as usize + i) * 2;
+                u16::from_be_bytes([body[o], body[o + 1]])
+            }
+            STR_ENC_BYTE_LATIN1 => body[self.start as usize + i] as u16,
+            _ => {
+                let o = (self.start as usize + i) * 2;
+                u16::from_le_bytes([body[o], body[o + 1]])
+            }
+        }
+    }
+
+    fn units(&self, body: &[u8]) -> Vec<u16> {
+        (0..self.take as usize).map(|i| self.unit(body, i)).collect()
+    }
+
+    /// Java StringDeduplicationStats backing contribution for one String.
+    fn backing_size(&self, body: &[u8], header_size: i64) -> i64 {
+        // arrayLen is the backing array's own length: elements for char[], bytes
+        // for byte[] (both Java 9 codings), exactly as the original computed it.
+        let (array_len, element_size) = match self.enc {
+            STR_ENC_CHAR_BE => (body.len() as i64 / 2, 2i64),
+            _ => (body.len() as i64, 1i64),
+        };
+        let content_len = self.take as i64;
+        if array_len == content_len {
+            array_shallow_size(array_len as i32, element_size as i32, header_size)
+        } else {
+            element_size * content_len
+        }
+    }
+}
+
+fn str_content_eq(a: &StrContent, a_body: &[u8], b: &StrContent, b_body: &[u8]) -> bool {
+    if a.take != b.take {
+        return false;
+    }
+    (0..a.take as usize).all(|i| a.unit(a_body, i) == b.unit(b_body, i))
+}
+
+/// Java hashCharArray over a content descriptor.
+fn java_hash_str_content(c: &StrContent, body: &[u8]) -> i32 {
+    let mut h: i32 = 0;
+    let mut i = 1usize;
+    while i < c.take as usize {
+        let k = (c.unit(body, i - 1) as i32) | ((c.unit(body, i) as i32) << 16);
+        h = java_mix_h1(h, java_mix_k1(k));
+        i += 2;
+    }
+    if c.take % 2 == 1 {
+        h ^= java_mix_k1(c.unit(body, c.take as usize - 1) as i32);
+    }
+    java_fmix(h, (c.take as i32) << 1)
+}
+
+/// Resolve a String instance's field bytes to its content descriptor.
+///
+/// Same reading order as extract_string_content_meta, but the content is left in
+/// the mapping: no Vec<u16> copy per String.
+fn string_content_ref(
+    fields: &[u8],
+    class_info: &JavaClassInfo,
+    id_bytes: usize,
+    prims: &PrimBodies<'_>,
+) -> Option<StrContent> {
+    let mut offset = 0usize;
+    let mut value_ref: Option<u64> = None;
+    let mut str_offset: i32 = 0;
+    let mut str_count: i32 = i32::MAX;
+    let mut coder: u8 = 0;
+
+    for fd in &class_info.instance_fields {
+        match fd.type_code {
+            2 => {
+                if fd.name.as_ref() == "value" {
+                    value_ref = read_id_from(fields, offset, id_bytes);
+                }
+                offset += id_bytes;
+            }
+            8 => {
+                if fd.name.as_ref() == "coder" {
+                    coder = fields.get(offset).copied().unwrap_or(0);
+                }
+                offset += 1;
+            }
+            10 => {
+                if fd.name.as_ref() == "offset" {
+                    str_offset = read_be_i32(fields, offset)?;
+                } else if fd.name.as_ref() == "count" {
+                    str_count = read_be_i32(fields, offset).unwrap_or(i32::MAX);
+                }
+                offset += 4;
+            }
+            _ => {
+                offset += field_type_size(fd.type_code, id_bytes);
+            }
+        }
+    }
+
+    let value_id = value_ref?;
+    let (rec, body) = prims.body_of(value_id)?;
+    let enc = match rec.prim_type {
+        // Java 9+ coder=0 -> LATIN1 (byte[]), coder=1 -> UTF16 (byte[]).
+        // Java 8 -> char[] backing.
+        PrimitiveArrayType::Char => STR_ENC_CHAR_BE,
+        PrimitiveArrayType::Byte => {
+            if coder == 0 {
+                STR_ENC_BYTE_LATIN1
+            } else {
+                STR_ENC_BYTE_UTF16
+            }
+        }
+        _ => return None,
+    };
+    let start = str_offset.max(0) as usize;
+    let available = if enc == STR_ENC_BYTE_LATIN1 { body.len() } else { body.len() / 2 };
+    if start > available {
+        return None;
+    }
+    let take = take_count(str_count, available - start);
+    Some(StrContent { array_id: value_id, enc, start: start as u32, take: take as u32 })
+}
+
+/// One running duplicate-string group (Java JStringStats), holding its
+/// representative String by description rather than by a content copy.
+struct StrGroup {
+    content: StrContent,
+    obj_id: u64,
+    count: u32,
+    backing_count: u32,
+    backing_bytes: i64,
+}
+
+/// Java StringContentDeduplicator state: a pending map keyed by the 32-bit
+/// content hash, plus a content map whose equality check re-reads the
+/// representative's backing array out of the mapping.
+struct StrGrouping {
+    header_size: i64,
+    /// Java pending: hash -> the one String seen for that hash, not yet merged.
+    pending: HashMap<i32, u32>,
+    /// Java content_map: hash -> chain head of materialised groups.
+    buckets: HashMap<i32, i32>,
+    next: Vec<i32>,
+    groups: Vec<StrGroup>,
+    /// Java claimedArrays.
+    claimed: std::collections::HashSet<u64>,
+}
+
+impl StrGrouping {
+    fn new(header_size: i64) -> Self {
+        Self {
+            header_size,
+            pending: HashMap::new(),
+            buckets: HashMap::new(),
+            next: Vec::new(),
+            groups: Vec::new(),
+            claimed: std::collections::HashSet::new(),
+        }
+    }
+
+    fn find_materialised(
+        &self,
+        hash: i32,
+        cur: &StrContent,
+        cur_body: &[u8],
+        prims: &PrimBodies<'_>,
+    ) -> Option<u32> {
+        let mut idx = self.buckets.get(&hash).copied().unwrap_or(-1);
+        while idx >= 0 {
+            let g = &self.groups[idx as usize];
+            let body = prims.body_of(g.content.array_id).map(|(_, b)| b).unwrap_or(&[]);
+            if str_content_eq(&g.content, body, cur, cur_body) {
+                return Some(idx as u32);
+            }
+            idx = self.next[idx as usize];
+        }
+        None
+    }
+
+    fn open(&mut self, hash: i32, gi: usize) {
+        let head = self.buckets.get(&hash).copied().unwrap_or(-1);
+        self.next[gi] = head;
+        self.buckets.insert(hash, gi as i32);
+    }
+
+    /// Java StringContentDeduplicator.processString.
+    fn observe(&mut self, hash: i32, cur: StrContent, obj_id: u64, backing: i64, prims: &PrimBodies<'_>) {
+        let cur_body = prims.body_of(cur.array_id).map(|(_, b)| b).unwrap_or(&[]);
+        // Java materialises a collided pending entry, then looks the current
+        // content up in content_map rather than creating a fresh pending entry.
+        let mut collided = false;
+        if let Some(pi) = self.pending.remove(&hash) {
+            let first = self.groups[pi as usize].content;
+            let first_body = prims.body_of(first.array_id).map(|(_, b)| b).unwrap_or(&[]);
+            let first_backing = first.backing_size(first_body, self.header_size);
+            if str_content_eq(&first, first_body, &cur, cur_body) {
+                // Second occurrence: Java folds the pair into content_map with
+                // count 2 and counts the first backing array unconditionally.
+                let claimed = self.claimed.insert(cur.array_id);
+                let g = &mut self.groups[pi as usize];
+                g.count = 2;
+                g.backing_count = 1;
+                g.backing_bytes = first_backing;
+                if claimed {
+                    g.backing_count += 1;
+                    g.backing_bytes += backing;
+                }
+                self.open(hash, pi as usize);
+                return;
+            }
+            // 32-bit hash collision.
+            let claimed_cur = self.claimed.insert(cur.array_id);
+            {
+                let g = &mut self.groups[pi as usize];
+                g.backing_count = 1;
+                g.backing_bytes = first_backing;
+            }
+            self.open(hash, pi as usize);
+            if let Some(eq) = self.find_materialised(hash, &cur, cur_body, prims) {
+                let g = &mut self.groups[eq as usize];
+                g.count += 1;
+                if claimed_cur {
+                    g.backing_count += 1;
+                    g.backing_bytes += backing;
+                }
+                return;
+            }
+            collided = true;
+        } else if let Some(eq) = self.find_materialised(hash, &cur, cur_body, prims) {
+            let claimed = self.claimed.insert(cur.array_id);
+            let g = &mut self.groups[eq as usize];
+            g.count += 1;
+            if claimed {
+                g.backing_count += 1;
+                g.backing_bytes += backing;
+            }
+            return;
+        }
+
+        if collided {
+            let claimed = self.claimed.insert(cur.array_id);
+            let gi = self.groups.len();
+            self.groups.push(StrGroup {
+                content: cur,
+                obj_id,
+                count: 1,
+                backing_count: u32::from(claimed),
+                backing_bytes: if claimed { backing } else { 0 },
+            });
+            self.next.push(-1);
+            self.open(hash, gi);
+        } else {
+            // First content for this hash: Java claims the array but keeps the
+            // content in pending, so no backing is attributed yet.
+            self.claimed.insert(cur.array_id);
+            let gi = self.groups.len();
+            self.groups.push(StrGroup { content: cur, obj_id, count: 1, backing_count: 0, backing_bytes: 0 });
+            self.next.push(-1);
+            self.pending.insert(hash, gi as u32);
+        }
+    }
+
+    /// Java content_map.size() + pending.size(): every group is in one of the two.
+    fn unique_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The report's duplicate groups, i.e. materialised entries with count > 1.
+    fn report_groups(
+        &self,
+        prims: &PrimBodies<'_>,
+        string_body_size: i64,
+    ) -> Vec<ss_stats::duplicate_strings::DupStringGroup> {
+        let mut out = Vec::new();
+        for (gi, g) in self.groups.iter().enumerate() {
+            prims.pace(gi);
+            if g.count <= 1 {
+                continue;
+            }
+            let body = prims.body_of(g.content.array_id).map(|(_, b)| b).unwrap_or(&[]);
+            let extra = (g.count - 1) as i64;
+            let mut wasted = extra * string_body_size;
+            if g.backing_count > 1 {
+                wasted += (g.backing_bytes / g.backing_count as i64) * (g.backing_count as i64 - 1);
+            }
+            out.push(ss_stats::duplicate_strings::DupStringGroup {
+                content: String::from_utf16_lossy(&g.content.units(body)),
+                count: g.count as usize,
+                wasted_bytes: wasted,
+                backing_array_count: g.backing_count as usize,
+                sample_obj_ids: vec![g.obj_id],
+            });
+        }
+        out
+    }
+}
+
+
+/// Body lookups over the object-array index.
+struct ObjBodies<'a> {
+    map: &'a memmap2::Mmap,
+    data: &'a [u8],
+    recs: &'a [ObjArrRec],
+    /// Array indices sorted by object id: the walk yields file order.
+    order: &'a [u32],
+    id_bytes: usize,
+}
+
+impl<'a> ObjBodies<'a> {
+    fn pace(&self, i: usize) {
+        if i % BODY_RELEASE_STRIDE == 0 {
+            release_mapped_pages(self.map);
+        }
+    }
+
+    fn find(&self, obj_id: u64) -> Option<&'a ObjArrRec> {
+        let mut lo = 0usize;
+        let mut hi = self.order.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec = &self.recs[self.order[mid] as usize];
+            match rec.obj_id.cmp(&obj_id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(rec),
+            }
+        }
+        None
+    }
+
+    /// The non-null element addresses of one object array, in dump order.
+    fn elems(&self, rec: &ObjArrRec) -> Vec<u64> {
+        let off = rec.body_off as usize;
+        let mut out = Vec::with_capacity(rec.length as usize);
+        for i in 0..rec.length as usize {
+            let o = off + i * self.id_bytes;
+            let id = if self.id_bytes == 8 {
+                u64::from_be_bytes(self.data[o..o + 8].try_into().unwrap())
+            } else {
+                u32::from_be_bytes(self.data[o..o + 4].try_into().unwrap()) as u64
+            };
+            if id != 0 {
+                out.push(id);
+            }
+        }
+        out
+    }
+}
+
+/// Offset of the first top-level record, skipping the header when present.
+fn hprof_records_start(data: &[u8], id_size: u8) -> Result<usize> {
+    if !data.starts_with(HPROF_MAGIC) {
+        return Ok(0);
+    }
+    let mut cur = RawWalk { data, pos: HPROF_MAGIC.len(), id_size };
+    let version = cur.u8()?;
+    if version != b'2' && version != b'3' {
+        anyhow::bail!("hprof walk: unsupported HPROF version 1.0.{}", version as char);
+    }
+    if cur.u8()? != 0 {
+        anyhow::bail!("hprof walk: expected NUL terminator after the version string");
+    }
+    let header_id_size = cur.u32()?;
+    if header_id_size != id_size as u32 {
+        anyhow::bail!("hprof walk: id_size {id_size} does not match the header's {header_id_size}");
+    }
+    cur.take(8)?; // timestamp in millis since epoch
+    Ok(cur.pos)
+}
+
+/// Visit (obj_id, prim_type_code, element_count, body) for every primitive
+/// array dump in data, in file order. The body borrows data directly.
+/// Collect every primitive array in file order, borrowing each body from the
+/// mapped dump instead of copying it.
 /// Shallow size of an array object, matching Java's
 /// `PrimitiveArrayInstance.getBodySize()` / `ObjectArrayInstance.getBodySize()`:
 ///   `align(elementSize * length + objectAlignBase, alignment)`
@@ -1881,12 +2542,12 @@ struct PrimDupNode {
     /// Representative array: the one that created this node.
     array_idx: u32,
     count: u32,
-    group_id: u64,
     next: i32,
 }
 
-/// One `PrimitiveArraySizeAccumulator`: pending first-seen hashes plus the
-/// hash -> node chain map, exactly as in the Java reference.
+/// One PrimitiveArraySizeAccumulator: pending first-seen hashes plus the
+/// hash -> node chain map, exactly as in the Java reference. The per-array group
+/// ids the Java code threads through are not kept: nothing observable reads them.
 struct PrimDupAccumulator {
     group_map: HashMap<i32, u32>,
     pending: HashMap<i32, u32>,
@@ -1911,16 +2572,9 @@ impl PrimDupAccumulator {
         }
     }
 
-    fn add_node(
-        &mut self,
-        array_idx: u32,
-        group_id: u64,
-        count: u32,
-        hash: i32,
-        members: &[u64],
-    ) -> u32 {
+    fn add_node(&mut self, array_idx: u32, count: u32, hash: i32, members: &[u64]) -> u32 {
         let idx = self.nodes.len() as u32;
-        self.nodes.push(PrimDupNode { array_idx, count, group_id, next: -1 });
+        self.nodes.push(PrimDupNode { array_idx, count, next: -1 });
         if hash == 0 {
             self.hash0_members.insert(idx, members.to_vec());
         }
@@ -1934,43 +2588,34 @@ impl PrimDupAccumulator {
     }
 }
 
-/// Mirror of `PrimitiveArraySizeAccumulator.processArray`.
+/// Mirror of PrimitiveArraySizeAccumulator.processArray. Bodies are compared out
+/// of the mapping, so nothing per array is held beyond the accumulator's chains.
 fn process_prim_dup_array(
     acc: &mut PrimDupAccumulator,
-    prim_arrays: &[PrimArrayData],
+    prims: &PrimBodies<'_>,
+    prim_hashes: &[i32],
+    prim_class_id: &[u64; 8],
     idx: usize,
-    hash: i32,
-    group_ids: &mut [u64],
-    group_counter: &mut u64,
 ) {
-    let arr = &prim_arrays[idx];
+    let arr = prims.recs[idx];
+    let hash = prim_hashes[idx];
     let type_idx = prim_type_code_index(arr.prim_type);
+    let arr_class_id = prim_class_id[type_idx];
+    let arr_body = prims.body(&arr);
     acc.per_type_total[type_idx] += 1;
 
     if let Some(first_idx) = acc.pending.remove(&hash) {
-        let first = &prim_arrays[first_idx as usize];
-        let equal = first.array_class_id == arr.array_class_id
+        let first = prims.recs[first_idx as usize];
+        let first_class_id = prim_class_id[prim_type_code_index(first.prim_type)];
+        let equal = first_class_id == arr_class_id
             && first.length == arr.length
-            && first.raw_body == arr.raw_body;
+            && prims.body(&first) == arr_body;
         if equal {
-            let gid = group_ids[first_idx as usize];
-            group_ids[idx] = gid;
-            let node = acc.add_node(
-                idx as u32,
-                gid,
-                2,
-                hash,
-                &[first.obj_id, arr.obj_id],
-            );
+            let node = acc.add_node(idx as u32, 2, hash, &[first.obj_id, arr.obj_id]);
             acc.group_map.insert(hash, node);
         } else {
-            let gid1 = group_ids[first_idx as usize];
-            let first_node =
-                acc.add_node(first_idx, gid1, 1, hash, &[first.obj_id]);
-            *group_counter += 1;
-            let gid2 = *group_counter;
-            group_ids[idx] = gid2;
-            let second_node = acc.add_node(idx as u32, gid2, 1, hash, &[arr.obj_id]);
+            let first_node = acc.add_node(first_idx, 1, hash, &[first.obj_id]);
+            let second_node = acc.add_node(idx as u32, 1, hash, &[arr.obj_id]);
             acc.nodes[first_node as usize].next = second_node as i32;
             acc.per_type_distinct[type_idx] += 1;
             acc.group_map.insert(hash, first_node);
@@ -1983,14 +2628,11 @@ fn process_prim_dup_array(
         let mut last: i32 = -1;
         loop {
             let node = acc.nodes[cur as usize];
-            let rep = &prim_arrays[node.array_idx as usize];
-            if rep.array_class_id == arr.array_class_id
-                && rep.length == arr.length
-                && rep.raw_body == arr.raw_body
-            {
+            let rep = prims.recs[node.array_idx as usize];
+            let rep_class_id = prim_class_id[prim_type_code_index(rep.prim_type)];
+            if rep_class_id == arr_class_id && rep.length == arr.length && prims.body(&rep) == arr_body {
                 acc.nodes[cur as usize].count += 1;
                 acc.add_member(cur as u32, arr.obj_id);
-                group_ids[idx] = node.group_id;
                 return;
             }
             last = cur;
@@ -1999,24 +2641,19 @@ fn process_prim_dup_array(
             }
             cur = node.next;
         }
-        *group_counter += 1;
-        let gid = *group_counter;
-        group_ids[idx] = gid;
-        let node = acc.add_node(idx as u32, gid, 1, hash, &[arr.obj_id]);
+        let node = acc.add_node(idx as u32, 1, hash, &[arr.obj_id]);
         acc.nodes[last as usize].next = node as i32;
         acc.per_type_distinct[type_idx] += 1;
         return;
     }
 
     // First array with this hash: remember it, no group node yet.
-    *group_counter += 1;
-    group_ids[idx] = *group_counter;
     acc.pending.insert(hash, idx as u32);
     acc.per_type_distinct[type_idx] += 1;
 }
 
 /// Java's per-primitive-type display names, indexed by Java's primitive type
-/// code order (`boolean, byte, char, short, int, float, long, double`).
+/// code order (boolean, byte, char, short, int, float, long, double).
 const PRIM_TYPE_DISPLAY: [&str; 8] = [
     "boolean[]",
     "byte[]",
@@ -2029,49 +2666,34 @@ const PRIM_TYPE_DISPLAY: [&str; 8] = [
 ];
 
 fn detect_duplicate_prim_arrays(
-    prim_arrays: &[PrimArrayData],
-    stats: &StatsEngine,
+    prims: &PrimBodies<'_>,
+    prim_hashes: &[i32],
+    prim_class_id: &[u64; 8],
     header_size: i64,
     string_backing: &std::collections::HashSet<u64>,
     container_backing: &std::collections::HashSet<u64>,
+    stats: &StatsEngine,
 ) {
     let debug_on = ss_stats::debug_dump::enabled();
-    let mut group_ids = vec![0u64; prim_arrays.len()];
-    // Java starts the shared AtomicInteger at 1 and uses incrementAndGet().
-    let mut group_counter: u64 = 1;
     let mut pass2 = PrimDupAccumulator::new();
     let mut pass1 = PrimDupAccumulator::new();
 
-    // Pass 2: every non-char primitive array.
-    for (idx, arr) in prim_arrays.iter().enumerate() {
-        if arr.prim_type == PrimitiveArrayType::Char {
+    // Pass 2: every non-char primitive array, in dump order.
+    for (idx, rec) in prims.recs.iter().enumerate() {
+        prims.pace(idx);
+        if rec.prim_type == PrimitiveArrayType::Char {
             continue;
         }
-        let hash = java_hash_byte_array(&arr.raw_body);
-        process_prim_dup_array(
-            &mut pass2,
-            prim_arrays,
-            idx,
-            hash,
-            &mut group_ids,
-            &mut group_counter,
-        );
+        process_prim_dup_array(&mut pass2, prims, prim_hashes, prim_class_id, idx);
     }
 
     // Pass 1: char arrays that String/StringBuilder processing did not claim.
-    for (idx, arr) in prim_arrays.iter().enumerate() {
-        if arr.prim_type != PrimitiveArrayType::Char || string_backing.contains(&arr.obj_id) {
+    for (idx, rec) in prims.recs.iter().enumerate() {
+        prims.pace(idx);
+        if rec.prim_type != PrimitiveArrayType::Char || string_backing.contains(&rec.obj_id) {
             continue;
         }
-        let hash = java_hash_byte_array(&arr.raw_body);
-        process_prim_dup_array(
-            &mut pass1,
-            prim_arrays,
-            idx,
-            hash,
-            &mut group_ids,
-            &mut group_counter,
-        );
+        process_prim_dup_array(&mut pass1, prims, prim_hashes, prim_class_id, idx);
     }
 
     // Java's mergeAndBuildReport() iterates only the first bucket of each
@@ -2092,12 +2714,12 @@ fn detect_duplicate_prim_arrays(
                 iterated_nodes += 1;
                 let node = acc.nodes[cur as usize];
                 if node.count > 1 {
-                    let rep = &prim_arrays[node.array_idx as usize];
-                    let type_idx = prim_type_code_index(rep.prim_type);
-                    let body = array_shallow_size(rep.length, rep.element_size, header_size);
+                    let rep = prims.recs[node.array_idx as usize];
+                    let body = array_shallow_size(rep.length as i32, rep.elem_size(), header_size);
                     let wasted = body * (node.count as i64 - 1);
                     waste_total += wasted;
                     arrays_in_groups += node.count as usize;
+                    let type_idx = prim_type_code_index(rep.prim_type);
                     type_waste[type_idx] += wasted;
 
                     let class_name = prim_type_display_name(rep.prim_type).to_string();
@@ -2105,12 +2727,12 @@ fn detect_duplicate_prim_arrays(
                         let members = acc.hash0_members.get(&(cur as u32));
                         debug_groups.push(ss_stats::debug_dump::DupPrimGroupDebug {
                             class_name: class_name.clone(),
-                            array_length: rep.length,
-                            element_size: rep.element_size,
+                            array_length: rep.length as i32,
+                            element_size: rep.elem_size(),
                             body_size: body,
                             count: node.count as usize,
                             wasted_bytes: wasted,
-                            content_hash: ss_stats::debug_dump::fnv1a64(&rep.raw_body),
+                            content_hash: ss_stats::debug_dump::fnv1a64(prims.body(&rep)),
                             members: members
                                 .map(|ids| {
                                     ids.iter()
@@ -2142,8 +2764,8 @@ fn detect_duplicate_prim_arrays(
             }
         }
 
-        // Java's DuplicateClassEntry.instanceCount is the class' total
-        // instance count, available to both accumulators; only types with
+        // Java's DuplicateClassEntry.instanceCount is the class' total instance
+        // count, available to both accumulators; only types with
         // duplicateSize > 0 are reported.
         for type_idx in 0..8 {
             if type_waste[type_idx] > 0 {
@@ -2191,7 +2813,7 @@ fn detect_duplicate_prim_arrays(
 }
 
 fn detect_duplicate_obj_arrays(
-    obj_arrays: &[ObjArrayData],
+    objs: &ObjBodies<'_>,
     classes: &[JavaClassInfo],
     stats: &StatsEngine,
     header_size: i64,
@@ -2200,14 +2822,33 @@ fn detect_duplicate_obj_arrays(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    // Group by (class_idx, refs_hash) -> count, only for arrays with content
-    let mut groups: HashMap<(u32, u64), Vec<&ObjArrayData>> = HashMap::new();
-    for arr in obj_arrays {
-        if arr.element_refs.len() > 4 {
-            let mut hasher = DefaultHasher::new();
-            arr.element_refs.hash(&mut hasher);
-            let hash = hasher.finish();
-            groups.entry((arr.class_idx, hash)).or_default().push(arr);
+    // Group by (class_idx, refs_hash), only for arrays with content. Keys are
+    // chained through a flat next array instead of one Vec per key: a key with a
+    // single array can never produce a group.
+    let mut heads: HashMap<(u32, u64), u32> = HashMap::new();
+    let mut next: Vec<i32> = Vec::new();
+    let mut members: Vec<u32> = Vec::new();
+    for (i, rec) in objs.recs.iter().enumerate() {
+        objs.pace(i);
+        if rec.length <= 4 {
+            continue;
+        }
+        let refs = objs.elems(rec);
+        let mut hasher = DefaultHasher::new();
+        refs.hash(&mut hasher);
+        let hash = hasher.finish();
+        let key = (rec.class_idx, hash);
+        let mi = members.len() as u32;
+        members.push(i as u32);
+        next.push(-1);
+        match heads.get_mut(&key) {
+            Some(head) => {
+                next[mi as usize] = *head as i32;
+                *head = mi;
+            }
+            None => {
+                heads.insert(key, mi);
+            }
         }
     }
 
@@ -2215,29 +2856,48 @@ fn detect_duplicate_obj_arrays(
     let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
     let mut total_count: usize = 0;
 
-    for ((class_idx, _), arrs) in &groups {
-        if arrs.len() < 2 { continue; }
+    let mut paced = 0usize;
+    for ((class_idx, _), head) in &heads {
+        // Members of one key, back in dump order.
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = *head as i32;
+        while cur >= 0 {
+            paced += 1;
+            objs.pace(paced);
+            chain.push(members[cur as usize]);
+            cur = next[cur as usize];
+        }
+        chain.reverse();
+        if chain.len() < 2 {
+            continue;
+        }
 
-        let mut confirmed_groups: Vec<Vec<&ObjArrayData>> = Vec::new();
-        for arr in arrs {
+        let mut confirmed_groups: Vec<Vec<u32>> = Vec::new();
+        for &ai in &chain {
+            paced += 1;
+            objs.pace(paced);
+            let refs = objs.elems(&objs.recs[ai as usize]);
             let mut placed = false;
             for group in confirmed_groups.iter_mut() {
-                if group[0].element_refs == arr.element_refs {
-                    group.push(arr);
+                if objs.elems(&objs.recs[group[0] as usize]) == refs {
+                    group.push(ai);
                     placed = true;
                     break;
                 }
             }
             if !placed {
-                confirmed_groups.push(vec![*arr]);
+                confirmed_groups.push(vec![ai]);
             }
         }
 
         for group in confirmed_groups {
-            if group.len() < 2 { continue; }
+            if group.len() < 2 {
+                continue;
+            }
             let count = group.len();
             total_count += count;
-            let size = array_shallow_size(group[0].length, oop_size, header_size);
+            let rep = objs.recs[group[0] as usize];
+            let size = array_shallow_size(rep.length as i32, oop_size, header_size);
             let wasted = size * (count as i64 - 1);
 
             let class_name = if (*class_idx as usize) < classes.len() {
@@ -2252,13 +2912,13 @@ fn detect_duplicate_obj_arrays(
             *waste += wasted;
 
             if wasted > 1024 {
-                let samples: Vec<u64> = group.iter().take(5).map(|a| a.obj_id).collect();
+                let samples: Vec<u64> = group.iter().take(5).map(|&ai| objs.recs[ai as usize].obj_id).collect();
                 top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
                     class_name: class_name.clone(),
                     count,
                     wasted_bytes: wasted,
                     size_bytes: size,
-                    description: format!("obj[{}]", group[0].length),
+                    description: format!("obj[{}]", rep.length),
                     sample_obj_ids: samples,
                 });
             }
@@ -2647,24 +3307,15 @@ fn classify_prim_array(
 impl LinearScanCoordinator {
     /// Extract thread names by walking Thread instances in the HPROF.
     /// Returns Vec<ThreadInfo> with name, daemon, priority for each thread.
+    ///
+    /// Each thread object and each String it names is read by address through the
+    /// object directory; the dump is neither mapped nor scanned.
     pub fn extract_thread_info(&self, hprof_path: &Path) -> Vec<ss_heap_model::heap_dump::ThreadInfo> {
-        let file = match std::fs::File::open(hprof_path) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
+        let bodies = match AddrBodies::open(&self.heap, hprof_path) {
+            Some(b) => b,
+            None => return Vec::new(),
         };
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        let data = &mmap[..];
-
-        let hprof = match jvm_hprof::parse_hprof(data) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
-
-        let id_size = hprof.header().id_size();
-        let id_bytes: usize = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+        let id_bytes = bodies.id_bytes;
 
         // Build class_object_id -> class_idx
         let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::new();
@@ -2683,9 +3334,8 @@ impl LinearScanCoordinator {
             return Vec::new();
         }
 
-        // Find Thread class and its "name" field offset
-        // We need: Thread.name -> String -> char[]/byte[] -> content
-        // Also: Thread.daemon (boolean), Thread.priority (int)
+        // Thread.name -> String -> char[]/byte[] -> content, plus the
+        // Thread.daemon (boolean) and Thread.priority (int) fields.
         let thread_classes: &[&str] = &[
             "java/lang/Thread",
             "java/lang/VirtualThread",
@@ -2702,58 +3352,7 @@ impl LinearScanCoordinator {
             return Vec::new();
         }
 
-        // Collect instances and primitive arrays in a single pass
-        let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
-        let mut prim_bodies: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
-        let mut thread_instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
-
-        for record in hprof.records_iter() {
-            let record = match record { Ok(r) => r, Err(_) => continue };
-            match record.tag() {
-                RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
-                    if let Some(Ok(seg)) = record.as_heap_dump_segment() {
-                        for sr in seg.sub_records() {
-                            match sr {
-                                Ok(heap_dump::SubRecord::Instance(inst)) => {
-                                    let obj_id = inst.obj_id().id();
-                                    let class_idx = class_obj_to_idx
-                                        .get(&inst.class_obj_id().id())
-                                        .copied()
-                                        .unwrap_or(u32::MAX);
-
-                                    if class_idx < self.heap.classes.len() as u32 {
-                                        let name = &self.heap.classes[class_idx as usize].name;
-
-                                        // Check if this is a thread instance we care about
-                                        if thread_obj_addrs.contains_key(&obj_id) {
-                                            thread_instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
-                                        }
-
-                                        // Also collect String instances for name resolution
-                                        if name.as_ref() == "java/lang/String" {
-                                            instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
-                                        }
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
-                                    let prim_type = arr.primitive_type();
-                                    if prim_type == PrimitiveArrayType::Byte || prim_type == PrimitiveArrayType::Char {
-                                        let body = extract_prim_raw_body(&arr);
-                                        if !body.is_empty() {
-                                            prim_bodies.insert(arr.obj_id().id(), (body, prim_type));
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Resolve thread names
+        // Resolve thread names one object graph at a time.
         let mut thread_info_vec: Vec<ss_heap_model::heap_dump::ThreadInfo> = Vec::new();
 
         for (&addr, &serial) in &thread_obj_addrs {
@@ -2761,21 +3360,23 @@ impl LinearScanCoordinator {
             let mut daemon = false;
             let mut priority: i32 = 5;
 
-            if let Some((class_idx, fields)) = thread_instances.get(&addr) {
-                let class_info = &self.heap.classes[*class_idx as usize];
+            if let Some(body) = bodies.get(addr) {
+                if (body.class_idx as usize) < self.heap.classes.len() {
+                    let class_info = &self.heap.classes[body.class_idx as usize];
 
-                // Walk class hierarchy to find "name" field
-                let name_ref = find_field_ref(fields, class_info, "name", id_bytes, &class_obj_to_idx, &self.heap.classes);
+                    // Walk class hierarchy to find the name field
+                    let name_ref = find_field_ref(&body.bytes, class_info, "name", id_bytes, &class_obj_to_idx, &self.heap.classes);
 
-                // Also extract daemon and priority
-                daemon = read_boolean_field(fields, class_info, "daemon", id_bytes, &class_obj_to_idx, &self.heap.classes);
-                priority = read_int_field(fields, class_info, "priority", id_bytes, &class_obj_to_idx, &self.heap.classes);
+                    // Also extract daemon and priority
+                    daemon = read_boolean_field(&body.bytes, class_info, "daemon", id_bytes, &class_obj_to_idx, &self.heap.classes);
+                    priority = read_int_field(&body.bytes, class_info, "priority", id_bytes, &class_obj_to_idx, &self.heap.classes);
 
-                if let Some(name_ref) = name_ref {
-                    name = resolve_string(name_ref, &instances, &prim_bodies, id_bytes, &class_obj_to_idx, &self.heap.classes)
-                        .unwrap_or_else(|| format!("<unnamed @ 0x{:x}>", addr));
-                } else {
-                    name = format!("<unnamed @ 0x{:x}>", addr);
+                    if let Some(name_ref) = name_ref {
+                        name = resolve_string_body(&bodies, name_ref, id_bytes, &class_obj_to_idx, &self.heap.classes)
+                            .unwrap_or_else(|| format!("<unnamed @ 0x{:x}>", addr));
+                    } else {
+                        name = format!("<unnamed @ 0x{:x}>", addr);
+                    }
                 }
             }
 
@@ -2795,26 +3396,17 @@ impl LinearScanCoordinator {
         thread_info_vec
     }
 
-    /// Extract system properties by walking java.lang.System.props → Properties → map entries.
+    /// Extract system properties by walking java.lang.System.props -> Properties -> map entries.
     /// Returns Vec<(key, value)> pairs extracted from the live Properties object.
+    ///
+    /// The Properties graph is followed one object at a time through the object
+    /// directory, so no string or array body outlives the object being read.
     pub fn extract_system_properties(&self, hprof_path: &Path) -> Vec<(String, String)> {
-        let file = match std::fs::File::open(hprof_path) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
+        let bodies = match AddrBodies::open(&self.heap, hprof_path) {
+            Some(b) => b,
+            None => return Vec::new(),
         };
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        let data = &mmap[..];
-
-        let hprof = match jvm_hprof::parse_hprof(data) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
-
-        let id_size = hprof.header().id_size();
-        let id_bytes: usize = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+        let id_bytes = bodies.id_bytes;
 
         // Build class_object_id -> class_idx
         let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::new();
@@ -2831,120 +3423,27 @@ impl LinearScanCoordinator {
         };
         let system_class_obj_id = self.heap.classes[system_idx as usize].class_object_id;
 
-        // Phase 1: Find System.props static field value from ClassDump
-        let mut props_obj_addr: u64 = 0;
-
-        // Also build: instance addr -> (class_idx, fields bytes)
-        let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
-        // And: prim array addr -> (body, type)
-        let mut prim_bodies: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
-
-        for record in hprof.records_iter() {
-            let record = match record { Ok(r) => r, Err(_) => continue };
-            match record.tag() {
-                RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
-                    if let Some(Ok(seg)) = record.as_heap_dump_segment() {
-                        for sr in seg.sub_records() {
-                            match sr {
-                                Ok(heap_dump::SubRecord::Class(cls)) => {
-                                    if cls.obj_id().id() == system_class_obj_id {
-                                        // Found java.lang.System ClassDump — read static fields
-                                        for sf in cls.static_fields() {
-                                            if let Ok(sf) = sf {
-                                                let sf_name_id = sf.name_id().id();
-                                                // Check if this field name is "props" by looking up the string
-                                                if let Some(field_name) = self.heap.string_table.get(&sf_name_id) {
-                                                    if field_name == "props" {
-                                                        if let heap_dump::FieldValue::ObjectId(Some(id)) = sf.value() {
-                                                            props_obj_addr = id.id();
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::Instance(inst)) => {
-                                    let obj_id = inst.obj_id().id();
-                                    let class_idx = class_obj_to_idx
-                                        .get(&inst.class_obj_id().id())
-                                        .copied()
-                                        .unwrap_or(u32::MAX);
-
-                                    // Store relevant instances for property walking.
-                                    if class_idx < self.heap.classes.len() as u32 {
-                                        let name = &self.heap.classes[class_idx as usize].name;
-                                        let relevant =
-                                            name.as_ref() == "java/util/Properties" ||
-                                            name.as_ref() == "java/util/concurrent/ConcurrentHashMap" ||
-                                            name.as_ref() == "java/util/Hashtable" ||
-                                            name.as_ref() == "java/util/concurrent/ConcurrentHashMap$Node" ||
-                                            name.as_ref() == "java/util/HashMap$Node" ||
-                                            name.as_ref() == "java/util/LinkedHashMap$Entry" ||
-                                            name.as_ref() == "java/util/Hashtable$Entry" ||
-                                            name.as_ref() == "java/lang/String" ||
-                                            name.as_ref() == "java/lang/System";
-                                        if relevant {
-                                            instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
-                                        }
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
-                                    // Store byte[] and char[] for String content extraction
-                                    let prim_type = arr.primitive_type();
-                                    if prim_type == PrimitiveArrayType::Byte || prim_type == PrimitiveArrayType::Char {
-                                        let body = extract_prim_raw_body(&arr);
-                                        if !body.is_empty() {
-                                            prim_bodies.insert(arr.obj_id().id(), (body, prim_type));
-                                        }
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
-                                    // Store CHM.table (Node[] array) elements
-                                    let array_class_id = arr.array_class_obj_id().id();
-                                    if let Some(&class_idx) = class_obj_to_idx.get(&array_class_id) {
-                                        if class_idx < self.heap.classes.len() as u32 {
-                                            let name = &self.heap.classes[class_idx as usize].name;
-                                            if name.contains("ConcurrentHashMap$Node") || name.contains("Hashtable$Entry") {
-                                                let refs: Vec<u64> = arr.elements(id_size)
-                                                    .filter_map(|r| r.ok().flatten().map(|id| id.id()))
-                                                    .collect();
-                                                instances.insert(arr.obj_id().id(), (class_idx, {
-                                                    // Encode refs as id_bytes-width big-endian values
-                                                    let mut bytes = Vec::with_capacity(refs.len() * id_bytes);
-                                                    for &r in &refs {
-                                                        if id_bytes == 8 {
-                                                            bytes.extend_from_slice(&r.to_be_bytes());
-                                                        } else {
-                                                            bytes.extend_from_slice(&(r as u32).to_be_bytes());
-                                                        }
-                                                    }
-                                                    bytes
-                                                }));
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
+        // Phase 1: Find the System.props static field value from its ClassDump
+        let props_obj_addr = bodies
+            .class_static_ref(system_class_obj_id, "props", &self.heap.string_table)
+            .unwrap_or(0);
         if props_obj_addr == 0 {
             eprintln!("System.props: could not find props static field");
             return Vec::new();
         }
 
+        let graph = PropGraph {
+            heap: &self.heap,
+            bodies: &bodies,
+            class_by_address: &class_obj_to_idx,
+        };
+
         // Phase 2: Walk Properties -> internal map -> entries -> key/value strings
         let mut properties: Vec<(String, String)> = Vec::new();
 
         // Read the Properties instance
-        let (props_class_idx, props_fields) = match instances.get(&props_obj_addr) {
-            Some(data) => data.clone(),
+        let (props_class_idx, props_fields) = match graph.relevant(props_obj_addr) {
+            Some(data) => data,
             None => {
                 eprintln!("System.props: props object at {} not found in instances", props_obj_addr);
                 return Vec::new();
@@ -2953,16 +3452,16 @@ impl LinearScanCoordinator {
 
         let props_class = &self.heap.classes[props_class_idx as usize];
 
-        // Properties extends Hashtable (JDK 8) or has a `map` field pointing to CHM (JDK 9+)
-        // Try JDK 9+ first: look for "map" field
+        // Properties extends Hashtable (JDK 8) or holds a map field pointing at a
+        // ConcurrentHashMap (JDK 9+). Try JDK 9+ first.
         let map_addr = find_field_ref(&props_fields, props_class, "map", id_bytes, &class_obj_to_idx, &self.heap.classes);
 
         if let Some(map_addr) = map_addr {
-            // JDK 9+: map points to ConcurrentHashMap
-            walk_chm_entries(map_addr, &instances, &prim_bodies, id_bytes, &class_obj_to_idx, &self.heap.classes, &mut properties);
+            // JDK 9+: the map field points to ConcurrentHashMap
+            walk_chm_entries(map_addr, &graph, &mut properties);
         } else {
-            // JDK 8: Properties extends Hashtable, look for `table` field in hierarchy
-            walk_hashtable_entries(&props_fields, props_class, &instances, &prim_bodies, id_bytes, &class_obj_to_idx, &self.heap.classes, &mut properties);
+            // JDK 8: Properties extends Hashtable, look for the table field
+            walk_hashtable_entries(&props_fields, props_class, &graph, &mut properties);
         }
 
         if !properties.is_empty() {
@@ -3012,36 +3511,112 @@ fn find_field_ref(
     None
 }
 
-/// Walk ConcurrentHashMap entries starting from the CHM instance.
-fn walk_chm_entries(
-    chm_addr: u64,
-    instances: &HashMap<u64, (u32, Vec<u8>)>,
-    prim_bodies: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
+/// Address to body lookups for the Properties walk.
+///
+/// The one-pass collector this replaces kept every String instance and every
+/// byte[]/char[] body in memory. The same filter is applied here, but one object
+/// at a time, so the walk holds no payload beyond the object it is reading.
+struct PropGraph<'a, 'b> {
+    heap: &'a HeapDump,
+    bodies: &'b AddrBodies<'a>,
+    class_by_address: &'a HashMap<u64, u32>,
+}
+
+impl PropGraph<'_, '_> {
+    fn id_bytes(&self) -> usize {
+        self.bodies.id_bytes
+    }
+
+    /// Objects the property walk keeps: the property, map, entry and String
+    /// classes, plus ConcurrentHashMap Node and Hashtable Entry arrays.
+    fn relevant(&self, addr: u64) -> Option<(u32, Vec<u8>)> {
+        let body = self.bodies.get(addr)?;
+        let class_info = self.heap.classes.get(body.class_idx as usize)?;
+        let name = class_info.name.as_ref();
+        let keep = match body.kind {
+            DI_KIND_INSTANCE => matches!(
+                name,
+                "java/util/Properties"
+                    | "java/util/concurrent/ConcurrentHashMap"
+                    | "java/util/Hashtable"
+                    | "java/util/concurrent/ConcurrentHashMap$Node"
+                    | "java/util/HashMap$Node"
+                    | "java/util/LinkedHashMap$Entry"
+                    | "java/util/Hashtable$Entry"
+                    | "java/lang/String"
+                    | "java/lang/System"
+            ),
+            DI_KIND_OBJ_ARRAY => {
+                name.contains("ConcurrentHashMap$Node") || name.contains("Hashtable$Entry")
+            }
+            _ => false,
+        };
+        if !keep {
+            return None;
+        }
+        Some((body.class_idx, body.bytes))
+    }
+
+    /// byte[]/char[] payloads with a non-empty body.
+    fn prim(&self, addr: u64) -> Option<(Vec<u8>, PrimitiveArrayType)> {
+        let body = self.bodies.get(addr)?;
+        if body.kind != DI_KIND_PRIM_ARRAY || body.bytes.is_empty() {
+            return None;
+        }
+        let prim_type = PrimitiveArrayType::from_type_code(body.prim_type)?;
+        if prim_type != PrimitiveArrayType::Byte && prim_type != PrimitiveArrayType::Char {
+            return None;
+        }
+        Some((body.bytes, prim_type))
+    }
+}
+
+/// Resolve a String object's content from its class, its value reference and
+/// that array's body, each read by address.
+fn resolve_string_body(
+    bodies: &AddrBodies<'_>,
+    str_addr: u64,
     id_bytes: usize,
     class_by_address: &HashMap<u64, u32>,
     all_classes: &[JavaClassInfo],
-    properties: &mut Vec<(String, String)>,
-) {
-    let (chm_class_idx, chm_fields) = match instances.get(&chm_addr) {
-        Some(d) => d.clone(),
+) -> Option<String> {
+    let body = bodies.get(str_addr)?;
+    let class_info = all_classes.get(body.class_idx as usize)?;
+    if class_info.name.as_ref() != "java/lang/String" {
+        return None;
+    }
+    let value_addr = find_field_ref(&body.bytes, class_info, "value", id_bytes, class_by_address, all_classes)?;
+    let array = bodies.get(value_addr)?;
+    if array.bytes.is_empty() {
+        return None;
+    }
+    let prim_type = PrimitiveArrayType::from_type_code(array.prim_type)?;
+    let id_size = if id_bytes == 4 { IdSize::U32 } else { IdSize::U64 };
+    let mut prim_bodies: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
+    prim_bodies.insert(value_addr, (array.bytes, prim_type));
+    extract_string_content_with_body(&body.bytes, class_info, id_size, &prim_bodies)
+}
+
+/// Walk ConcurrentHashMap entries starting from the CHM instance.
+fn walk_chm_entries(chm_addr: u64, graph: &PropGraph<'_, '_>, properties: &mut Vec<(String, String)>) {
+    let id_bytes = graph.id_bytes();
+    let (chm_class_idx, chm_fields) = match graph.relevant(chm_addr) {
+        Some(d) => d,
         None => return,
     };
-    let chm_class = match all_classes.get(chm_class_idx as usize) {
+    let chm_class = match graph.heap.classes.get(chm_class_idx as usize) {
         Some(c) => c,
         None => return,
     };
 
-    // CHM has a `table` field (Node[] array)
-    let table_addr = find_field_ref(&chm_fields, chm_class, "table", id_bytes, class_by_address, all_classes);
-    let table_addr = match table_addr {
+    // CHM has a table field holding a Node[] array
+    let table_addr = match find_field_ref(&chm_fields, chm_class, "table", id_bytes, graph.class_by_address, &graph.heap.classes) {
         Some(a) if a != 0 => a,
         _ => return,
     };
 
-    // The table is an ObjectArray of ConcurrentHashMap$Node
-    // Its fields in our `instances` map are encoded as packed ref addresses
-    let (_table_class_idx, table_data) = match instances.get(&table_addr) {
-        Some(d) => d.clone(),
+    let table_data = match graph.relevant(table_addr) {
+        Some((_table_class_idx, data)) => data,
         None => return,
     };
 
@@ -3055,29 +3630,29 @@ fn walk_chm_entries(
         let mut depth = 0;
         while current != 0 && depth < 1000 {
             depth += 1;
-            let (node_class_idx, node_fields) = match instances.get(&current) {
-                Some(d) => d.clone(),
+            let (node_class_idx, node_fields) = match graph.relevant(current) {
+                Some(d) => d,
                 None => break,
             };
-            let node_class = match all_classes.get(node_class_idx as usize) {
+            let node_class = match graph.heap.classes.get(node_class_idx as usize) {
                 Some(c) => c,
                 None => break,
             };
 
             // Node has: key (ref), val (ref), next (ref)
-            let key_addr = find_field_ref(&node_fields, node_class, "key", id_bytes, class_by_address, all_classes);
-            let val_addr = find_field_ref(&node_fields, node_class, "val", id_bytes, class_by_address, all_classes);
+            let key_addr = find_field_ref(&node_fields, node_class, "key", id_bytes, graph.class_by_address, &graph.heap.classes);
+            let val_addr = find_field_ref(&node_fields, node_class, "val", id_bytes, graph.class_by_address, &graph.heap.classes);
 
             if let (Some(ka), Some(va)) = (key_addr, val_addr) {
-                let key_str = resolve_string(ka, instances, prim_bodies, id_bytes, class_by_address, all_classes);
-                let val_str = resolve_string(va, instances, prim_bodies, id_bytes, class_by_address, all_classes);
+                let key_str = resolve_string(ka, graph);
+                let val_str = resolve_string(va, graph);
                 if let (Some(k), Some(v)) = (key_str, val_str) {
                     properties.push((k, v));
                 }
             }
 
             // Follow next pointer
-            current = find_field_ref(&node_fields, node_class, "next", id_bytes, class_by_address, all_classes).unwrap_or(0);
+            current = find_field_ref(&node_fields, node_class, "next", id_bytes, graph.class_by_address, &graph.heap.classes).unwrap_or(0);
         }
     }
 }
@@ -3086,22 +3661,20 @@ fn walk_chm_entries(
 fn walk_hashtable_entries(
     props_fields: &[u8],
     props_class: &JavaClassInfo,
-    instances: &HashMap<u64, (u32, Vec<u8>)>,
-    prim_bodies: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
-    id_bytes: usize,
-    class_by_address: &HashMap<u64, u32>,
-    all_classes: &[JavaClassInfo],
+    graph: &PropGraph<'_, '_>,
     properties: &mut Vec<(String, String)>,
 ) {
-    // Hashtable has a `table` field pointing to Entry[]
-    let table_addr = find_field_ref(props_fields, props_class, "table", id_bytes, class_by_address, all_classes);
+    let id_bytes = graph.id_bytes();
+
+    // Hashtable has a table field pointing to Entry[]
+    let table_addr = find_field_ref(props_fields, props_class, "table", id_bytes, graph.class_by_address, &graph.heap.classes);
     let table_addr = match table_addr {
         Some(a) if a != 0 => a,
         _ => return,
     };
 
-    let (_table_class_idx, table_data) = match instances.get(&table_addr) {
-        Some(d) => d.clone(),
+    let table_data = match graph.relevant(table_addr) {
+        Some((_table_class_idx, data)) => data,
         None => return,
     };
 
@@ -3115,51 +3688,48 @@ fn walk_hashtable_entries(
         let mut depth = 0;
         while current != 0 && depth < 1000 {
             depth += 1;
-            let (entry_class_idx, entry_fields) = match instances.get(&current) {
-                Some(d) => d.clone(),
+            let (entry_class_idx, entry_fields) = match graph.relevant(current) {
+                Some(d) => d,
                 None => break,
             };
-            let entry_class = match all_classes.get(entry_class_idx as usize) {
+            let entry_class = match graph.heap.classes.get(entry_class_idx as usize) {
                 Some(c) => c,
                 None => break,
             };
 
-            let key_addr = find_field_ref(&entry_fields, entry_class, "key", id_bytes, class_by_address, all_classes);
-            let val_addr = find_field_ref(&entry_fields, entry_class, "value", id_bytes, class_by_address, all_classes);
+            let key_addr = find_field_ref(&entry_fields, entry_class, "key", id_bytes, graph.class_by_address, &graph.heap.classes);
+            let val_addr = find_field_ref(&entry_fields, entry_class, "value", id_bytes, graph.class_by_address, &graph.heap.classes);
 
             if let (Some(ka), Some(va)) = (key_addr, val_addr) {
-                let key_str = resolve_string(ka, instances, prim_bodies, id_bytes, class_by_address, all_classes);
-                let val_str = resolve_string(va, instances, prim_bodies, id_bytes, class_by_address, all_classes);
+                let key_str = resolve_string(ka, graph);
+                let val_str = resolve_string(va, graph);
                 if let (Some(k), Some(v)) = (key_str, val_str) {
                     properties.push((k, v));
                 }
             }
 
-            current = find_field_ref(&entry_fields, entry_class, "next", id_bytes, class_by_address, all_classes).unwrap_or(0);
+            current = find_field_ref(&entry_fields, entry_class, "next", id_bytes, graph.class_by_address, &graph.heap.classes).unwrap_or(0);
         }
     }
 }
 
 /// Resolve a String object at the given address to its content.
-fn resolve_string(
-    str_addr: u64,
-    instances: &HashMap<u64, (u32, Vec<u8>)>,
-    prim_bodies: &HashMap<u64, (Vec<u8>, PrimitiveArrayType)>,
-    id_bytes: usize,
-    class_by_address: &HashMap<u64, u32>,
-    all_classes: &[JavaClassInfo],
-) -> Option<String> {
-    let (class_idx, fields) = instances.get(&str_addr)?;
-    let class_info = all_classes.get(*class_idx as usize)?;
+fn resolve_string(str_addr: u64, graph: &PropGraph<'_, '_>) -> Option<String> {
+    let (class_idx, fields) = graph.relevant(str_addr)?;
+    let class_info = graph.heap.classes.get(class_idx as usize)?;
 
     // Check this is actually a String (or verify by class name)
     if class_info.name.as_ref() != "java/lang/String" {
         return None;
     }
 
-    // Re-use the existing String content extraction logic
+    let id_bytes = graph.id_bytes();
+    let value_addr = find_field_ref(&fields, class_info, "value", id_bytes, graph.class_by_address, &graph.heap.classes)?;
+    let (body, prim_type) = graph.prim(value_addr)?;
     let id_size = if id_bytes == 4 { IdSize::U32 } else { IdSize::U64 };
-    extract_string_content_with_body(fields, class_info, id_size, prim_bodies)
+    let mut prim_bodies: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
+    prim_bodies.insert(value_addr, (body, prim_type));
+    extract_string_content_with_body(&fields, class_info, id_size, &prim_bodies)
 }
 
 /// Read a boolean field by name, walking the class hierarchy.
@@ -3247,7 +3817,7 @@ fn read_all_fields(
     id_bytes: usize,
     class_by_address: &HashMap<u64, u32>,
     all_classes: &[JavaClassInfo],
-    object_to_class_idx: &HashMap<u64, u32>,
+    heap: &HeapDump,
 ) -> Vec<(String, FieldValue)> {
     let mut result = Vec::new();
     let mut current_class_id: Option<u64> = Some(class_info.class_object_id);
@@ -3270,9 +3840,8 @@ fn read_all_fields(
                         if ref_id == 0 {
                             result.push((field_name, FieldValue::Reference(None)));
                         } else {
-                            let class_name = object_to_class_idx
-                                .get(&ref_id)
-                                .and_then(|&idx| all_classes.get(idx as usize))
+                            let class_name = heap.class_idx_of(ref_id)
+                                .and_then(|idx| all_classes.get(idx as usize))
                                 .map(|c| c.name.replace('/', "."));
                             result.push((field_name, FieldValue::Reference(class_name)));
                         }
@@ -3347,7 +3916,7 @@ fn read_all_fields(
 fn read_obj_array_elements(
     elements: &[u8],
     id_bytes: usize,
-    object_to_class_idx: &HashMap<u64, u32>,
+    heap: &HeapDump,
     all_classes: &[JavaClassInfo],
 ) -> Vec<Option<String>> {
     let count = elements.len() / id_bytes;
@@ -3357,9 +3926,9 @@ fn read_obj_array_elements(
         if addr == 0 {
             result.push(None);
         } else {
-            let class_name = object_to_class_idx
-                .get(&addr)
-                .and_then(|&idx| all_classes.get(idx as usize))
+            let class_name = heap
+                .class_idx_of(addr)
+                .and_then(|idx| all_classes.get(idx as usize))
                 .map(|c| c.name.replace('/', "."));
             result.push(class_name);
         }
@@ -3367,86 +3936,59 @@ fn read_obj_array_elements(
     result
 }
 
-/// Read a primitive array into a display string (e.g., "{485, -1, ...}").
-fn read_prim_array_display(arr: &heap_dump::PrimitiveArray) -> String {
+/// Render a primitive array body as a display string (e.g., "{485, -1, ...}").
+fn prim_array_display(body: &[u8], prim_type: PrimitiveArrayType) -> String {
     use std::fmt::Write;
+    let width = prim_type_size(prim_type);
+    let count = if width == 0 { 0 } else { body.len() / width };
     let mut s = String::with_capacity(256);
     s.push('{');
-    match arr.primitive_type() {
-        PrimitiveArrayType::Boolean => {
-            if let Some(iter) = arr.booleans() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    s.push_str(if v { "true" } else { "false" });
+    for i in 0..count {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        if i >= 20 {
+            s.push_str("...");
+            break;
+        }
+        let at = i * width;
+        match prim_type {
+            PrimitiveArrayType::Boolean => {
+                s.push_str(if body[at] != 0 { "true" } else { "false" });
+            }
+            PrimitiveArrayType::Byte => {
+                write!(s, "{}", body[at] as i8).unwrap();
+            }
+            PrimitiveArrayType::Char => {
+                let ch = u16::from_be_bytes([body[at], body[at + 1]]);
+                if ch >= 0x20 && ch < 0x7f {
+                    write!(s, "'{}'", char::from_u32(ch as u32).unwrap_or('?')).unwrap();
+                } else {
+                    write!(s, "\\u{:04x}", ch).unwrap();
                 }
             }
-        }
-        PrimitiveArrayType::Byte => {
-            if let Some(iter) = arr.bytes() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v as i8).unwrap();
-                }
+            PrimitiveArrayType::Short => {
+                write!(s, "{}", i16::from_be_bytes([body[at], body[at + 1]])).unwrap();
             }
-        }
-        PrimitiveArrayType::Char => {
-            if let Some(iter) = arr.chars() {
-                for (i, ch) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    if ch >= 0x20 && ch < 0x7f {
-                        write!(s, "'{}'", char::from_u32(ch as u32).unwrap_or('?')).unwrap();
-                    } else {
-                        write!(s, "\\u{:04x}", ch).unwrap();
-                    }
-                }
+            PrimitiveArrayType::Int => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&body[at..at + 4]);
+                write!(s, "{}", i32::from_be_bytes(b)).unwrap();
             }
-        }
-        PrimitiveArrayType::Short => {
-            if let Some(iter) = arr.shorts() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v).unwrap();
-                }
+            PrimitiveArrayType::Long => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&body[at..at + 8]);
+                write!(s, "{}", i64::from_be_bytes(b)).unwrap();
             }
-        }
-        PrimitiveArrayType::Int => {
-            if let Some(iter) = arr.ints() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v).unwrap();
-                }
+            PrimitiveArrayType::Float => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&body[at..at + 4]);
+                write!(s, "{}", f32::from_bits(u32::from_be_bytes(b))).unwrap();
             }
-        }
-        PrimitiveArrayType::Long => {
-            if let Some(iter) = arr.longs() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v).unwrap();
-                }
-            }
-        }
-        PrimitiveArrayType::Float => {
-            if let Some(iter) = arr.floats() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v).unwrap();
-                }
-            }
-        }
-        PrimitiveArrayType::Double => {
-            if let Some(iter) = arr.doubles() {
-                for (i, v) in iter.filter_map(|r| r.ok()).enumerate() {
-                    if i > 0 { s.push_str(", "); }
-                    if i >= 20 { s.push_str("..."); break; }
-                    write!(s, "{}", v).unwrap();
-                }
+            PrimitiveArrayType::Double => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&body[at..at + 8]);
+                write!(s, "{}", f64::from_bits(u64::from_be_bytes(b))).unwrap();
             }
         }
     }
@@ -3457,28 +3999,18 @@ fn read_prim_array_display(arr: &heap_dump::PrimitiveArray) -> String {
 impl LinearScanCoordinator {
     /// Extract local variable details for a specific thread (OOM thread).
     /// Returns Vec<FrameLocals> keyed by frame depth.
+    ///
+    /// Only the root objects of that thread's frames are read, one body at a time.
     pub fn extract_oom_local_details(
         &self,
         hprof_path: &Path,
         thread_serial: u32,
     ) -> Vec<FrameLocals> {
-        let file = match std::fs::File::open(hprof_path) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
+        let bodies = match AddrBodies::open(&self.heap, hprof_path) {
+            Some(b) => b,
+            None => return Vec::new(),
         };
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        let data = &mmap[..];
-
-        let hprof = match jvm_hprof::parse_hprof(data) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
-
-        let id_size = hprof.header().id_size();
-        let id_bytes: usize = match id_size { IdSize::U32 => 4, IdSize::U64 => 8 };
+        let id_bytes = bodies.id_bytes;
 
         // Build class_object_id -> class_idx
         let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::new();
@@ -3502,67 +4034,7 @@ impl LinearScanCoordinator {
             return Vec::new();
         }
 
-        // Collect all local var addresses we need to resolve
-        let target_addrs: std::collections::HashSet<u64> = frame_objects.values()
-            .flat_map(|v| v.iter().copied())
-            .collect();
-
-        // Single pass: collect instances, object arrays, and primitive arrays for target addresses
-        let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
-        let mut obj_arrays: HashMap<u64, Vec<u8>> = HashMap::new();
-        let mut prim_arrays: HashMap<u64, String> = HashMap::new();
-
-        for record in hprof.records_iter() {
-            let record = match record { Ok(r) => r, Err(_) => continue };
-            match record.tag() {
-                RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
-                    if let Some(Ok(seg)) = record.as_heap_dump_segment() {
-                        for sr in seg.sub_records() {
-                            match sr {
-                                Ok(heap_dump::SubRecord::Instance(inst)) => {
-                                    let obj_id = inst.obj_id().id();
-                                    if target_addrs.contains(&obj_id) {
-                                        let class_idx = class_obj_to_idx
-                                            .get(&inst.class_obj_id().id())
-                                            .copied()
-                                            .unwrap_or(u32::MAX);
-                                        if class_idx < self.heap.classes.len() as u32 {
-                                            instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
-                                        }
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
-                                    let obj_id = arr.obj_id().id();
-                                    if target_addrs.contains(&obj_id) {
-                                        let mut elems = Vec::new();
-                                        for r in arr.elements(id_size) {
-                                            let id_opt = match r { Ok(o) => o, Err(_) => None };
-                                            let val = id_opt.map(|id| id.id()).unwrap_or(0);
-                                            if id_bytes == 8 {
-                                                elems.extend_from_slice(&val.to_be_bytes());
-                                            } else {
-                                                elems.extend_from_slice(&(val as u32).to_be_bytes());
-                                            }
-                                        }
-                                        obj_arrays.insert(obj_id, elems);
-                                    }
-                                }
-                                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
-                                    let obj_id = arr.obj_id().id();
-                                    if target_addrs.contains(&obj_id) {
-                                        prim_arrays.insert(obj_id, read_prim_array_display(&arr));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Build FrameLocals for each frame depth
+        // Build FrameLocals for each frame depth, reading each local by address.
         let mut frame_locals: Vec<FrameLocals> = Vec::new();
         let mut frame_keys: Vec<u32> = frame_objects.keys().copied().collect();
         frame_keys.sort();
@@ -3572,58 +4044,73 @@ impl LinearScanCoordinator {
             let mut objects = Vec::new();
 
             for &addr in addrs {
-                // Check if it's an instance, object array, or primitive array
-                if let Some(display) = prim_arrays.get(&addr) {
-                    let class_name = self.heap.object_to_class_idx
-                        .get(&addr)
-                        .and_then(|&idx| self.heap.classes.get(idx as usize))
-                        .map(|c| c.name.replace('/', "."))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    objects.push(LocalVarDetail {
-                        class_name,
-                        address: addr,
-                        fields: Vec::new(),
-                        array_elements: None,
-                        prim_array_display: Some(display.clone()),
-                    });
-                } else if let Some(elements) = obj_arrays.get(&addr) {
-                    let class_name = self.heap.object_to_class_idx
-                        .get(&addr)
-                        .and_then(|&idx| self.heap.classes.get(idx as usize))
-                        .map(|c| c.name.replace('/', "."))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let elem_class = self.heap.object_to_class_idx
-                        .get(&addr)
-                        .and_then(|&idx| {
-                            // Get element class from the array's class
-                            let arr_class = self.heap.classes.get(idx as usize)?;
-                            // For object arrays, class name is like "java.lang.Object[]"
-                            Some(arr_class.name.replace('/', "."))
-                        })
-                        .unwrap_or_else(|| "Object".to_string());
-                    let elem_refs = read_obj_array_elements(
-                        elements, id_bytes, &self.heap.object_to_class_idx, &self.heap.classes
-                    );
-                    objects.push(LocalVarDetail {
-                        class_name,
-                        address: addr,
-                        fields: Vec::new(),
-                        array_elements: Some((elem_class, elem_refs)),
-                        prim_array_display: None,
-                    });
-                } else if let Some((class_idx, fields)) = instances.get(&addr) {
-                    let class_info = &self.heap.classes[*class_idx as usize];
-                    let class_name = class_info.name.replace('/', ".");
-                    let field_values = read_all_fields(
-                        fields, class_info, id_bytes, &class_obj_to_idx, &self.heap.classes, &self.heap.object_to_class_idx
-                    );
-                    objects.push(LocalVarDetail {
-                        class_name,
-                        address: addr,
-                        fields: field_values,
-                        array_elements: None,
-                        prim_array_display: None,
-                    });
+                let body = match bodies.get(addr) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                match body.kind {
+                    DI_KIND_PRIM_ARRAY => {
+                        let prim_type = match PrimitiveArrayType::from_type_code(body.prim_type) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        let display = prim_array_display(&body.bytes, prim_type);
+                        let class_name = self.heap.class_idx_of(addr)
+                            .and_then(|idx| self.heap.classes.get(idx as usize))
+                            .map(|c| c.name.replace('/', "."))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        objects.push(LocalVarDetail {
+                            class_name,
+                            address: addr,
+                            fields: Vec::new(),
+                            array_elements: None,
+                            prim_array_display: Some(display),
+                        });
+                    }
+                    DI_KIND_OBJ_ARRAY => {
+                        let class_name = self.heap.class_idx_of(addr)
+                            .and_then(|idx| self.heap.classes.get(idx as usize))
+                            .map(|c| c.name.replace('/', "."))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let elem_class = self.heap.class_idx_of(addr)
+                            .and_then(|idx| {
+                                // For object arrays, class name is like "java.lang.Object[]"
+                                let arr_class = self.heap.classes.get(idx as usize)?;
+                                Some(arr_class.name.replace('/', "."))
+                            })
+                            .unwrap_or_else(|| "Object".to_string());
+                        let elem_refs = read_obj_array_elements(&body.bytes, id_bytes, &self.heap, &self.heap.classes);
+                        objects.push(LocalVarDetail {
+                            class_name,
+                            address: addr,
+                            fields: Vec::new(),
+                            array_elements: Some((elem_class, elem_refs)),
+                            prim_array_display: None,
+                        });
+                    }
+                    DI_KIND_INSTANCE => {
+                        if (body.class_idx as usize) >= self.heap.classes.len() {
+                            continue;
+                        }
+                        let class_info = &self.heap.classes[body.class_idx as usize];
+                        let class_name = class_info.name.replace('/', ".");
+                        let field_values = read_all_fields(
+                            &body.bytes,
+                            class_info,
+                            id_bytes,
+                            &class_obj_to_idx,
+                            &self.heap.classes,
+                            &self.heap,
+                        );
+                        objects.push(LocalVarDetail {
+                            class_name,
+                            address: addr,
+                            fields: field_values,
+                            array_elements: None,
+                            prim_array_display: None,
+                        });
+                    }
+                    _ => {}
                 }
             }
 
@@ -3700,26 +4187,11 @@ pub fn resolve_field_values(
         return ResolvedValues::default();
     }
 
-    let file = match std::fs::File::open(hprof_path) {
-        Ok(f) => f,
-        Err(_) => return ResolvedValues::default(),
+    let bodies = match AddrBodies::open(heap, hprof_path) {
+        Some(b) => b,
+        None => return ResolvedValues::default(),
     };
-    let mmap = match unsafe { Mmap::map(&file) } {
-        Ok(m) => m,
-        Err(_) => return ResolvedValues::default(),
-    };
-    let data = &mmap[..];
-
-    let hprof = match jvm_hprof::parse_hprof(data) {
-        Ok(h) => h,
-        Err(_) => return ResolvedValues::default(),
-    };
-
-    let id_size = hprof.header().id_size();
-    let id_bytes: usize = match id_size {
-        IdSize::U32 => 4,
-        IdSize::U64 => 8,
-    };
+    let id_bytes = bodies.id_bytes;
 
     // Build class_object_id -> class_idx
     let mut class_obj_to_idx: HashMap<u64, u32> = HashMap::new();
@@ -3731,75 +4203,37 @@ pub fn resolve_field_values(
 
     let string_class_idx = heap.class_by_name.get("java/lang/String").copied();
 
-    // Collect the raw bytes for every requested object in a single pass.
+    // Read the requested objects only, one body at a time.
     let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
     let mut obj_arrays: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut prim_arrays: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
     let mut addr_to_class_idx: HashMap<u64, u32> = HashMap::new();
 
-    for record in hprof.records_iter() {
-        let record = match record {
-            Ok(r) => r,
-            Err(_) => continue,
+    for &addr in obj_addrs {
+        let body = match bodies.get(addr) {
+            Some(b) => b,
+            None => continue,
         };
-        if !matches!(record.tag(), RecordTag::HeapDump | RecordTag::HeapDumpSegment) {
-            continue;
-        }
-        let seg = match record.as_heap_dump_segment() {
-            Some(Ok(s)) => s,
-            _ => continue,
-        };
-        for sr in seg.sub_records() {
-            match sr {
-                Ok(heap_dump::SubRecord::Instance(inst)) => {
-                    let obj_id = inst.obj_id().id();
-                    if !obj_addrs.contains(&obj_id) {
-                        continue;
-                    }
-                    let class_idx = class_obj_to_idx
-                        .get(&inst.class_obj_id().id())
-                        .copied()
-                        .unwrap_or(u32::MAX);
-                    if class_idx < heap.classes.len() as u32 {
-                        instances.insert(obj_id, (class_idx, inst.fields().to_vec()));
-                        addr_to_class_idx.insert(obj_id, class_idx);
-                    }
+        match body.kind {
+            DI_KIND_INSTANCE => {
+                if (body.class_idx as usize) < heap.classes.len() {
+                    instances.insert(addr, (body.class_idx, body.bytes));
+                    addr_to_class_idx.insert(addr, body.class_idx);
                 }
-                Ok(heap_dump::SubRecord::ObjectArray(arr)) => {
-                    let obj_id = arr.obj_id().id();
-                    if !obj_addrs.contains(&obj_id) {
-                        continue;
-                    }
-                    let mut elems = Vec::new();
-                    for r in arr.elements(id_size) {
-                        let val = match r {
-                            Ok(o) => o.map(|id| id.id()).unwrap_or(0),
-                            Err(_) => 0,
-                        };
-                        if id_bytes == 8 {
-                            elems.extend_from_slice(&val.to_be_bytes());
-                        } else {
-                            elems.extend_from_slice(&(val as u32).to_be_bytes());
-                        }
-                    }
-                    obj_arrays.insert(obj_id, elems);
-                    if let Some(&cidx) = class_obj_to_idx.get(&arr.array_class_obj_id().id()) {
-                        addr_to_class_idx.insert(obj_id, cidx);
-                    }
-                }
-                Ok(heap_dump::SubRecord::PrimitiveArray(arr)) => {
-                    let obj_id = arr.obj_id().id();
-                    if !obj_addrs.contains(&obj_id) {
-                        continue;
-                    }
-                    let prim_type = arr.primitive_type();
-                    let body = extract_prim_raw_body(&arr);
-                    if !body.is_empty() {
-                        prim_arrays.insert(obj_id, (body, prim_type));
-                    }
-                }
-                _ => {}
             }
+            DI_KIND_OBJ_ARRAY => {
+                obj_arrays.insert(addr, body.bytes);
+                addr_to_class_idx.insert(addr, body.class_idx);
+            }
+            DI_KIND_PRIM_ARRAY => {
+                // prim_arrays keeps owned bodies: this pass outlives any single read.
+                if !body.bytes.is_empty() {
+                    if let Some(prim_type) = PrimitiveArrayType::from_type_code(body.prim_type) {
+                        prim_arrays.insert(addr, (body.bytes, prim_type));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3850,15 +4284,14 @@ pub fn resolve_field_values(
             .map(|c| c.name.replace('/', "."))
             .unwrap_or_else(|| "Object[]".to_string());
         let elem_class = heap
-            .object_to_class_idx
-            .get(addr)
-            .and_then(|&idx| heap.classes.get(idx as usize))
+            .class_idx_of(*addr)
+            .and_then(|idx| heap.classes.get(idx as usize))
             .map(|c| c.name.replace('/', "."))
             .unwrap_or_else(|| "Object".to_string());
         let elem_refs = read_obj_array_elements(
             elems,
             id_bytes,
-            &heap.object_to_class_idx,
+            heap,
             &heap.classes,
         );
         objects.insert(
@@ -3882,7 +4315,7 @@ pub fn resolve_field_values(
             id_bytes,
             &class_obj_to_idx,
             &heap.classes,
-            &heap.object_to_class_idx,
+            heap,
         );
         objects.insert(
             *addr,

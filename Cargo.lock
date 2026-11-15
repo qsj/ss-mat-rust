@@ -727,6 +727,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "hashbrown",
+ "memmap2",
  "parking_lot",
 ]
 

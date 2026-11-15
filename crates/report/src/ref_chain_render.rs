@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use ss_heap_model::heap_dump::{FieldValue, HeapDump};
 use ss_stats::ref_chain::{ChainStep, ClassRefChains, GcRootTreeNode};
-use ss_stats::traversal_data::{FieldPool, ObjectEntry};
+use ss_stats::traversal_data::{FieldPool, TraversalData};
 use ss_traversal::ResolvedValues;
 
 use crate::html_builder::HtmlStringBuilder;
@@ -180,9 +180,8 @@ pub struct RefChainRenderInput<'a> {
 /// class+field-name paths only (the original behavior).
 pub struct RefChainRenderer<'a> {
     pub heap: &'a HeapDump,
-    pub objects: &'a [ObjectEntry],
-    pub parent: &'a [u32],
-    pub parent_edge: &'a [u32],
+    /// Post-traversal data, queried on demand for object metadata and parents.
+    pub data: &'a TraversalData,
     pub field_pool: &'a FieldPool,
     pub gc_root_set: &'a HashSet<u32>,
     pub resolved_values: Option<&'a ResolvedValues>,
@@ -191,17 +190,13 @@ pub struct RefChainRenderer<'a> {
 impl<'a> RefChainRenderer<'a> {
     pub fn new(
         heap: &'a HeapDump,
-        objects: &'a [ObjectEntry],
-        parent: &'a [u32],
-        parent_edge: &'a [u32],
+        data: &'a TraversalData,
         field_pool: &'a FieldPool,
         gc_root_set: &'a HashSet<u32>,
     ) -> Self {
         Self {
             heap,
-            objects,
-            parent,
-            parent_edge,
+            data,
             field_pool,
             gc_root_set,
             resolved_values: None,
@@ -276,9 +271,10 @@ impl<'a> RefChainRenderer<'a> {
             // Show the problem object's own decoded body (leaf of the chain)
             // so its primitive field values appear as `<t-s>` tags.
             if let Some(rv) = self.resolved_values {
-                let prob_obj = &self.objects[prob.obj_idx as usize];
-                if let Some(dec) = rv.objects.get(&prob_obj.obj_id) {
-                    let body = render_decoded_object_body(dec, prob_obj.obj_id, rv);
+                let prob_obj = self.data.object_at(prob.obj_idx);
+                let prob_id = prob_obj.map(|o| o.obj_id).unwrap_or(0);
+                if let Some(dec) = rv.objects.get(&prob_id) {
+                    let body = render_decoded_object_body(dec, prob_id, rv);
                     if !body.is_empty() {
                         html.push_str(&format!(
                             "<rc_tab3>&nbsp;&nbsp;<t-c>{}</t-c>{}<br></rc_tab3>\n",
@@ -338,13 +334,15 @@ impl<'a> RefChainRenderer<'a> {
         let max_hops = 60;
 
         for _ in 0..max_hops {
-            let p = match self.parent.get(current as usize) {
-                Some(&p) if p != u32::MAX => p,
-                _ => break,
+            let (p, edge_key) = self.data.parent.parent_of(current);
+            if p == u32::MAX {
+                break;
+            }
+            let parent_obj = match self.data.object_at(p) {
+                Some(o) => o,
+                None => break,
             };
-            let parent_obj = &self.objects[p as usize];
             let class_name = get_class_display(parent_obj.class_idx, self.heap);
-            let edge_key = self.parent_edge[current as usize];
             let field_name = self.field_pool.get(edge_key);
             // Match Java's chain rendering: each hop is the path label plus
             // the parent object's decoded body, which carries the primitive

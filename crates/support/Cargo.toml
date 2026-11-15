@@ -7,3 +7,4 @@ edition.workspace = true
 hashbrown = { workspace = true }
 parking_lot = { workspace = true }
 ahash = { workspace = true }
+memmap2 = { workspace = true }

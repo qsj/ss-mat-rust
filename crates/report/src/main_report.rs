@@ -244,12 +244,9 @@ impl MainReportGenerator {
         // for N≤20. For larger N, build a HashSet first.
         let sample_set: std::collections::HashSet<u64> = sample_obj_ids.iter().cloned().collect();
         let mut id_to_idx: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for (idx, obj) in data.objects.iter().enumerate() {
-            if sample_set.contains(&obj.obj_id) {
-                id_to_idx.insert(obj.obj_id, idx as u32);
-                if id_to_idx.len() == sample_set.len() {
-                    break;
-                }
+        for &id in &sample_set {
+            if let Some(rank) = data.rank_of_id(id) {
+                id_to_idx.insert(id, rank);
             }
         }
 
@@ -262,14 +259,15 @@ impl MainReportGenerator {
         // Preserve caller's order; map each obj_id to ProblemObj.
         let problem_objs: Vec<ProblemObj> = sample_obj_ids.iter()
             .filter_map(|id| {
-                id_to_idx.get(id).map(|&idx| {
-                    let obj = &data.objects[idx as usize];
-                    let class_name = self.get_class_display(obj.class_idx);
-                    ProblemObj {
-                        obj_idx: idx,
-                        shallow_bytes: 0,
-                        display: format!("<t-c>{}</t-c>@0x{:x}", class_name, obj.obj_id),
-                    }
+                id_to_idx.get(id).and_then(|&idx| {
+                    data.object_at(idx).map(|obj| {
+                        let class_name = self.get_class_display(obj.class_idx);
+                        ProblemObj {
+                            obj_idx: idx,
+                            shallow_bytes: 0,
+                            display: format!("<t-c>{}</t-c>@0x{:x}", class_name, obj.obj_id),
+                        }
+                    })
                 })
             })
             .take(20)
@@ -286,13 +284,14 @@ impl MainReportGenerator {
         for prob in &problem_objs {
             let mut cur = prob.obj_idx;
             for _ in 0..60 {
-                if let Some(obj) = data.objects.get(cur as usize) {
+                if let Some(obj) = data.object_at(cur) {
                     chain_addrs.insert(obj.obj_id);
                 }
-                match data.parent.get(cur as usize) {
-                    Some(&p) if p != u32::MAX => cur = p,
-                    _ => break,
+                let (p, _) = data.parent.parent_of(cur);
+                if p == u32::MAX {
+                    break;
                 }
+                cur = p;
             }
         }
         let resolved = self.hprof_path.as_ref().and_then(|path| {
@@ -305,9 +304,7 @@ impl MainReportGenerator {
 
         let renderer = crate::ref_chain_render::RefChainRenderer::new(
             &self.heap,
-            &data.objects,
-            &data.parent,
-            &data.parent_edge,
+            data,
             &data.field_pool,
             &gc_root_set,
         );
@@ -1131,11 +1128,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 let guard = self.stats.traversal_data.lock().unwrap();
                 if let Some(data) = guard.as_ref() {
                     if let Some(&class_idx) = self.heap.class_by_name.get("java/lang/ref/Finalizer") {
-                        data.objects.iter()
-                            .filter(|o| o.class_idx == class_idx)
-                            .take(20)
-                            .map(|o| o.obj_id)
-                            .collect()
+                        data.sample_ids_by_class(class_idx, 20)
                     } else {
                         Vec::new()
                     }
@@ -1376,11 +1369,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                     if let Some(data) = guard.as_ref() {
                         let key: &str = lookup.as_str();
                         if let Some(&class_idx) = self.heap.class_by_name.get(key) {
-                            data.objects.iter()
-                                .filter(|o| o.class_idx == class_idx)
-                                .take(20)
-                                .map(|o| o.obj_id)
-                                .collect()
+                            data.sample_ids_by_class(class_idx, 20)
                         } else {
                             Vec::new()
                         }
@@ -1739,11 +1728,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                     let guard = self.stats.traversal_data.lock().unwrap();
                     if let Some(data) = guard.as_ref() {
                         if let Some(&class_idx) = self.heap.class_by_name.get(lookup.as_str()) {
-                            data.objects.iter()
-                                .filter(|o| o.class_idx == class_idx)
-                                .take(20)
-                                .map(|o| o.obj_id)
-                                .collect()
+                            data.sample_ids_by_class(class_idx, 20)
                         } else {
                             Vec::new()
                         }
@@ -1839,11 +1824,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                     if let Some(data) = guard.as_ref() {
                         let key: &str = name.as_ref();
                         if let Some(&class_idx) = self.heap.class_by_name.get(key) {
-                            data.objects.iter()
-                                .filter(|o| o.class_idx == class_idx)
-                                .take(20)
-                                .map(|o| o.obj_id)
-                                .collect()
+                            data.sample_ids_by_class(class_idx, 20)
                         } else {
                             Vec::new()
                         }
@@ -2104,11 +2085,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 let guard = self.stats.traversal_data.lock().unwrap();
                 if let Some(data) = guard.as_ref() {
                     if let Some(&class_idx) = self.heap.class_by_name.get(lookup.as_str()) {
-                        data.objects.iter()
-                            .filter(|o| o.class_idx == class_idx)
-                            .take(20)
-                            .map(|o| o.obj_id)
-                            .collect()
+                        data.sample_ids_by_class(class_idx, 20)
                     } else {
                         Vec::new()
                     }
@@ -2161,11 +2138,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 let guard = self.stats.traversal_data.lock().unwrap();
                 if let Some(data) = guard.as_ref() {
                     if let Some(class_idx) = whm_class_idx {
-                        data.objects.iter()
-                            .filter(|o| o.class_idx == class_idx)
-                            .take(20)
-                            .map(|o| o.obj_id)
-                            .collect()
+                        data.sample_ids_by_class(class_idx, 20)
                     } else {
                         Vec::new()
                     }
@@ -2465,12 +2438,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             };
 
             // Walk parent[] for every visited object, compute chain depth.
-            let mut depths: Vec<u32> = vec![0; data.objects.len()];
+            let mut depths: Vec<u32> = vec![0; data.object_count as usize];
             let mut visited_chain: Vec<u32> = Vec::with_capacity(64);
             let mut long_chains: Vec<(u32, u32)> = Vec::new(); // (depth, obj_idx)
 
-            for (idx, &is_visited) in data.visited.iter().enumerate() {
-                if !is_visited || depths[idx] > 0 {
+            for idx in 0..data.object_count as usize {
+                if !data.visited.get(idx as u32) || depths[idx] > 0 {
                     continue;
                 }
                 visited_chain.clear();
@@ -2489,7 +2462,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                         }
                         break;
                     }
-                    let parent = data.parent[cur];
+                    let parent = data.parent.parent_of(cur as u32).0;
                     if parent == u32::MAX {
                         depths[cur] = 1;
                         for &node in visited_chain.iter().rev() {
@@ -2514,8 +2487,8 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             long_chains.sort_by(|a, b| b.0.cmp(&a.0));
             long_chains.truncate(top_n);
 
-            long_chains.iter().map(|&(depth, obj_idx)| {
-                let obj = &data.objects[obj_idx as usize];
+            long_chains.iter().filter_map(|&(depth, obj_idx)| {
+                let obj = data.object_at(obj_idx)?;
                 let class_name = if (obj.class_idx as usize) < self.heap.classes.len() {
                     self.heap.classes[obj.class_idx as usize].name.replace('/', ".")
                 } else {
@@ -2528,17 +2501,20 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 let mut hops = 0u32;
                 let mut reached_root = true;
                 loop {
-                    let parent = data.parent[current as usize];
+                    let parent = data.parent.parent_of(current).0;
                     if parent == u32::MAX {
                         break;
                     }
-                    let parent_obj = &data.objects[parent as usize];
+                    let parent_obj = match data.object_at(parent) {
+                        Some(o) => o,
+                        None => break,
+                    };
                     let parent_class = if (parent_obj.class_idx as usize) < self.heap.classes.len() {
                         self.heap.classes[parent_obj.class_idx as usize].name.replace('/', ".")
                     } else {
                         "unknown".to_string()
                     };
-                    let edge = data.parent_edge[current as usize];
+                    let edge = data.parent.parent_of(current).1;
                     let field = data.field_pool.get(edge).to_string();
                     path.push((parent_obj.obj_id, parent_class, field));
                     current = parent;
@@ -2548,13 +2524,13 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                         break;
                     }
                 }
-                ChainRow {
+                Some(ChainRow {
                     depth,
                     obj_id: obj.obj_id,
                     class_name,
                     path,
                     reached_root,
-                }
+                })
             }).collect()
         };
 
@@ -2871,16 +2847,10 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         // Build obj_id -> visited lookup. `visited` is parallel to `objects`.
         // Only buffers whose obj_id appears in objects AND is visited count as
         // reachable; anything absent or not visited is unreachable.
-        let mut visited_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (i, obj) in data.objects.iter().enumerate() {
-            if data.visited.get(i).copied().unwrap_or(false) {
-                visited_ids.insert(obj.obj_id);
-            }
-        }
         report
             .buffers
             .iter()
-            .filter(|b| !visited_ids.contains(&b.obj_id))
+            .filter(|b| !data.is_live_id(b.obj_id))
             .map(|b| b.capacity)
             .sum()
     }

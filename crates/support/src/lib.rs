@@ -3,3 +3,7 @@ pub mod chunked_queue;
 pub mod reference_node;
 pub mod probabilistic_sampler;
 pub mod int_histogram;
+pub mod page_window;
+pub mod external_sort;
+pub mod obj_dir;
+pub mod mem_trace;

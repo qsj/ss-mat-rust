@@ -3,6 +3,9 @@ mod flags;
 mod progress;
 
 use anyhow::{Context, Result};
+
+#[global_allocator]
+static GLOBAL_ALLOC: ss_support::mem_trace::CountingAlloc = ss_support::mem_trace::CountingAlloc;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,11 +60,24 @@ fn main() -> Result<()> {
     eprintln!("Report output: {}", report_path.display());
 
     let run_start = Instant::now();
+    ss_support::mem_trace::trace("start");
 
     // Phase 1: Parse HPROF file
     eprintln!("\n=== Phase 1: Parsing HPROF ===");
     let t = Instant::now();
-    let heap = ss_hprof_parser::hprof_wrapper::parse_hprof(heap_dump_path)
+    let temp_root = flags
+        .temp_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("ss-mat-{}", std::process::id())));
+    let workspace = ss_hprof_parser::objdir_build::TempWorkspace::create(&temp_root)
+        .with_context(|| format!("cannot prepare temp dir {}", temp_root.display()))?;
+    let obj_cfg = ss_hprof_parser::objdir_build::ObjDirConfig {
+        temp_dir: workspace.path().to_path_buf(),
+        cache_bytes: (flags.cache_mb.max(1) as usize) << 20,
+        disk_budget_bytes: flags.disk_budget_gb.max(1) << 30,
+    };
+
+    let heap = ss_hprof_parser::hprof_wrapper::parse_hprof_with_config(heap_dump_path, &obj_cfg)
         .map_err(|e| friendly_hprof_error(&e, heap_dump_path))?;
     eprintln!(
         "  Classes: {}, Objects: {}, Roots: {}, Strings: {}",
@@ -71,6 +87,7 @@ fn main() -> Result<()> {
         heap.string_table.len()
     );
     print_elapsed("Phase 1", t.elapsed());
+    ss_support::mem_trace::trace("phase1-parsed");
 
     // Phase 2: Initialize StatsEngine with per-class data
     eprintln!("\n=== Phase 2: Statistics Engine ===");
@@ -145,6 +162,7 @@ fn main() -> Result<()> {
         *ti = thread_info;
     }
     print_elapsed("Phase 3 (linear scan + extraction)", t.elapsed());
+    ss_support::mem_trace::trace("phase3-linear-scan");
 
     // Phase 3b: BFS traversal from GC roots
     eprintln!("\n=== Phase 3b: BFS Traversal ===");
@@ -166,6 +184,7 @@ fn main() -> Result<()> {
     );
     drop(traverser);
     print_elapsed("Phase 3b", t.elapsed());
+    ss_support::mem_trace::trace("phase3b-bfs");
 
     // Opt-in S14 forensics: join the detector's duplicate groups with the
     // final BFS live set. Inert when SS_MAT_DEBUG_DIR is not set.
@@ -229,12 +248,15 @@ fn main() -> Result<()> {
 
     eprintln!("Report written to: {}", report_path.display());
     print_elapsed("Phase 4", t.elapsed());
+    ss_support::mem_trace::trace("phase4-report");
 
     // Print final summary
     if let Some(stats) = Arc::into_inner(stats_arc) {
         stats.print_summary();
     }
 
+    ss_support::mem_trace::trace("end");
+    ss_support::mem_trace::summary();
     eprintln!("\nAnalysis complete. Total time: {:.2}s", run_start.elapsed().as_secs_f64());
     Ok(())
 }

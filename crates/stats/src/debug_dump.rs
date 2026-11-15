@@ -315,13 +315,13 @@ fn timestamp() -> String {
 pub fn live_primitive_array_ids(
     traversal: &crate::traversal_data::TraversalData,
 ) -> HashSet<u64> {
-    traversal
-        .objects
-        .iter()
-        .enumerate()
-        .filter(|(i, o)| o.kind == 1 && traversal.visited[*i])
-        .map(|(_, o)| o.obj_id)
-        .collect()
+    let mut out = HashSet::new();
+    traversal.for_each_in_dump_order(|_dump_rank, addr_rank, entry| {
+        if entry.kind == 1 && traversal.visited.get(addr_rank) {
+            out.insert(entry.obj_id);
+        }
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------

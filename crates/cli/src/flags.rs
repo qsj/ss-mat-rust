@@ -35,11 +35,26 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub xdebug_max_obj_graph_scan_threads: i32,
 
+    // --- Memory and disk budget ---
+    /// Directory for temporary files (default: system temp dir per run)
+    #[arg(long)]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Object-directory page cache size in MB (default: 8)
+    #[arg(long, default_value_t = 8)]
+    pub cache_mb: u64,
+
+    /// Temporary-disk budget in GB, checked before the run starts (default: 4)
+    #[arg(long, default_value_t = 4)]
+    pub disk_budget_gb: u64,
 }
 
 /// Global configuration flags, mirroring Java's Flags class.
 pub struct Flags {
     pub version: &'static str,
+    pub temp_dir: Option<PathBuf>,
+    pub cache_mb: u64,
+    pub disk_budget_gb: u64,
     pub min_trailing_zeroes_percent: f64,
     pub min_sparse_zeroes_percent: f64,
     pub min_unused_hi_bits_percent: f64,
@@ -56,6 +71,9 @@ impl Flags {
 
         Self {
             version: "0.1.0",
+            temp_dir: cli.temp_dir.clone(),
+            cache_mb: cli.cache_mb,
+            disk_budget_gb: cli.disk_budget_gb,
             min_trailing_zeroes_percent: cli.min_trailing_zeroes_percent,
             min_sparse_zeroes_percent: cli.min_sparse_zeroes_percent,
             min_unused_hi_bits_percent: cli.min_unused_hi_bits_percent,
@@ -77,5 +95,8 @@ pub fn print_help() {
     println!("  --min_unused_hi_bits_percent <f64> Min unused high bits % (default: 70.0)");
     println!("  --jvm_flags_file <path>           JVM flags file path");
     println!("  --xdebug_max_obj_graph_scan_threads <int>  Max scan threads (default: auto)");
+    println!("  --temp-dir <path>                 Directory for temporary files");
+    println!("  --cache-mb <n>                    Object-directory page cache in MB (default: 8)");
+    println!("  --disk-budget-gb <n>              Temporary-disk budget in GB (default: 4)");
     println!("  -h, --help                        Print this help");
 }

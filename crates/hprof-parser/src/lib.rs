@@ -5,3 +5,5 @@ pub mod string_table;
 pub mod class_registry;
 pub mod root_collector;
 pub mod error;
+pub mod record_reader;
+pub mod objdir_build;
