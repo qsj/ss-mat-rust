@@ -1,0 +1,17 @@
+accumulator	class	total_instances	unique_count_field_duplicateCount	duplicate_size_bytes
+0	boolean[]	13611	413	240
+0	byte[]	643417	303219	7072
+0	char[]	3346	0	0
+0	short[]	1134	188	3328
+0	int[]	121086	15755	164096
+0	float[]	9	3	48
+0	long[]	4463	1548	96
+0	double[]	17	8	64
+1	boolean[]	13611	0	0
+1	byte[]	643417	0	0
+1	char[]	3346	2099	1744
+1	short[]	1134	0	0
+1	int[]	121086	0	0
+1	float[]	9	0	0
+1	long[]	4463	0	0
+1	double[]	17	0	0

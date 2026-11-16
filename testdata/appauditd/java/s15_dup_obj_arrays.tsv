@@ -1,0 +1,14 @@
+row_kind	entry_index	class_name	class_display_name	instance_count	duplicate_count	wasted_bytes	representative_index	representative_address_hex	group_id	representative_class	representative_body_size	representative_length	report_present	total_duplicate_count	total_group_count	total_waste_bytes
+metric	-1	total_bytes	-	-	400350024	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	instance_total_bytes	-	-	153523152	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	object_array_total_size	-	-	39080580	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	primitive_array_total_size	-	-	203882791	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	dup_threshold	-	-	3964865	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	class_percent_threshold	-	-	400350	-	-	-	-	-	-	-	-	-	-	-
+metric	-1	candidate_class_count	-	-	2	-	-	-	-	-	-	-	-	-	-	-
+obj_array_class	-1	[Ljava.util.concurrent.ConcurrentHashMap$Node;	j.u.concurrent.ConcurrentHashMap$Node[]	11910	9264580	2268505	16	-	-	-	-	-	-	-	-	-
+candidate	-1	[Ljava.util.concurrent.ConcurrentHashMap$Node;	j.u.concurrent.ConcurrentHashMap$Node[]	11910	9264580	2268505	-	-	-	-	-	-	-	-	-	-
+obj_array_class	-1	[Ljava.util.HashMap$Node;	j.u.HashMap$Node[]	101486	8588944	1741292	16	-	-	-	-	-	-	-	-	-
+obj_array_class	-1	[Ljava.lang.Object;	Object[]	162662	9459592	1714250	16	-	-	-	-	-	-	-	-	-
+candidate	-1	[Ljava.lang.Object;	Object[]	162662	9459592	1714250	-	-	-	-	-	-	-	-	-	-
+summary	-1	-	-	-	-	-	-	-	-	-	-	-	0	0	0	0

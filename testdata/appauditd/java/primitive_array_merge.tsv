@@ -1,0 +1,15 @@
+metric	value
+merge	merge_call	primitiveAccumulator.mergeAndBuildReport(charAccumulator)
+merge	prim_accumulator_total_array_count	783737
+merge	char_accumulator_total_array_count	3346
+merge	prim_accumulator_group_map_size	106994
+merge	char_accumulator_group_map_size	284
+merge	prim_accumulator_hash_index_size	214077
+merge	char_accumulator_hash_index_size	1815
+merge	merge_iterated_nodes	8
+merge	merge_group_entries	8
+merge	merge_class_entries	8
+merge	merge_total_waste_bytes	176688
+merge	report_total_duplicate_count_field1	787083
+merge	report_total_group_count_field2	215900
+merge	process_array_calls	787083

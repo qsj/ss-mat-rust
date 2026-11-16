@@ -12,7 +12,7 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 
 测试：`cargo test --workspace`（34 个测试：15 traversal + 9 record_reader + 6 support + 3 parser + 1 objdir）。`SS_MAT_BIG_DUMP=<dump>` 时 ss-hprof-parser 会额外走一遍真实 dump 校验记录走查器。
 
-回归检查：`python3 scripts/parity.py <report.html>`，基线 `scripts/parity_baseline.json` **全部 tolerance=0（严格模式）**；当前 17/17 精确 PASS。`Cargo.lock` 已不再被 `.gitignore` 忽略。S15 已按 Java 两阶段语义复刻（两个真实 dump 均为空报告），`problem_stats.tsv` / `boxed_summary.tsv` / `s8_summary.tsv` / `s15_dup_obj_arrays.tsv` 与 Java 排序后 0 diff。
+回归检查：`python3 scripts/parity.py <report.html>`，基线 `scripts/parity_baseline.json` **全部 tolerance=0（严格模式）**；当前 17/17 精确 PASS。`Cargo.lock` 已不再被 `.gitignore` 忽略。S15 已按 Java 两阶段语义复刻（两个真实 dump 均为空报告），`problem_stats.tsv` / `boxed_summary.tsv` / `s8_summary.tsv` / `s15_dup_obj_arrays.tsv` 与 Java 排序后 0 diff。Java 夹具在 `testdata/<dump>/java/`，用 `python3 scripts/java_parity.py <SS_MAT_DEBUG_DIR> testdata/<dump>/java` 对账；dump 本身（`*.hprof`）不入库，sha256 与复现步骤见 `testdata/README.md`。
 
 取证开关（默认关闭）：`SS_MAT_DEBUG_DIR=<dir>` 输出 roots/objects/S14/S15 TSV，以及 Java 同 schema 的 `problem_stats.tsv` / `s8_summary.tsv` / `s8_groups.tsv` / `boxed_summary.tsv`（S8–S12 聚合）、`s15_dup_obj_arrays.tsv`（S15 汇总/阈值/候选类/class/group 明细）、`bad_collections.tsv`（S9 逐实例），用于和 Java 逐对象/逐类 diff。
 

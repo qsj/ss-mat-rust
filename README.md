@@ -54,27 +54,35 @@ Run `ss-mat --help` for the full list.
 ## Running tests
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-17 unit tests cover array/field size calculations, detection helpers, BFS
-array sizing, and HPROF heap-info parsing (`crates/traversal/src/linear_scan.rs`,
-`crates/traversal/src/heap_traverser.rs`, `crates/hprof-parser/src/heap_info.rs`).
+34 unit/integration tests cover array/field size calculations, detection
+helpers, BFS array sizing, HPROF heap-info parsing, the raw record walker,
+the object directory and the external sorter.
 
 ## Regression check
 
 `scripts/parity.py` extracts the key report metrics and compares them with the
-Java reference values in `scripts/parity_baseline.json`:
+Java reference values in `scripts/parity_baseline.json` (all tolerances 0):
 
 ```bash
 ./target/release/ss-mat task_dump.hprof /tmp/report.html
-python3 scripts/parity.py /tmp/report.html
+python3 scripts/parity.py /tmp/report.html --strict    # 17/17
 ```
 
-The baseline uses the Java report from the same dump. Sections 8/11/12/18 are
-now within tolerance; the remaining expected failures are the live/garbage
-split (static roots), Sections 9/10/14, and the Section 13/16/17 detection
-stubs.
+For the second reference dump (`appauditd`) and for the forensic TSVs, the Java
+ground truth lives in `testdata/`:
+
+```bash
+SS_MAT_DEBUG_DIR=/tmp/rust-appauditd \
+  ./target/release/ss-mat testdata/appauditd/appauditd-20261114.hprof /tmp/appauditd.html
+python3 scripts/java_parity.py /tmp/rust-appauditd testdata/appauditd/java
+```
+
+`testdata/README.md` explains the layout, the dump checksum (the 595 MB dump
+itself is not committed) and the expected numbers.
+
 
 ## Known gaps
 
