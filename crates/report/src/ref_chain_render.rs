@@ -121,22 +121,6 @@ fn html_escape_body(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Build the set of object indices that are themselves GC roots (i.e.,
-/// `root_of[i] == i`). Pass the result to `RefChainRenderer::new` so the
-/// renderer can skip them in `render_problem_list` (they're already shown
-/// in Section 4's root tree).
-pub fn build_gc_root_set(root_of: &[u32]) -> HashSet<u32> {
-    root_of.iter().enumerate()
-        .filter_map(|(idx, &root)| {
-            if root != u32::MAX && root == idx as u32 {
-                Some(idx as u32)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 // ============================================================
 // Public types
 // ============================================================

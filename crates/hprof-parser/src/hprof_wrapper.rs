@@ -400,6 +400,10 @@ fn walk_segment(
 // Builder
 // ---------------------------------------------------------------------------
 
+/// How many of the lowest object addresses the oop-size overlap validation
+/// inspects: it walks the sorted address list and stops at this count.
+const OVERLAP_SAMPLE: usize = 5000;
+
 struct HeapDumpBuilder {
     string_table: HashMap<u64, String>,
     /// Class object id -> class name, from LOAD_CLASS plus the UTF8 table.
@@ -414,7 +418,9 @@ struct HeapDumpBuilder {
     class_by_address: HashMap<u64, u32>,
     /// Synthetic "<type>[]" class index per HPROF basic type code.
     prim_class_idx: [u32; 12],
-    addresses: Vec<u64>,
+    /// The lowest `OVERLAP_SAMPLE` object addresses; the overlap validation
+    /// only ever needs that prefix of the sorted list.
+    smallest_addresses: std::collections::BinaryHeap<u64>,
     gen_counts: [u64; 4],
     heap_info: Option<HeapInfo>,
     object_count: u64,
@@ -437,7 +443,7 @@ impl HeapDumpBuilder {
             classes: Vec::new(),
             class_by_address: HashMap::new(),
             prim_class_idx: [u32::MAX; 12],
-            addresses: Vec::with_capacity(1 << 20),
+            smallest_addresses: std::collections::BinaryHeap::with_capacity(OVERLAP_SAMPLE),
             gen_counts: [0; 4],
             heap_info: None,
             object_count: 0,
@@ -454,6 +460,18 @@ impl HeapDumpBuilder {
         if self.per_class_inst_count.len() < needed {
             self.per_class_inst_count.resize(needed, 0);
             self.per_class_inst_bytes.resize(needed, 0);
+        }
+    }
+
+    /// Keep the lowest `OVERLAP_SAMPLE` addresses in a bounded max-heap.
+    fn note_address(&mut self, addr: u64) {
+        if self.smallest_addresses.len() < OVERLAP_SAMPLE {
+            self.smallest_addresses.push(addr);
+        } else if let Some(&max) = self.smallest_addresses.peek() {
+            if addr < max {
+                self.smallest_addresses.pop();
+                self.smallest_addresses.push(addr);
+            }
         }
     }
 
@@ -541,7 +559,7 @@ impl HeapDumpBuilder {
                 let class_idx = self.resolve_class_index(rec.class_ref);
                 let generation = self.get_generation(rec.addr);
                 self.gen_counts[generation as usize] += 1;
-                self.addresses.push(rec.addr);
+                self.note_address(rec.addr);
                 self.object_count += 1;
                 self.ensure_per_class(class_idx);
                 self.per_class_inst_count[class_idx as usize] += 1;
@@ -557,7 +575,7 @@ impl HeapDumpBuilder {
                 let class_idx = self.resolve_class_index(rec.class_ref);
                 let generation = self.get_generation(rec.addr);
                 self.gen_counts[generation as usize] += 1;
-                self.addresses.push(rec.addr);
+                self.note_address(rec.addr);
                 self.obj_array_count += 1;
                 sink.push(
                     rec.addr,
@@ -573,7 +591,7 @@ impl HeapDumpBuilder {
                 let class_idx = self.prim_class_index(rec.prim_type);
                 let generation = self.get_generation(rec.addr);
                 self.gen_counts[generation as usize] += 1;
-                self.addresses.push(rec.addr);
+                self.note_address(rec.addr);
                 self.prim_array_count += 1;
                 sink.push(
                     rec.addr,
@@ -714,7 +732,7 @@ impl HeapDumpBuilder {
             .unwrap_or(0)
     }
 
-    fn build(self, identifier_size: u8) -> Result<HeapDump> {
+    fn build(mut self, identifier_size: u8) -> Result<HeapDump> {
         let total_objects = self.object_count + self.prim_array_count + self.obj_array_count;
 
         eprintln!(
@@ -804,9 +822,10 @@ impl HeapDumpBuilder {
             thread_serial_map.len()
         );
 
-        // One sort serves both the overlap validation and the final index.
-        let mut sorted_addresses = self.addresses;
-        sorted_addresses.sort_unstable();
+        // The overlap validation is the only consumer of the address list, and it
+        // stops after OVERLAP_SAMPLE entries, so the sorted sample is built here
+        // and dropped with this function instead of living in the HeapDump.
+        let overlap_sample = std::mem::take(&mut self.smallest_addresses).into_sorted_vec();
 
         // Determine oop_size (reference size) and header_size.
         //
@@ -828,14 +847,14 @@ impl HeapDumpBuilder {
             let validate = |hdr_size: u8| -> bool {
                 let mut prev_end: u64 = 0;
                 let mut checked: u32 = 0;
-                for &addr in &sorted_addresses {
+                for &addr in &overlap_sample {
                     if checked > 0 && addr < prev_end {
                         return false; // overlap
                     }
                     let min_size = ((hdr_size as u64 + 8) + 7) & !7;
                     prev_end = addr + min_size;
                     checked += 1;
-                    if checked >= 5000 {
+                    if checked >= OVERLAP_SAMPLE as u32 {
                         break;
                     }
                 }
@@ -871,7 +890,6 @@ impl HeapDumpBuilder {
             header_size,
             per_class_inst_count: self.per_class_inst_count,
             per_class_inst_bytes: self.per_class_inst_bytes,
-            sorted_addresses,
             stack_traces,
             thread_serial_map,
             thread_info: Vec::new(),

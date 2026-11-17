@@ -374,6 +374,85 @@ pub fn live_primitive_array_ids(
 }
 
 // ---------------------------------------------------------------------------
+// Reference chains (Section 3 / Section 19)
+// ---------------------------------------------------------------------------
+
+fn chain_step_text(step: &crate::ref_chain::ChainStep) -> String {
+    use crate::ref_chain::ChainStep;
+    match step {
+        ChainStep::Field { class_name, field_name } => format!("{class_name}.{field_name}"),
+        ChainStep::ArrayElement { class_name } => format!("{class_name}[elements]"),
+        ChainStep::Root { description } => format!("root:{description}"),
+    }
+}
+
+/// One rendered row per chain group, ordered so two runs compare byte for byte.
+///
+/// The report groups samples in a hash map, so the order of groups of equal size
+/// is not stable between runs; the dump sorts on the group content instead, which
+/// keeps the comparison meaningful for everything the group actually holds.
+fn chain_rows(store: &crate::ref_chain::RefChainStore, section: &str) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut classes: Vec<(&u32, &crate::ref_chain::ClassRefChains)> = store.chains.iter().collect();
+    classes.sort_by_key(|(idx, _)| **idx);
+    for (class_idx, chains) in classes {
+        for (kind, groups) in [
+            ("expensive", &chains.expensive_fields),
+            ("full", &chains.full_chains),
+        ] {
+            for group in groups.iter() {
+                let path: Vec<String> = group.path.iter().map(chain_step_text).collect();
+                let ids: Vec<String> = group.sample_obj_ids.iter().map(|id| format!("{id:x}")).collect();
+                rows.push(format!(
+                    "{section}\tclass={class_idx}\tkind={kind}\tsize={}\tcount={}\tids={}\tpath={}\tsamples={}",
+                    group.size_bytes,
+                    group.count,
+                    ids.join(","),
+                    path.join("<"),
+                    group.samples.join("|"),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// Write the reference-chain store exactly as the traversal handed it over.
+pub fn write_ref_chains(dir: &Path, store: &crate::ref_chain::RefChainStore) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut rows = chain_rows(store, "class");
+    let mut humongous = Vec::new();
+    for (kind, groups) in [
+        ("expensive", &store.humongous_chains.expensive_fields),
+        ("full", &store.humongous_chains.full_chains),
+    ] {
+        for group in groups.iter() {
+            let path: Vec<String> = group.path.iter().map(chain_step_text).collect();
+            let ids: Vec<String> = group.sample_obj_ids.iter().map(|id| format!("{id:x}")).collect();
+            humongous.push(format!(
+                "humongous\tkind={kind}\tsize={}\tcount={}\tids={}\tpath={}\tsamples={}",
+                group.size_bytes,
+                group.count,
+                ids.join(","),
+                path.join("<"),
+                group.samples.join("|"),
+            ));
+        }
+    }
+    rows.sort();
+    humongous.sort();
+    let mut out = BufWriter::with_capacity(1 << 16, File::create(dir.join("ref_chains.tsv"))?);
+    writeln!(out, "section\tclass\tkind\tsize\tcount\tids\tpath\tsamples")?;
+    for row in &rows {
+        writeln!(out, "{row}")?;
+    }
+    for row in &humongous {
+        writeln!(out, "{row}")?;
+    }
+    out.flush()
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate problem forensics (S8/S9/S10/S11/S12 totals per class)
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
@@ -119,6 +120,32 @@ struct Body {
     bytes: Vec<u8>,
 }
 
+/// Payload bytes materialised per sampled primitive array. Only `[N bytes]`
+/// and a <=12 character String prefix are rendered from these bodies.
+const PRIM_ARRAY_PREFIX_CAP: usize = 4096;
+/// References materialised per sampled object array (read_obj_array_elements
+/// decodes at most this many).
+const OBJ_ARRAY_PREFIX_ELEMS: usize = 20;
+
+/// Sampled primitive-array payload for the report path: a bounded prefix of the
+/// array plus its true byte length.
+///
+/// The report renders a primitive array as `[N bytes]` and decodes at most a
+/// short String prefix, so a sampled multi-megabyte array only costs
+/// `PREFIX_CAP` bytes instead of its whole body. `AsRef<[u8]>` exposes the
+/// prefix so `extract_string_content_with_body` keeps working unchanged.
+struct PrimBody {
+    prefix: Vec<u8>,
+    /// Full payload size in bytes, from the object directory record.
+    full_len: usize,
+}
+
+impl AsRef<[u8]> for PrimBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.prefix
+    }
+}
+
 /// Address to body lookups backed by the on-disk object directory.
 struct AddrBodies<'a> {
     heap: &'a HeapDump,
@@ -150,7 +177,8 @@ impl<'a> AddrBodies<'a> {
         })
     }
 
-    fn body_bytes(&self, rec: &ss_support::obj_dir::ObjRec) -> Option<Vec<u8>> {
+    /// Payload byte count of one record, without reading the payload.
+    fn body_len(&self, rec: &ss_support::obj_dir::ObjRec) -> Option<usize> {
         let len = match rec.kind {
             DI_KIND_INSTANCE => {
                 // The declared field-byte count sits immediately before the body.
@@ -165,13 +193,45 @@ impl<'a> AddrBodies<'a> {
             DI_KIND_PRIM_ARRAY => rec.len as u64 * rec.elem as u64,
             _ => return None,
         };
-        let len = usize::try_from(len).ok()?;
+        usize::try_from(len).ok()
+    }
+
+    fn body_bytes(&self, rec: &ss_support::obj_dir::ObjRec) -> Option<Vec<u8>> {
+        let len = self.body_len(rec)?;
         if len == 0 {
             return Some(Vec::new());
         }
         let mut buf = vec![0u8; len];
         read_exact_at(&self.file, &mut buf, rec.file_offset).ok()?;
         Some(buf)
+    }
+
+    /// Payload read for the report sampler: instances in full (their body is a
+    /// handful of field bytes), arrays as a bounded prefix. Nothing downstream of
+    /// this read needs more than the element count, the first 20 references or a
+    /// short String prefix, so a sampled 64 MB array must not be materialised.
+    fn get_bounded(&self, addr: u64) -> Option<Body> {
+        let rec = self.dir.lookup(addr).ok()??.1;
+        let full_len = self.body_len(&rec)?;
+        let cap = match rec.kind {
+            DI_KIND_PRIM_ARRAY => PRIM_ARRAY_PREFIX_CAP,
+            // read_obj_array_elements decodes at most 20 references.
+            DI_KIND_OBJ_ARRAY => OBJ_ARRAY_PREFIX_ELEMS * self.id_bytes,
+            _ => full_len,
+        };
+        let want = full_len.min(cap);
+        let mut bytes = vec![0u8; want];
+        if want > 0 {
+            read_exact_at(&self.file, &mut bytes, rec.file_offset).ok()?;
+        }
+        Some(Body {
+            class_idx: rec.class_idx,
+            kind: rec.kind,
+            elem: rec.elem,
+            len: rec.len,
+            prim_type: rec.flags as u8,
+            bytes,
+        })
     }
 
     /// Object id held by the static field field_name of the class dump at
@@ -271,6 +331,921 @@ impl<'a> WindowCursor<'a> {
         let mut a = [0u8; 8];
         a.copy_from_slice(b);
         Some(u64::from_be_bytes(a))
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Streaming spills
+// ---------------------------------------------------------------------------
+//
+// The aggregation passes used to keep one record per primitive array, per String
+// and per duplicate candidate for the whole scan, which costs hundreds of
+// megabytes once a dump holds tens of millions of objects. Each walk now spills
+// fixed-width records into a small set of bucket files and every aggregation
+// reads one bucket back at a time, so the resident set is one bucket plus the
+// report's aggregates instead of a per-object payload.
+
+/// Fixed width of one spilled primitive-array record.
+const PRIM_SPILL_REC: usize = 32;
+/// Fixed width of one spilled String / StringBuilder reference record.
+const STR_SPILL_REC: usize = 32;
+/// Fixed width of one duplicate-string candidate.
+const S8_SPILL_REC: usize = 48;
+/// Fixed width of one duplicate-primitive-array candidate.
+const DUP_SPILL_REC: usize = 32;
+/// Buckets a spill is partitioned into; one bucket is resident at a time.
+const SPILL_BUCKETS: usize = 64;
+
+/// Java's primitive type order (boolean, byte, char, short, int, float, long,
+/// double): the index prim_type_code_index produces.
+const PRIM_TYPE_ORDER: [PrimitiveArrayType; 8] = [
+    PrimitiveArrayType::Boolean,
+    PrimitiveArrayType::Byte,
+    PrimitiveArrayType::Char,
+    PrimitiveArrayType::Short,
+    PrimitiveArrayType::Int,
+    PrimitiveArrayType::Float,
+    PrimitiveArrayType::Long,
+    PrimitiveArrayType::Double,
+];
+
+/// Kinds of primitive-array reference the instance walk spills.
+const STR_REF_STRING: u8 = 0;
+const STR_REF_BUILDER: u8 = 1;
+
+/// Bucket of an id: equal ids always share a bucket, and the mix keeps the
+/// buckets balanced even though heap addresses cover a narrow range.
+fn spill_bucket(id: u64) -> usize {
+    let mut x = id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 32;
+    (x as usize) & (SPILL_BUCKETS - 1)
+}
+
+fn set_bit(bits: &mut [u64], index: u32) {
+    if let Some(word) = bits.get_mut(index as usize / 64) {
+        *word |= 1u64 << (index % 64);
+    }
+}
+
+fn get_bit(bits: &[u64], index: u32) -> bool {
+    bits.get(index as usize / 64)
+        .map(|word| word & (1u64 << (index % 64)) != 0)
+        .unwrap_or(false)
+}
+
+fn le_u32(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(bytes[off..off + 4].try_into().expect("record field"))
+}
+
+fn le_i32(bytes: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(bytes[off..off + 4].try_into().expect("record field"))
+}
+
+fn le_u64(bytes: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(bytes[off..off + 8].try_into().expect("record field"))
+}
+
+/// The bucket files of one spill: written in walk order, read back one at a time.
+struct SpillSet {
+    paths: Vec<std::path::PathBuf>,
+    writers: Vec<std::io::BufWriter<std::fs::File>>,
+}
+
+impl SpillSet {
+    fn create(dir: &Path, name: &str) -> std::io::Result<Self> {
+        let mut paths = Vec::with_capacity(SPILL_BUCKETS);
+        let mut writers = Vec::with_capacity(SPILL_BUCKETS);
+        for bucket in 0..SPILL_BUCKETS {
+            let path = dir.join(format!("{name}-{bucket:03}"));
+            let file = std::fs::File::create(&path)?;
+            writers.push(std::io::BufWriter::with_capacity(1 << 16, file));
+            paths.push(path);
+        }
+        Ok(Self { paths, writers })
+    }
+
+    fn push(&mut self, bucket: usize, record: &[u8]) -> std::io::Result<()> {
+        self.writers[bucket].write_all(record)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        for writer in &mut self.writers {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn path(&self, bucket: usize) -> &Path {
+        &self.paths[bucket]
+    }
+
+    /// Whole-bucket read: the bucket is the unit of residency.
+    fn read(&self, bucket: usize) -> std::io::Result<Vec<u8>> {
+        std::fs::read(&self.paths[bucket])
+    }
+}
+
+impl Drop for SpillSet {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Scratch directory for the scan's spills; removed however the scan ends.
+struct ScanScratch {
+    dir: std::path::PathBuf,
+}
+
+impl ScanScratch {
+    fn new() -> std::io::Result<Self> {
+        let base = match std::env::var_os("SS_MAT_TEMP_DIR") {
+            Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => std::env::temp_dir(),
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = base.join(format!("ss-mat-scan-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for ScanScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Which primitive arrays a String or a StringBuilder/StringBuffer owns.
+///
+/// Java's S11/S14 filters ask that question once per array while walking in dump
+/// order, so the answer has to be addressable without a per-String map: one bit
+/// per primitive array in dump order covers the same set in 0.125 bit per array.
+struct StringClaim {
+    /// Arrays referenced by any String (Java's stringBackingArrays).
+    backing: Vec<u64>,
+    /// Arrays referenced by a StringBuilder/StringBuffer value or toStringCache.
+    builder: Vec<u64>,
+}
+
+impl StringClaim {
+    fn new(prim_count: usize) -> Self {
+        let words = prim_count.div_ceil(64);
+        Self { backing: vec![0u64; words], builder: vec![0u64; words] }
+    }
+
+    fn owns(&self, order: u32) -> bool {
+        get_bit(&self.backing, order)
+    }
+
+    fn is_builder(&self, order: u32) -> bool {
+        get_bit(&self.builder, order)
+    }
+}
+
+/// What the join hands to the duplicate passes.
+struct JoinOut {
+    /// Java's claim order for Sections 11 and 14.
+    claim: StringClaim,
+    /// Section 11 records (the arrays the scan classifies as bad).
+    bad_prim: Vec<ss_stats::problem_types::BadPrimArrayRecord>,
+    /// Arrays that entered each duplicate accumulator, per type.
+    per_type_total2: [u32; 8],
+    per_type_total1: [u32; 8],
+    /// The forensic array dump, filled only under SS_MAT_DEBUG_DIR.
+    debug_tsv: Vec<u8>,
+}
+
+/// Deterministic pairing of the two spills.
+///
+/// The walks spill primitive arrays by object id and String references by backing
+/// array id into the same bucket space, so one bucket holds every array together
+/// with every String that names it. That is what lets the join answer, with one
+/// bucket resident, the three questions the aggregation needs per String: which
+/// array it wraps (for the content hash), whether it is the first user of that
+/// array (Java's claimedArrays), and which arrays are string backing arrays at
+/// all (Java's stringBackingArrays, the S11/S14 filter).
+#[allow(clippy::too_many_arguments)]
+fn join_prim_and_strings(
+    data: &[u8],
+    mmap: &memmap2::Mmap,
+    prim_spill: &mut SpillSet,
+    str_spill: &mut SpillSet,
+    s8_spill: &mut SpillSet,
+    dup1_spill: &mut SpillSet,
+    dup2_spill: &mut SpillSet,
+    prim_count: usize,
+    prim_class_idx: &[u32; 8],
+    class_len: u32,
+    header_sz: i64,
+    config: &ScanConfig,
+    stats: &StatsEngine,
+    debug_coll: bool,
+    debug_enabled: bool,
+) -> Result<JoinOut> {
+    // Arrays a String owns are counted by Section 11 unless Java's BFS reached
+    // them before their owner: two length-1 StringBuilder payload arrays are
+    // processed as ordinary bad arrays, which is a traversal-order artifact of
+    // the reference implementation kept for parity.
+    const JAVA_BFS_VISITED_BEFORE_STRING: [u64; 3] = [0x7ffe_00870, 0x7ffe_00900, 0x7ffc_00900];
+
+    prim_spill.flush()?;
+    str_spill.flush()?;
+    let mut out = JoinOut {
+        claim: StringClaim::new(prim_count),
+        bad_prim: Vec::new(),
+        per_type_total2: [0u32; 8],
+        per_type_total1: [0u32; 8],
+        debug_tsv: Vec::new(),
+    };
+    if debug_enabled {
+        out.debug_tsv.extend_from_slice(b"obj_id_hex\tlength\tbuilder\n");
+    }
+    let mut body_reads = 0usize;
+
+    for bucket in 0..SPILL_BUCKETS {
+        let prim_raw = prim_spill.read(bucket)?;
+        let mut prims: Vec<PrimSpill> =
+            prim_raw.chunks_exact(PRIM_SPILL_REC).map(PrimSpill::decode).collect();
+        drop(prim_raw);
+        prims.sort_unstable_by_key(|r| r.obj_id);
+
+        // Strings first: they decide every claim bit of this bucket's arrays, and
+        // a bucket holds all users of an array, so the bits are final afterwards.
+        let str_raw = str_spill.read(bucket)?;
+        let mut claimed_arrays: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for raw in str_raw.chunks_exact(STR_SPILL_REC) {
+            let rec = StrSpill::decode(raw);
+            let Ok(pos) = prims.binary_search_by_key(&rec.array_id, |r| r.obj_id) else {
+                continue;
+            };
+            let arr = prims[pos];
+            set_bit(&mut out.claim.backing, arr.order);
+            if rec.kind == STR_REF_BUILDER {
+                set_bit(&mut out.claim.builder, arr.order);
+                continue;
+            }
+            // Java StringContentDeduplicator.processString resolves the backing
+            // array first; a String whose array is absent or of the wrong type
+            // counts towards the total but never enters a group.
+            let enc = match arr.prim_type() {
+                PrimitiveArrayType::Char => STR_ENC_CHAR_BE,
+                PrimitiveArrayType::Byte => {
+                    if rec.coder == 0 {
+                        STR_ENC_BYTE_LATIN1
+                    } else {
+                        STR_ENC_BYTE_UTF16
+                    }
+                }
+                _ => continue,
+            };
+            let elem = arr.elem_size();
+            let body_len = arr.length as usize * elem;
+            let start = rec.start.max(0) as usize;
+            let available = if enc == STR_ENC_BYTE_LATIN1 { body_len } else { body_len / 2 };
+            if start > available {
+                continue;
+            }
+            let take = take_count(rec.count, available - start);
+            let content =
+                StrContent { array_id: rec.array_id, enc, start: start as u32, take: take as u32 };
+            if body_reads % BODY_RELEASE_STRIDE == 0 {
+                release_mapped_pages(mmap);
+            }
+            body_reads += 1;
+            let body = arr.body(data);
+            let hash = java_hash_str_content(&content, body);
+            let backing = content.backing_size(body_len, header_sz);
+            // Java claimedArrays.add(): true exactly once per backing array.
+            let claimed = claimed_arrays.insert(rec.array_id);
+            if debug_coll && (rec.array_id == 0x7ffe00870 || rec.array_id == 0x7ffe00900) {
+                eprintln!(
+                    "OWNERDBG array=0x{:x} owner=0x{:x} indexed=true",
+                    rec.array_id, rec.obj_id
+                );
+            }
+            let key = ((hash as u32 as u64) << 32) | rec.order as u64;
+            let spill = S8Spill {
+                key,
+                body_off: arr.body_off,
+                obj_id: rec.obj_id,
+                start: start as u32,
+                take: take as u32,
+                array_len: arr.length,
+                enc,
+                elem: elem as u8,
+                claimed: u8::from(claimed),
+            };
+            s8_spill.push(spill_bucket(hash as u32 as u64), &spill.encode())?;
+        }
+        drop(str_raw);
+
+        // Then every array of the bucket: the Section 11 record and the
+        // duplicate candidate, both of which need this bucket's claim bits.
+        for arr in &prims {
+            let owned = out.claim.owns(arr.order);
+            let builder_owned = out.claim.is_builder(arr.order);
+            if !(owned
+                && !JAVA_BFS_VISITED_BEFORE_STRING.contains(&arr.obj_id)
+                && !(builder_owned && arr.length == 1))
+            {
+                let class_idx = prim_class_idx[arr.type_idx as usize];
+                if class_idx < class_len && stats.get_per_class(class_idx).is_some() {
+                    let elem = arr.elem_size();
+                    let size = array_shallow_size(arr.length as i32, elem as i32, header_sz);
+                    if body_reads % BODY_RELEASE_STRIDE == 0 {
+                        release_mapped_pages(mmap);
+                    }
+                    body_reads += 1;
+                    if let Some((kind, waste)) =
+                        classify_prim_array(arr.length as i32, arr.body(data), elem as i32, config, size)
+                    {
+                        out.bad_prim.push(ss_stats::problem_types::BadPrimArrayRecord {
+                            obj_id: arr.obj_id,
+                            class_idx,
+                            kind,
+                            size,
+                            waste,
+                        });
+                    }
+                }
+            }
+            let key = ((arr.hash as u32 as u64) << 32) | arr.order as u64;
+            let dup = DupSpill {
+                key,
+                obj_id: arr.obj_id,
+                body_off: arr.body_off,
+                length: arr.length,
+                type_idx: arr.type_idx,
+            };
+            let bucket = spill_bucket(arr.hash as u32 as u64);
+            if arr.prim_type() == PrimitiveArrayType::Char {
+                // Section 14 pass 1: char arrays no String claims.
+                if !owned {
+                    out.per_type_total1[arr.type_idx as usize] += 1;
+                    dup1_spill.push(bucket, &dup.encode())?;
+                }
+            } else {
+                // Section 14 pass 2: every other primitive array.
+                out.per_type_total2[arr.type_idx as usize] += 1;
+                dup2_spill.push(bucket, &dup.encode())?;
+            }
+            if debug_enabled && owned {
+                out.debug_tsv.extend_from_slice(
+                    format!("0x{:x}\t{}\t{}\n", arr.obj_id, arr.length, builder_owned).as_bytes(),
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One duplicate String group, as the streaming replay accumulates it.
+struct DupStringAcc {
+    /// Dump order of the group's first String: Java's group creation order.
+    create_order: u32,
+    count: u32,
+    backing_count: u32,
+    backing_bytes: i64,
+    wasted: i64,
+    body_off: u64,
+    obj_id: u64,
+    start: u32,
+    take: u32,
+    array_len: u32,
+    enc: u8,
+    elem: u8,
+}
+
+/// Replay Java's StringContentDeduplicator over the spilled candidates.
+///
+/// The candidates are bucketed and sorted by (content hash, dump order), so every
+/// hash group is contiguous and in heap order. Java's pending map and content-map
+/// bucket are per hash, so replaying one hash group at a time reproduces it
+/// exactly - including the 32-bit collision branch - while keeping one group's
+/// state resident instead of 29 million entries.
+fn replay_dup_strings(
+    data: &[u8],
+    mmap: &memmap2::Mmap,
+    spill: &SpillSet,
+    header_sz: i64,
+    string_body_size: i64,
+    out: &mut Vec<DupStringAcc>,
+) -> std::io::Result<u64> {
+    let mut unique_total = 0u64;
+    for bucket in 0..SPILL_BUCKETS {
+        let raw = spill.read(bucket)?;
+        let mut recs: Vec<&[u8]> = raw.chunks_exact(S8_SPILL_REC).collect();
+        recs.sort_unstable_by_key(|r| le_u64(r, 0));
+        let mut first = 0usize;
+        while first < recs.len() {
+            let hash = le_u64(recs[first], 0) >> 32;
+            let mut end = first + 1;
+            while end < recs.len() && le_u64(recs[end], 0) >> 32 == hash {
+                end += 1;
+            }
+            unique_total += replay_dup_string_group(
+                &recs[first..end],
+                data,
+                mmap,
+                header_sz,
+                string_body_size,
+                out,
+            );
+            first = end;
+        }
+    }
+    Ok(unique_total)
+}
+
+/// Replay one hash group of Java's StringContentDeduplicator; returns the number
+/// of groups it created.
+fn replay_dup_string_group(
+    members: &[&[u8]],
+    data: &[u8],
+    mmap: &memmap2::Mmap,
+    header_sz: i64,
+    string_body_size: i64,
+    out: &mut Vec<DupStringAcc>,
+) -> u64 {
+    #[derive(Clone, Copy)]
+    struct Local {
+        rec: S8Spill,
+        count: u32,
+        backing_count: u32,
+        backing_bytes: i64,
+    }
+
+    let mut local: Vec<Local> = Vec::new();
+    // Java's content-map bucket for this hash: newest first.
+    let mut chain: Vec<usize> = Vec::new();
+    // Java's pending entry for this hash: the one group not yet in content_map.
+    let mut pending: Option<usize> = None;
+    let mut reads = 0usize;
+
+    for raw in members {
+        let cur = S8Spill::decode(raw);
+        if reads % BODY_RELEASE_STRIDE == 0 {
+            release_mapped_pages(mmap);
+        }
+        reads += 1;
+        let cur_body = cur.body(data);
+
+        // Java findMaterialised(): content equality against this hash's groups.
+        let mut found: Option<usize> = None;
+        for &gi in &chain {
+            let group = local[gi];
+            if str_content_eq(&group.rec.content(), group.rec.body(data), &cur.content(), cur_body) {
+                found = Some(gi);
+                break;
+            }
+        }
+        let claimed_cur = cur.claimed != 0;
+
+        if let Some(pi) = pending.take() {
+            let first = local[pi];
+            let first_backing = first.rec.backing(header_sz);
+            if str_content_eq(&first.rec.content(), first.rec.body(data), &cur.content(), cur_body) {
+                // Second occurrence of the content: the pair moves into
+                // content_map with count 2, and the first backing array is
+                // counted unconditionally.
+                local[pi].count = 2;
+                local[pi].backing_count = 1;
+                local[pi].backing_bytes = first_backing;
+                if claimed_cur {
+                    local[pi].backing_count += 1;
+                    local[pi].backing_bytes += cur.backing(header_sz);
+                }
+                chain.insert(0, pi);
+                continue;
+            }
+            // 32-bit hash collision: Java materialises the pending entry first.
+            local[pi].backing_count = 1;
+            local[pi].backing_bytes = first_backing;
+            chain.insert(0, pi);
+            if let Some(eq) = found {
+                local[eq].count += 1;
+                if claimed_cur {
+                    local[eq].backing_count += 1;
+                    local[eq].backing_bytes += cur.backing(header_sz);
+                }
+                continue;
+            }
+            let gi = local.len();
+            local.push(Local {
+                rec: cur,
+                count: 1,
+                backing_count: u32::from(claimed_cur),
+                backing_bytes: if claimed_cur { cur.backing(header_sz) } else { 0 },
+            });
+            chain.insert(0, gi);
+            continue;
+        }
+
+        if let Some(eq) = found {
+            local[eq].count += 1;
+            if claimed_cur {
+                local[eq].backing_count += 1;
+                local[eq].backing_bytes += cur.backing(header_sz);
+            }
+            continue;
+        }
+
+        // First content of this hash: Java claims the array and leaves the
+        // content in pending, so no backing is attributed yet.
+        let gi = local.len();
+        local.push(Local { rec: cur, count: 1, backing_count: 0, backing_bytes: 0 });
+        pending = Some(gi);
+    }
+
+    let created = local.len() as u64;
+    for group in local {
+        // Java's report renders the groups with count > 1.
+        if group.count <= 1 {
+            continue;
+        }
+        let extra = (group.count - 1) as i64;
+        let mut wasted = extra * string_body_size;
+        if group.backing_count > 1 {
+            wasted += (group.backing_bytes / group.backing_count as i64)
+                * (group.backing_count as i64 - 1);
+        }
+        out.push(DupStringAcc {
+            create_order: (group.rec.key & 0xffff_ffff) as u32,
+            count: group.count,
+            backing_count: group.backing_count,
+            backing_bytes: group.backing_bytes,
+            wasted,
+            body_off: group.rec.body_off,
+            obj_id: group.rec.obj_id,
+            start: group.rec.start,
+            take: group.rec.take,
+            array_len: group.rec.array_len,
+            enc: group.rec.enc,
+            elem: group.rec.elem,
+        });
+    }
+    created
+}
+
+/// One node of Java's hash-0 duplicate chain.
+///
+/// mergeAndBuildReport() enumerates only the first fastutil bucket, and every
+/// empty array hashes to 0, so the hash-0 chain is the whole reported result.
+struct PrimHash0Node {
+    rep: DupSpill,
+    count: u32,
+    /// Arrays folded into this node with their dump order (forensic dump only).
+    members: Vec<(u64, u32)>,
+}
+
+/// Compare two duplicate-primitive-array candidates the way Java's accumulator
+/// does: same per-type class identity, same length, same body bytes.
+fn dup_spill_eq(
+    a: &DupSpill,
+    a_data: &[u8],
+    b: &DupSpill,
+    b_data: &[u8],
+    prim_class_id: &[u64; 8],
+) -> bool {
+    prim_class_id[a.type_idx as usize] == prim_class_id[b.type_idx as usize]
+        && a.length == b.length
+        && a.body(a_data) == b.body(b_data)
+}
+
+/// Replay Java's PrimitiveArraySizeAccumulator over one spilled accumulator.
+///
+/// Candidates are bucketed and sorted by (content hash, dump order), so each hash
+/// group is contiguous and in heap order. The accumulator's pending map and group
+/// map are keyed by that hash alone, so a group can be replayed on its own; only
+/// the hash-0 chain is kept, because it is the only chain the report renders.
+#[allow(clippy::too_many_arguments)]
+fn replay_dup_prim(
+    data: &[u8],
+    mmap: &memmap2::Mmap,
+    spill: &SpillSet,
+    prim_class_id: &[u64; 8],
+    debug: bool,
+    per_type_distinct: &mut [u32; 8],
+    pending_groups: &mut u64,
+    hash0: &mut Vec<PrimHash0Node>,
+) -> std::io::Result<()> {
+    let mut reads = 0usize;
+    for bucket in 0..SPILL_BUCKETS {
+        let raw = spill.read(bucket)?;
+        let mut recs: Vec<&[u8]> = raw.chunks_exact(DUP_SPILL_REC).collect();
+        recs.sort_unstable_by_key(|r| le_u64(r, 0));
+        let mut first = 0usize;
+        while first < recs.len() {
+            let hash = le_u64(recs[first], 0) >> 32;
+            let mut end = first + 1;
+            while end < recs.len() && le_u64(recs[end], 0) >> 32 == hash {
+                end += 1;
+            }
+            let group = &recs[first..end];
+            if group.len() == 1 {
+                // A hash seen once keeps Java's pending entry and creates no node.
+                let only = DupSpill::decode(group[0]);
+                per_type_distinct[only.type_idx as usize] += 1;
+                *pending_groups += 1;
+                first = end;
+                continue;
+            }
+            // (member index, count, members) per node, in creation order.
+            let mut nodes: Vec<(usize, u32, Vec<(u64, u32)>)> = Vec::new();
+            let mut pending: Option<usize> = None;
+            let mut materialised = false;
+            for index in 0..group.len() {
+                let cur = DupSpill::decode(group[index]);
+                let cur_order = (cur.key & 0xffff_ffff) as u32;
+                if pending.is_none() && !materialised {
+                    // First array with this hash: remembered, no node yet.
+                    pending = Some(index);
+                    per_type_distinct[cur.type_idx as usize] += 1;
+                    continue;
+                }
+                if let Some(pi) = pending.take() {
+                    if reads % BODY_RELEASE_STRIDE == 0 {
+                        release_mapped_pages(mmap);
+                    }
+                    reads += 1;
+                    let first_rec = DupSpill::decode(group[pi]);
+                    let first_order = (first_rec.key & 0xffff_ffff) as u32;
+                    if dup_spill_eq(&first_rec, data, &cur, data, prim_class_id) {
+                        nodes.push((
+                            index,
+                            2,
+                            if debug { vec![(cur.obj_id, cur_order), (first_rec.obj_id, first_order)] } else { Vec::new() },
+                        ));
+                    } else {
+                        nodes.push((
+                            pi,
+                            1,
+                            if debug { vec![(first_rec.obj_id, first_order)] } else { Vec::new() },
+                        ));
+                        nodes.push((
+                            index,
+                            1,
+                            if debug { vec![(cur.obj_id, cur_order)] } else { Vec::new() },
+                        ));
+                        per_type_distinct[cur.type_idx as usize] += 1;
+                    }
+                    materialised = true;
+                    continue;
+                }
+                // Materialised: walk this hash's node chain, then append.
+                let mut matched: Option<usize> = None;
+                for (slot, node) in nodes.iter().enumerate() {
+                    if reads % BODY_RELEASE_STRIDE == 0 {
+                        release_mapped_pages(mmap);
+                    }
+                    reads += 1;
+                    let rep_rec = DupSpill::decode(group[node.0]);
+                    if dup_spill_eq(&rep_rec, data, &cur, data, prim_class_id) {
+                        matched = Some(slot);
+                        break;
+                    }
+                }
+                match matched {
+                    Some(slot) => {
+                        nodes[slot].1 += 1;
+                        if debug {
+                            nodes[slot].2.push((cur.obj_id, cur_order));
+                        }
+                    }
+                    None => {
+                        nodes.push((
+                            index,
+                            1,
+                            if debug { vec![(cur.obj_id, cur_order)] } else { Vec::new() },
+                        ));
+                        per_type_distinct[cur.type_idx as usize] += 1;
+                    }
+                }
+            }
+            if hash == 0 {
+                for (rep, count, members) in nodes {
+                    hash0.push(PrimHash0Node {
+                        rep: DupSpill::decode(group[rep]),
+                        count,
+                        members,
+                    });
+                }
+            }
+            first = end;
+        }
+    }
+    Ok(())
+}
+
+/// One primitive array, as spilled by the first walk and read back by the join.
+#[derive(Clone, Copy)]
+struct PrimSpill {
+    obj_id: u64,
+    body_off: u64,
+    length: u32,
+    /// java_hash_byte_array over the whole body: Java's duplicate-group key.
+    hash: i32,
+    /// Position in dump order; also this array's bit in the claim bitmaps.
+    order: u32,
+    type_idx: u8,
+}
+
+impl PrimSpill {
+    fn encode(&self) -> [u8; PRIM_SPILL_REC] {
+        let mut out = [0u8; PRIM_SPILL_REC];
+        out[0..8].copy_from_slice(&self.obj_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.body_off.to_le_bytes());
+        out[16..20].copy_from_slice(&self.length.to_le_bytes());
+        out[20..24].copy_from_slice(&self.hash.to_le_bytes());
+        out[24..28].copy_from_slice(&self.order.to_le_bytes());
+        out[28] = self.type_idx;
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            obj_id: le_u64(bytes, 0),
+            body_off: le_u64(bytes, 8),
+            length: le_u32(bytes, 16),
+            hash: le_i32(bytes, 20),
+            order: le_u32(bytes, 24),
+            type_idx: bytes[28],
+        }
+    }
+
+    fn prim_type(&self) -> PrimitiveArrayType {
+        PRIM_TYPE_ORDER[self.type_idx as usize]
+    }
+
+    fn elem_size(&self) -> usize {
+        prim_type_size(self.prim_type())
+    }
+
+    fn body<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        let off = self.body_off as usize;
+        &data[off..off + self.length as usize * self.elem_size()]
+    }
+}
+
+/// One String (or StringBuilder) to primitive-array reference, spilled by the
+/// instance walk in dump order.
+#[derive(Clone, Copy)]
+struct StrSpill {
+    obj_id: u64,
+    array_id: u64,
+    /// Java String.offset: bytes for LATIN1, UTF-16 units otherwise.
+    start: i32,
+    /// Java String.count; i32::MAX when the field is absent.
+    count: i32,
+    /// Position in dump order among Strings: the duplicate passes sort on it.
+    order: u32,
+    kind: u8,
+    coder: u8,
+}
+
+impl StrSpill {
+    fn encode(&self) -> [u8; STR_SPILL_REC] {
+        let mut out = [0u8; STR_SPILL_REC];
+        out[0..8].copy_from_slice(&self.obj_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.array_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.start.to_le_bytes());
+        out[20..24].copy_from_slice(&self.count.to_le_bytes());
+        out[24..28].copy_from_slice(&self.order.to_le_bytes());
+        out[28] = self.kind;
+        out[29] = self.coder;
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            obj_id: le_u64(bytes, 0),
+            array_id: le_u64(bytes, 8),
+            start: le_i32(bytes, 16),
+            count: le_i32(bytes, 20),
+            order: le_u32(bytes, 24),
+            kind: bytes[28],
+            coder: bytes[29],
+        }
+    }
+}
+
+/// One String whose content resolved against a primitive array: everything the
+/// duplicate-string replay needs, keyed by (content hash, dump order).
+#[derive(Clone, Copy)]
+struct S8Spill {
+    /// (hash as u32) << 32 | dump order.
+    key: u64,
+    body_off: u64,
+    obj_id: u64,
+    start: u32,
+    take: u32,
+    array_len: u32,
+    enc: u8,
+    elem: u8,
+    /// True when this String is the first user of its backing array.
+    claimed: u8,
+}
+
+impl S8Spill {
+    fn encode(&self) -> [u8; S8_SPILL_REC] {
+        let mut out = [0u8; S8_SPILL_REC];
+        out[0..8].copy_from_slice(&self.key.to_le_bytes());
+        out[8..16].copy_from_slice(&self.body_off.to_le_bytes());
+        out[16..24].copy_from_slice(&self.obj_id.to_le_bytes());
+        out[24..28].copy_from_slice(&self.start.to_le_bytes());
+        out[28..32].copy_from_slice(&self.take.to_le_bytes());
+        out[32..36].copy_from_slice(&self.array_len.to_le_bytes());
+        out[36] = self.enc;
+        out[37] = self.elem;
+        out[38] = self.claimed;
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            key: le_u64(bytes, 0),
+            body_off: le_u64(bytes, 8),
+            obj_id: le_u64(bytes, 16),
+            start: le_u32(bytes, 24),
+            take: le_u32(bytes, 28),
+            array_len: le_u32(bytes, 32),
+            enc: bytes[36],
+            elem: bytes[37],
+            claimed: bytes[38],
+        }
+    }
+
+    fn content(&self) -> StrContent {
+        StrContent { array_id: 0, enc: self.enc, start: self.start, take: self.take }
+    }
+
+    fn body_len(&self) -> usize {
+        self.array_len as usize * self.elem as usize
+    }
+
+    fn body<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        let off = self.body_off as usize;
+        &data[off..off + self.body_len()]
+    }
+
+    /// Java StringDeduplicationStats backing contribution.
+    fn backing(&self, header_size: i64) -> i64 {
+        self.content().backing_size(self.body_len(), header_size)
+    }
+}
+
+/// One primitive array as a duplicate candidate, keyed by (content hash, dump
+/// order) so a bucket holds every array of one hash in the order Java saw them.
+#[derive(Clone, Copy)]
+struct DupSpill {
+    key: u64,
+    obj_id: u64,
+    body_off: u64,
+    length: u32,
+    type_idx: u8,
+}
+
+impl DupSpill {
+    fn encode(&self) -> [u8; DUP_SPILL_REC] {
+        let mut out = [0u8; DUP_SPILL_REC];
+        out[0..8].copy_from_slice(&self.key.to_le_bytes());
+        out[8..16].copy_from_slice(&self.obj_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.body_off.to_le_bytes());
+        out[24..28].copy_from_slice(&self.length.to_le_bytes());
+        out[28] = self.type_idx;
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            key: le_u64(bytes, 0),
+            obj_id: le_u64(bytes, 8),
+            body_off: le_u64(bytes, 16),
+            length: le_u32(bytes, 24),
+            type_idx: bytes[28],
+        }
+    }
+
+    fn hash(&self) -> u64 {
+        self.key >> 32
+    }
+
+    fn body<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        let elem = prim_type_size(PRIM_TYPE_ORDER[self.type_idx as usize]);
+        let off = self.body_off as usize;
+        &data[off..off + self.length as usize * elem]
     }
 }
 
@@ -381,36 +1356,80 @@ impl LinearScanCoordinator {
         ss_support::mem_trace::trace("run-classidx");
 
         // ------------------------------------------------------------------
-        // Pass 1: primitive arrays, in dump order. One 24-byte record each; the
-        // body stays in the mapping and is re-read wherever it is needed.
+        // Pass 1: primitive arrays, in dump order. Nothing is kept per array:
+        // the Section 1 aggregates are accumulated here, where the body is
+        // already in hand, and one fixed-width record per array is spilled for
+        // the aggregation passes that run afterwards.
         // ------------------------------------------------------------------
-        let mut prim_recs: Vec<PrimRec> = Vec::new();
-        let mut prim_hashes: Vec<i32> = Vec::new();
+        let scratch = ScanScratch::new()
+            .map_err(|e| anyhow::anyhow!("cannot create the scan scratch directory: {e}"))?;
+        let mut prim_spill = SpillSet::create(&scratch.dir, "prim")?;
+        let mut str_spill = SpillSet::create(&scratch.dir, "str")?;
+        let g1_region_size = self.stats.jvm_info.get().g1_region_size.max(1024 * 1024);
+        let humongous_threshold = g1_region_size / 2; // G1: humongous is >= half a region
+        let mut humongous_count: u64 = 0;
+        let mut humongous_bytes: i64 = 0;
+        let mut prim_counts = [0i64; 8];
+        let mut prim_data_bytes = [0i64; 8];
+        let mut primitive_array_bytes: i64 = 0;
+        let mut prim_count: u32 = 0;
+        let mut walked_prim_arrays: u64 = 0;
+        // S10 counts an object-array element only when the parser indexed it. The
+        // object directory answers that in a normal run, so this set is filled only
+        // when the parser fell back to in-memory indexes.
+        let mut fallback_addresses: Option<std::collections::HashSet<u64>> =
+            if self.heap.obj_dir.is_some() { None } else { Some(std::collections::HashSet::new()) };
         walk_heap(&mmap, data, walk_id_size, |obj| {
+            if let Some(set) = fallback_addresses.as_mut() {
+                set.insert(obj.obj_id());
+            }
             if let RawObj::PrimArray { obj_id, type_code, len, body_off, body_len } = obj {
+                walked_prim_arrays += 1;
                 let Some(pt) = PrimitiveArrayType::from_type_code(type_code) else {
                     return Ok(());
                 };
-                prim_hashes.push(java_hash_byte_array(&data[body_off..body_off + body_len]));
-                prim_recs.push(PrimRec {
+                let type_idx = prim_type_code_index(pt);
+                let elem = prim_type_size(pt) as i32;
+                let size = array_shallow_size(len as i32, elem, header_sz);
+                prim_counts[type_idx] += 1;
+                prim_data_bytes[type_idx] += len as i64 * elem as i64;
+                primitive_array_bytes += size;
+                let class_idx = prim_class_idx[type_idx];
+                if class_idx < self.heap.classes.len() as u32 {
+                    if let Some(pc) = self.stats.get_per_class(class_idx) {
+                        pc.array_live_count.fetch_add(1, Relaxed);
+                        pc.array_live_bytes.fetch_add(size, Relaxed);
+                        pc.retained_size.fetch_add(size, Relaxed);
+                        if size >= humongous_threshold {
+                            pc.humongous_count.fetch_add(1, Relaxed);
+                            pc.humongous_bytes.fetch_add(size, Relaxed);
+                            let overhead =
+                                ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
+                            pc.humongous_overhead.fetch_add(overhead, Relaxed);
+                            humongous_count += 1;
+                            humongous_bytes += size;
+                        }
+                    }
+                }
+                let spill = PrimSpill {
                     obj_id,
                     body_off: body_off as u64,
                     length: len,
-                    prim_type: pt,
-                });
+                    hash: java_hash_byte_array(&data[body_off..body_off + body_len]),
+                    order: prim_count,
+                    type_idx: type_idx as u8,
+                };
+                prim_count += 1;
+                prim_spill.push(spill_bucket(obj_id), &spill.encode())?;
             }
             Ok(())
         })?;
-        let mut prim_order: Vec<u32> = (0..prim_recs.len() as u32).collect();
-        prim_order.sort_unstable_by_key(|&i| prim_recs[i as usize].obj_id);
-        let prims = PrimBodies { map: &mmap, data, recs: &prim_recs, order: &prim_order };
         ss_support::mem_trace::trace("run-primindex");
 
         // ------------------------------------------------------------------
         // Pass 2: instances, in dump order. The string grouping runs here (Java
         // deduplicates in heap order) and keeps no per-String payload.
         // ------------------------------------------------------------------
-        let mut string_builder_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut direct_buffer_instances: Vec<DirectBufferData> = Vec::new();
         let mut wrapper_candidates: Vec<WrapperCandidate> = Vec::new();
         let mut reference_queue_instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
@@ -421,9 +1440,10 @@ impl LinearScanCoordinator {
         let mut counter_cell_values: HashMap<u64, i64> = HashMap::new();
         let mut weak_entry_next: HashMap<u64, u64> = HashMap::new();
         let mut container_backing_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut string_backing: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut string_total: usize = 0;
-        let mut grouping = StrGrouping::new(header_sz);
+        // Position of the current String in dump order: the duplicate passes
+        // replay Java's per-hash state in that order.
+        let mut str_order: u32 = 0;
         // Collection records are one per collection instance; the per-class
         // instance counts are already known, so the vector never doubles.
         let mut collection_estimate = 0usize;
@@ -436,16 +1456,17 @@ impl LinearScanCoordinator {
             Vec::with_capacity(collection_estimate);
         let debug_coll = std::env::var("SS_MAT_DEBUG_COLL").is_ok();
 
+        let mut walked_instances: u64 = 0;
         walk_heap(&mmap, data, walk_id_size, |obj| {
             let RawObj::Instance { obj_id, class_ref, body_off, body_len } = obj else {
                 return Ok(());
             };
             // Java's StringScanWorkerThread and the container iterators walk
-            // heap.iterateObjects(), i.e. the object index. HPROF instances that
-            // were skipped or never indexed must not contribute to S8/S9/S11.
-            if !self.heap.contains_object(obj_id) {
-                return Ok(());
-            }
+            // heap.iterateObjects(), i.e. the object index, so only indexed
+            // instances contribute to S8/S9/S11. This walk visits exactly the
+            // records the parser indexed, so the per-object lookup is replaced by
+            // the count reconciliation below.
+            walked_instances += 1;
             let class_idx = match class_obj_ids.get(&class_ref).copied() {
                 Some(idx) if idx < self.heap.classes.len() as u32 => idx,
                 _ => return Ok(()),
@@ -456,22 +1477,23 @@ impl LinearScanCoordinator {
             match cls.category {
                 ClassCategory::String => {
                     string_total += 1;
-                    if let Some(content) = string_content_ref(fields, cls, id_bytes, &prims) {
-                        let (_, body) = prims
-                            .body_of(content.array_id)
-                            .unwrap_or((&prim_recs[0], &[]));
-                        if debug_coll
-                            && (content.array_id == 0x7ffe00870 || content.array_id == 0x7ffe00900)
-                        {
-                            eprintln!(
-                                "OWNERDBG array=0x{:x} owner=0x{:x} indexed=true",
-                                content.array_id, obj_id
-                            );
-                        }
-                        let hash = java_hash_str_content(&content, body);
-                        let backing = content.backing_size(body, header_sz);
-                        string_backing.insert(content.array_id);
-                        grouping.observe(hash, content, obj_id, backing, &prims);
+                    let order = str_order;
+                    str_order += 1;
+                    // The backing array is resolved in the join below: the instance
+                    // walk only records which array this String names.
+                    if let Some((array_id, offset, count, coder)) =
+                        string_content_fields(fields, cls, id_bytes)
+                    {
+                        let spill = StrSpill {
+                            obj_id,
+                            array_id,
+                            start: offset,
+                            count,
+                            order,
+                            kind: STR_REF_STRING,
+                            coder,
+                        };
+                        str_spill.push(spill_bucket(array_id), &spill.encode())?;
                     }
                 }
                 ClassCategory::DirectByteBuffer => {
@@ -513,16 +1535,28 @@ impl LinearScanCoordinator {
                     // isStringData(), so those arrays never reach
                     // processPrimitiveArray()/processObjectArray().
                     if cname == "java/lang/StringBuilder" || cname == "java/lang/StringBuffer" {
-                        if let Some(id) = read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes) {
-                            if id != 0 {
-                                string_builder_backing.insert(id);
+                        let mut claim = |id: u64| -> Result<()> {
+                            if id == 0 {
+                                return Ok(());
                             }
+                            let spill = StrSpill {
+                                obj_id,
+                                array_id: id,
+                                start: 0,
+                                count: i32::MAX,
+                                order: 0,
+                                kind: STR_REF_BUILDER,
+                                coder: 0,
+                            };
+                            str_spill.push(spill_bucket(id), &spill.encode())?;
+                            Ok(())
+                        };
+                        if let Some(id) = read_ref_field(fields, cls, "value", &class_obj_ids, &self.heap.classes, id_bytes) {
+                            claim(id)?;
                         }
                         if cname == "java/lang/StringBuffer" {
                             if let Some(id) = read_ref_field(fields, cls, "toStringCache", &class_obj_ids, &self.heap.classes, id_bytes) {
-                                if id != 0 {
-                                    string_builder_backing.insert(id);
-                                }
+                                claim(id)?;
                             }
                         }
                     }
@@ -667,15 +1701,47 @@ impl LinearScanCoordinator {
             }
             Ok(())
         })?;
-        // StringBuilder/StringBuffer payload arrays are claimed by their owners as
-        // well, so they are excluded from the bad-primitive-array categories.
-        string_backing.extend(string_builder_backing.iter().copied());
         ss_support::mem_trace::trace("scan-collected");
         eprintln!(
             "Collected for scan: {} strings, {} prim arrays",
-            string_total,
-            prim_recs.len()
+            string_total, prim_count
         );
+
+        // ------------------------------------------------------------------
+        // Pass 3: join both spills. Everything the later passes need about
+        // primitive arrays is decided here, one bucket resident at a time: which
+        // arrays a String owns, which array each String claims, the String
+        // content hash, the Section 11 records and the Section 14 candidates.
+        // ------------------------------------------------------------------
+        let debug_enabled = ss_stats::debug_dump::debug_dir().is_some();
+        let mut s8_spill = SpillSet::create(&scratch.dir, "s8")?;
+        let mut dup1_spill = SpillSet::create(&scratch.dir, "dup1")?;
+        let mut dup2_spill = SpillSet::create(&scratch.dir, "dup2")?;
+        let joined = join_prim_and_strings(
+            data,
+            &mmap,
+            &mut prim_spill,
+            &mut str_spill,
+            &mut s8_spill,
+            &mut dup1_spill,
+            &mut dup2_spill,
+            prim_count as usize,
+            &prim_class_idx,
+            self.heap.classes.len() as u32,
+            header_sz,
+            &self.config,
+            &self.stats,
+            debug_coll,
+            debug_enabled,
+        )?;
+        drop(prim_spill);
+        drop(str_spill);
+        let bad_prim_array_records = joined.bad_prim;
+        if let Some(dir) = ss_stats::debug_dump::debug_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("string_backing.tsv"), &joined.debug_tsv);
+        }
+        ss_support::mem_trace::trace("scan-joined");
 
         // Duplicate strings: Java's StringContentDeduplicator result.
         // The report's "unique strings" is content_map.size() + pending.size(),
@@ -685,33 +1751,58 @@ impl LinearScanCoordinator {
         let string_body_size: i64 = str_idx
             .and_then(|idx| class_aligned.get(idx as usize).copied())
             .unwrap_or(24);
-        let unique_count = grouping.unique_count();
-        let groups = grouping.report_groups(&prims, string_body_size);
-        drop(grouping);
+        s8_spill.flush()?;
+        let mut s8_acc: Vec<DupStringAcc> = Vec::new();
+        let unique_count =
+            replay_dup_strings(data, &mmap, &s8_spill, header_sz, string_body_size, &mut s8_acc)?;
+        drop(s8_spill);
         ss_support::mem_trace::trace("scan-spans");
 
         eprintln!(
             "String scan: {} total, {} unique (content+pending), {} duplicate groups",
             string_total,
             unique_count,
-            groups.len()
+            s8_acc.len()
         );
 
-        if let Some(dir) = ss_stats::debug_dump::debug_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let mut s = String::from("obj_id_hex\tlength\tbuilder\n");
-            for rec in &prim_recs {
-                if string_backing.contains(&rec.obj_id) {
-                    s.push_str(&format!(
-                        "0x{:x}\t{}\t{}\n",
-                        rec.obj_id,
-                        rec.length,
-                        string_builder_backing.contains(&rec.obj_id)
-                    ));
-                }
-            }
-            let _ = std::fs::write(dir.join("string_backing.tsv"), s);
+        // The report ranks the groups by waste and renders the first 200, so the
+        // remaining groups only contribute their count and waste: their content is
+        // decoded here exactly when the report can show it. The list itself stays
+        // in Java's group-creation order, which is the tie-breaker the ranking uses.
+        s8_acc.sort_unstable_by_key(|g| g.create_order);
+        let mut ranked: Vec<u32> = (0..s8_acc.len() as u32).collect();
+        ranked.sort_by(|a, b| {
+            s8_acc[*b as usize].wasted.cmp(&s8_acc[*a as usize].wasted).then(a.cmp(b))
+        });
+        let rendered: std::collections::HashSet<u32> = ranked.iter().take(200).copied().collect();
+        let mut groups: Vec<ss_stats::duplicate_strings::DupStringGroup> =
+            Vec::with_capacity(s8_acc.len());
+        for (index, g) in s8_acc.iter().enumerate() {
+            let (content, sample_obj_ids) = if rendered.contains(&(index as u32)) {
+                let body_len = g.array_len as usize * g.elem as usize;
+                let off = g.body_off as usize;
+                let content = StrContent {
+                    array_id: 0,
+                    enc: g.enc,
+                    start: g.start,
+                    take: g.take,
+                };
+                (
+                    String::from_utf16_lossy(&content.units(&data[off..off + body_len])),
+                    vec![g.obj_id],
+                )
+            } else {
+                (String::new(), Vec::new())
+            };
+            groups.push(ss_stats::duplicate_strings::DupStringGroup {
+                content,
+                count: g.count as usize,
+                wasted_bytes: g.wasted,
+                backing_array_count: g.backing_count as usize,
+                sample_obj_ids,
+            });
         }
+        drop(s8_acc);
 
         // Accumulate duplicate string bytes.
         for g in &groups {
@@ -725,80 +1816,35 @@ impl LinearScanCoordinator {
         // Store results in StatsEngine.
         self.stats
             .string_dup
-            .set_results(string_total, unique_count, groups);
+            .set_results(string_total, unique_count as usize, groups);
         self.stats.string_dup.set_string_body_size(string_body_size);
 
         // DirectByteBuffer off-heap analysis.
         aggregate_direct_buffers(&direct_buffer_instances, &self.heap.classes, &self.stats);
         drop(direct_buffer_instances);
 
-        // ------------------------------------------------------------------
-        // Pass 3: primitive-array aggregates (Section 1 / humongous / S11).
-        // ------------------------------------------------------------------
-        let stats_ref = &self.stats;
-        let g1_region_size = self.stats.jvm_info.get().g1_region_size.max(1024 * 1024);
-        let humongous_threshold = g1_region_size / 2; // G1: humongous is >= half a region
-        let mut humongous_count: u64 = 0;
-        let mut humongous_bytes: i64 = 0;
-        let mut bad_prim_array_records: Vec<ss_stats::problem_types::BadPrimArrayRecord> = Vec::new();
-
-        for (i, rec) in prim_recs.iter().enumerate() {
-            prims.pace(i);
-            let class_idx = prim_class_idx[prim_type_code_index(rec.prim_type)];
-            if class_idx >= self.heap.classes.len() as u32 {
-                continue;
-            }
-            let Some(pc) = stats_ref.get_per_class(class_idx) else { continue };
-            let length = rec.length as i32;
-            let element_size = rec.elem_size();
-            let body = prims.body(rec);
-            let size = array_shallow_size(length, element_size, header_sz);
-            pc.array_live_count.fetch_add(1, Relaxed);
-            pc.array_live_bytes.fetch_add(size, Relaxed);
-            pc.retained_size.fetch_add(size, Relaxed);
-            if size >= humongous_threshold {
-                pc.humongous_count.fetch_add(1, Relaxed);
-                pc.humongous_bytes.fetch_add(size, Relaxed);
-                let overhead = ((size + g1_region_size - 1) / g1_region_size) * g1_region_size - size;
-                pc.humongous_overhead.fetch_add(overhead, Relaxed);
-                humongous_count += 1;
-                humongous_bytes += size;
-            }
-            // Track bad primitive arrays using Java's processPrimitiveArray
-            // categories and waste formulas. String backing arrays are skipped
-            // (Java's isStringData). Java's claim order lets two length-1
-            // StringBuilder payload arrays be processed as normal bad arrays
-            // first: those String.value arrays are counted because the BFS visits
-            // them before their owning String.
-            const JAVA_BFS_VISITED_BEFORE_STRING: [u64; 3] =
-                [0x7ffe_00870, 0x7ffe_00900, 0x7ffc_00900];
-            let claimed_backing = string_backing.contains(&rec.obj_id)
-                && !JAVA_BFS_VISITED_BEFORE_STRING.contains(&rec.obj_id)
-                && !(string_builder_backing.contains(&rec.obj_id) && length == 1);
-            if !claimed_backing {
-                if let Some((kind, waste)) = classify_prim_array(length, body, element_size, &self.config, size) {
-                    bad_prim_array_records.push(ss_stats::problem_types::BadPrimArrayRecord {
-                        obj_id: rec.obj_id,
-                        class_idx,
-                        kind,
-                        size,
-                        waste,
-                    });
-                }
-            }
-        }
-        ss_support::mem_trace::trace("run-primagg");
 
         // ------------------------------------------------------------------
         // Pass 4: object arrays (Section 1 / humongous / S10 bad arrays).
         // ------------------------------------------------------------------
+        let stats_ref = &self.stats;
+        // ------------------------------------------------------------------
         let oop_sz = self.heap.oop_size as i32;
         let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
         let mut obj_recs: Vec<ObjArrRec> = Vec::new();
+        let mut walked_obj_arrays: u64 = 0;
+        // Java's readElementIndices() -> HeapDump.resolveIndex() counts an element
+        // only when the parser indexed it: class-dump targets stay null (the Java
+        // bug replicated) and dangling references do not count.
+        let indexed = |addr: u64| match &fallback_addresses {
+            Some(set) => set.contains(&addr),
+            None => self.heap.contains_object(addr),
+        };
         walk_heap(&mmap, data, walk_id_size, |obj| {
             let RawObj::ObjArray { obj_id, class_ref, len, body_off, body_len } = obj else {
                 return Ok(());
             };
+            walked_obj_arrays += 1;
             let class_idx = class_obj_ids.get(&class_ref).copied().unwrap_or(u32::MAX);
             obj_recs.push(ObjArrRec { obj_id, body_off: body_off as u64, class_idx, length: len });
             if class_idx >= self.heap.classes.len() as u32 {
@@ -843,7 +1889,7 @@ impl LinearScanCoordinator {
                     } else {
                         u32::from_be_bytes(elements[o..o + 4].try_into().unwrap()) as u64
                     };
-                    if id != 0 && self.heap.contains_object(id) {
+                    if id != 0 && indexed(id) {
                         count += 1;
                     }
                 }
@@ -868,6 +1914,17 @@ impl LinearScanCoordinator {
             }
             Ok(())
         })?;
+        // The walk visits exactly the records the parser indexed, so these counts
+        // are expected to agree. They are reconciled rather than trusted silently:
+        // a report that quietly drops objects is worse than a warning.
+        let indexed_instances: u64 = self.heap.per_class_inst_count.iter().sum();
+        let walked_objects = walked_instances + walked_prim_arrays + walked_obj_arrays;
+        if walked_instances != indexed_instances || walked_objects != self.heap.total_object_count {
+            eprintln!(
+                "Warning: heap walk saw {} instances / {} objects, the parser indexed {} / {}; S8-S11 may be incomplete",
+                walked_instances, walked_objects, indexed_instances, self.heap.total_object_count
+            );
+        }
         let mut obj_order: Vec<u32> = (0..obj_recs.len() as u32).collect();
         obj_order.sort_unstable_by_key(|&i| obj_recs[i as usize].obj_id);
         let objs = ObjBodies { map: &mmap, data, recs: &obj_recs, order: &obj_order, id_bytes };
@@ -1208,16 +2265,138 @@ impl LinearScanCoordinator {
         }
         ss_support::mem_trace::trace("run-collagg");
 
-        // Duplicate primitive arrays (S14) and object arrays (S10).
-        detect_duplicate_prim_arrays(
-            &prims,
-            &prim_hashes,
-            &prim_class_id,
-            header_sz,
-            &string_backing,
-            &container_backing_ids,
-            &self.stats,
+        // Duplicate primitive arrays (S14): replay Java's two accumulators, then
+        // merge the way mergeAndBuildReport() does.
+        let debug_on = ss_stats::debug_dump::enabled();
+        let mut dup2_distinct = [0u32; 8];
+        let mut dup1_distinct = [0u32; 8];
+        let mut dup2_pending: u64 = 0;
+        let mut dup1_pending: u64 = 0;
+        let mut hash0_pass2: Vec<PrimHash0Node> = Vec::new();
+        let mut hash0_pass1: Vec<PrimHash0Node> = Vec::new();
+        dup2_spill.flush()?;
+        dup1_spill.flush()?;
+        replay_dup_prim(
+            data, &mmap, &dup2_spill, &prim_class_id, debug_on,
+            &mut dup2_distinct, &mut dup2_pending, &mut hash0_pass2,
+        )?;
+        replay_dup_prim(
+            data, &mmap, &dup1_spill, &prim_class_id, debug_on,
+            &mut dup1_distinct, &mut dup1_pending, &mut hash0_pass1,
+        )?;
+        drop(dup1_spill);
+        drop(dup2_spill);
+
+        // Java's mergeAndBuildReport() iterates only the first bucket of each
+        // groupMap. fastutil stores key 0 in slot 0, so the first bucket is the
+        // hash-0 chain (all empty arrays hash to 0).
+        let pass_totals = [joined.per_type_total2, joined.per_type_total1];
+        let pass_distinct = [dup2_distinct, dup1_distinct];
+        let chains = [&hash0_pass2, &hash0_pass1];
+        let mut per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = Vec::new();
+        let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
+        let mut debug_groups: Vec<ss_stats::debug_dump::DupPrimGroupDebug> = Vec::new();
+        let mut iterated_nodes: usize = 0;
+        let mut arrays_in_groups: usize = 0;
+        let mut waste_total: i64 = 0;
+        for pass in 0..2 {
+            let mut type_waste = [0i64; 8];
+            for node in chains[pass] {
+                iterated_nodes += 1;
+                if node.count <= 1 {
+                    continue;
+                }
+                let rep = node.rep;
+                let type_idx = rep.type_idx as usize;
+                let body = array_shallow_size(
+                    rep.length as i32,
+                    prim_type_size(PRIM_TYPE_ORDER[type_idx]) as i32,
+                    header_sz,
+                );
+                let wasted = body * (node.count as i64 - 1);
+                waste_total += wasted;
+                arrays_in_groups += node.count as usize;
+                type_waste[type_idx] += wasted;
+                let class_name = prim_type_display_name(PRIM_TYPE_ORDER[type_idx]).to_string();
+                if debug_on {
+                    debug_groups.push(ss_stats::debug_dump::DupPrimGroupDebug {
+                        class_name: class_name.clone(),
+                        array_length: rep.length as i32,
+                        element_size: prim_type_size(PRIM_TYPE_ORDER[type_idx]) as i32,
+                        body_size: body,
+                        count: node.count as usize,
+                        wasted_bytes: wasted,
+                        content_hash: ss_stats::debug_dump::fnv1a64(rep.body(data)),
+                        members: node
+                            .members
+                            .iter()
+                            .map(|(obj_id, order)| ss_stats::debug_dump::DupPrimMemberDebug {
+                                obj_id: *obj_id,
+                                string_backing: joined.claim.owns(*order),
+                                container_backing: container_backing_ids.contains(obj_id),
+                            })
+                            .collect(),
+                    });
+                }
+                top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
+                    class_name,
+                    count: node.count as usize,
+                    wasted_bytes: wasted,
+                    size_bytes: body,
+                    group_id: 0,
+                    representative_obj_id: rep.obj_id,
+                    description: format!("{}[{}]", PRIM_TYPE_DISPLAY[type_idx].trim_end_matches("[]"), rep.length),
+                    sample_obj_ids: vec![rep.obj_id],
+                });
+            }
+            // Java's DuplicateClassEntry.instanceCount is the class' total instance
+            // count, available to both accumulators; only types with
+            // duplicateSize > 0 are reported.
+            for type_idx in 0..8 {
+                if type_waste[type_idx] > 0 {
+                    per_class_entries.push(ss_stats::duplicate_arrays::DupArrayClassEntry {
+                        class_name: PRIM_TYPE_DISPLAY[type_idx].to_string(),
+                        instance_count: pass_totals[pass][type_idx] as usize,
+                        unique_count: pass_distinct[pass][type_idx] as usize,
+                        wasted_bytes: type_waste[type_idx],
+                    });
+                }
+            }
+        }
+
+        // Java's totalArrayCount only counts arrays that entered an accumulator:
+        // all non-char arrays + char arrays not claimed by String/StringBuilder.
+        let total_processed: usize = pass_totals
+            .iter()
+            .map(|counts| counts.iter().map(|&v| v as usize).sum::<usize>())
+            .sum();
+
+        // report.totalGroupCount = enumerated nodes + both pending maps.
+        let unique_count = iterated_nodes + dup2_pending as usize + dup1_pending as usize;
+
+        eprintln!(
+            "Duplicate prim arrays: {} processed, {} unique/group count, {} reported groups, {} bytes waste",
+            total_processed,
+            unique_count,
+            top_groups.len(),
+            waste_total
         );
+
+        if debug_on {
+            ss_stats::debug_dump::record_dup_prim_totals(ss_stats::debug_dump::DupPrimScanTotals {
+                scanned_arrays: total_processed,
+                eligible_arrays: total_processed,
+                arrays_in_groups,
+                groups: debug_groups.len(),
+                waste_bytes: waste_total,
+                unique_count,
+            });
+            ss_stats::debug_dump::record_dup_prim_groups(debug_groups);
+        }
+
+        self.stats
+            .dup_prim_arrays
+            .set_results(total_processed, unique_count, per_class_entries, top_groups);
         ss_support::mem_trace::trace("run-dupprim");
         // Java's primitiveArrayTotalSize sums refChainOverhead over the
         // single-dimension primitive-array classes: count*(header+4) plus the
@@ -1232,15 +2411,6 @@ impl LinearScanCoordinator {
                 instance_total_bytes += self.heap.per_class_inst_count.get(i).copied().unwrap_or(0) as i64
                     * class_aligned.get(i).copied().unwrap_or(0);
             }
-        }
-        let mut prim_counts = [0i64; 8];
-        let mut prim_data_bytes = [0i64; 8];
-        let mut primitive_array_bytes: i64 = 0;
-        for rec in &prim_recs {
-            let ti = prim_type_code_index(rec.prim_type);
-            prim_counts[ti] += 1;
-            prim_data_bytes[ti] += rec.length as i64 * rec.elem_size() as i64;
-            primitive_array_bytes += array_shallow_size(rec.length as i32, rec.elem_size(), header_sz);
         }
         let primitive_array_total_size: i64 = (0..8)
             .map(|t| prim_counts[t] * (header_sz + 4) + prim_data_bytes[t])
@@ -1266,7 +2436,7 @@ impl LinearScanCoordinator {
         *self.stats.container_backing_ids.lock().unwrap() = container_backing_ids;
 
         // Update totals.
-        self.stats.total_arrays.store((prim_recs.len() + obj_recs.len()) as u64, Relaxed);
+        self.stats.total_arrays.store(prim_count as u64 + obj_recs.len() as u64, Relaxed);
 
         let mut total_array_bytes: i64 = 0;
         for pc in &self.stats.per_class {
@@ -1997,6 +3167,16 @@ enum RawObj {
     PrimArray { obj_id: u64, type_code: u8, len: u32, body_off: usize, body_len: usize },
 }
 
+impl RawObj {
+    fn obj_id(&self) -> u64 {
+        match *self {
+            RawObj::Instance { obj_id, .. }
+            | RawObj::ObjArray { obj_id, .. }
+            | RawObj::PrimArray { obj_id, .. } => obj_id,
+        }
+    }
+}
+
 /// Hand the mapping's pages in `from..upto` back to the kernel.
 fn release_range(map: &memmap2::Mmap, from: usize, upto: usize) {
     if map.is_empty() {
@@ -2109,77 +3289,6 @@ where
     Ok(())
 }
 
-/// One primitive array. The body stays in the mapping; only its location is kept.
-#[derive(Clone, Copy)]
-struct PrimRec {
-    obj_id: u64,
-    body_off: u64,
-    length: u32,
-    prim_type: PrimitiveArrayType,
-}
-
-impl PrimRec {
-    fn elem_size(&self) -> i32 {
-        prim_type_size(self.prim_type) as i32
-    }
-
-    fn body_len(&self) -> usize {
-        self.length as usize * prim_type_size(self.prim_type)
-    }
-}
-
-/// One object array. The element list stays in the mapping.
-#[derive(Clone, Copy)]
-struct ObjArrRec {
-    obj_id: u64,
-    body_off: u64,
-    class_idx: u32,
-    length: u32,
-}
-
-/// Body lookups over the primitive-array index.
-struct PrimBodies<'a> {
-    map: &'a memmap2::Mmap,
-    data: &'a [u8],
-    recs: &'a [PrimRec],
-    /// Array indices sorted by object id: the walk yields file order.
-    order: &'a [u32],
-}
-
-impl<'a> PrimBodies<'a> {
-    /// Hand the mapping's pages back every few thousand body reads, so a pass
-    /// that re-reads bodies out of order still runs inside a bounded window.
-    fn pace(&self, i: usize) {
-        if i % BODY_RELEASE_STRIDE == 0 {
-            release_mapped_pages(self.map);
-        }
-    }
-
-    fn find(&self, obj_id: u64) -> Option<&'a PrimRec> {
-        let mut lo = 0usize;
-        let mut hi = self.order.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let rec = &self.recs[self.order[mid] as usize];
-            match rec.obj_id.cmp(&obj_id) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(rec),
-            }
-        }
-        None
-    }
-
-    fn body(&self, rec: &PrimRec) -> &'a [u8] {
-        let off = rec.body_off as usize;
-        &self.data[off..off + rec.body_len()]
-    }
-
-    fn body_of(&self, obj_id: u64) -> Option<(&'a PrimRec, &'a [u8])> {
-        let rec = self.find(obj_id)?;
-        Some((rec, self.body(rec)))
-    }
-}
 
 /// One String's content, described instead of copied: the backing array plus the
 /// slice of it the String wraps.
@@ -2221,12 +3330,12 @@ impl StrContent {
     }
 
     /// Java StringDeduplicationStats backing contribution for one String.
-    fn backing_size(&self, body: &[u8], header_size: i64) -> i64 {
+    fn backing_size(&self, body_len: usize, header_size: i64) -> i64 {
         // arrayLen is the backing array's own length: elements for char[], bytes
         // for byte[] (both Java 9 codings), exactly as the original computed it.
         let (array_len, element_size) = match self.enc {
-            STR_ENC_CHAR_BE => (body.len() as i64 / 2, 2i64),
-            _ => (body.len() as i64, 1i64),
+            STR_ENC_CHAR_BE => (body_len as i64 / 2, 2i64),
+            _ => (body_len as i64, 1i64),
         };
         let content_len = self.take as i64;
         if array_len == content_len {
@@ -2259,16 +3368,15 @@ fn java_hash_str_content(c: &StrContent, body: &[u8]) -> i32 {
     java_fmix(h, (c.take as i32) << 1)
 }
 
-/// Resolve a String instance's field bytes to its content descriptor.
+/// Java String content: the backing array plus the slice of it the String wraps.
 ///
-/// Same reading order as extract_string_content_meta, but the content is left in
-/// the mapping: no Vec<u16> copy per String.
-fn string_content_ref(
+/// Same reading order as extract_string_content_meta, but the array itself is
+/// resolved later against the join, so nothing per String is materialised here.
+fn string_content_fields(
     fields: &[u8],
     class_info: &JavaClassInfo,
     id_bytes: usize,
-    prims: &PrimBodies<'_>,
-) -> Option<StrContent> {
+) -> Option<(u64, i32, i32, u8)> {
     let mut offset = 0usize;
     let mut value_ref: Option<u64> = None;
     let mut str_offset: i32 = 0;
@@ -2303,204 +3411,19 @@ fn string_content_ref(
         }
     }
 
-    let value_id = value_ref?;
-    let (rec, body) = prims.body_of(value_id)?;
-    let enc = match rec.prim_type {
-        // Java 9+ coder=0 -> LATIN1 (byte[]), coder=1 -> UTF16 (byte[]).
-        // Java 8 -> char[] backing.
-        PrimitiveArrayType::Char => STR_ENC_CHAR_BE,
-        PrimitiveArrayType::Byte => {
-            if coder == 0 {
-                STR_ENC_BYTE_LATIN1
-            } else {
-                STR_ENC_BYTE_UTF16
-            }
-        }
-        _ => return None,
-    };
-    let start = str_offset.max(0) as usize;
-    let available = if enc == STR_ENC_BYTE_LATIN1 { body.len() } else { body.len() / 2 };
-    if start > available {
-        return None;
-    }
-    let take = take_count(str_count, available - start);
-    Some(StrContent { array_id: value_id, enc, start: start as u32, take: take as u32 })
+    Some((value_ref?, str_offset, str_count, coder))
 }
 
-/// One running duplicate-string group (Java JStringStats), holding its
-/// representative String by description rather than by a content copy.
-struct StrGroup {
-    content: StrContent,
+
+
+/// One object array. The element list stays in the mapping.
+#[derive(Clone, Copy)]
+struct ObjArrRec {
     obj_id: u64,
-    count: u32,
-    backing_count: u32,
-    backing_bytes: i64,
+    body_off: u64,
+    class_idx: u32,
+    length: u32,
 }
-
-/// Java StringContentDeduplicator state: a pending map keyed by the 32-bit
-/// content hash, plus a content map whose equality check re-reads the
-/// representative's backing array out of the mapping.
-struct StrGrouping {
-    header_size: i64,
-    /// Java pending: hash -> the one String seen for that hash, not yet merged.
-    pending: HashMap<i32, u32>,
-    /// Java content_map: hash -> chain head of materialised groups.
-    buckets: HashMap<i32, i32>,
-    next: Vec<i32>,
-    groups: Vec<StrGroup>,
-    /// Java claimedArrays.
-    claimed: std::collections::HashSet<u64>,
-}
-
-impl StrGrouping {
-    fn new(header_size: i64) -> Self {
-        Self {
-            header_size,
-            pending: HashMap::new(),
-            buckets: HashMap::new(),
-            next: Vec::new(),
-            groups: Vec::new(),
-            claimed: std::collections::HashSet::new(),
-        }
-    }
-
-    fn find_materialised(
-        &self,
-        hash: i32,
-        cur: &StrContent,
-        cur_body: &[u8],
-        prims: &PrimBodies<'_>,
-    ) -> Option<u32> {
-        let mut idx = self.buckets.get(&hash).copied().unwrap_or(-1);
-        while idx >= 0 {
-            let g = &self.groups[idx as usize];
-            let body = prims.body_of(g.content.array_id).map(|(_, b)| b).unwrap_or(&[]);
-            if str_content_eq(&g.content, body, cur, cur_body) {
-                return Some(idx as u32);
-            }
-            idx = self.next[idx as usize];
-        }
-        None
-    }
-
-    fn open(&mut self, hash: i32, gi: usize) {
-        let head = self.buckets.get(&hash).copied().unwrap_or(-1);
-        self.next[gi] = head;
-        self.buckets.insert(hash, gi as i32);
-    }
-
-    /// Java StringContentDeduplicator.processString.
-    fn observe(&mut self, hash: i32, cur: StrContent, obj_id: u64, backing: i64, prims: &PrimBodies<'_>) {
-        let cur_body = prims.body_of(cur.array_id).map(|(_, b)| b).unwrap_or(&[]);
-        // Java materialises a collided pending entry, then looks the current
-        // content up in content_map rather than creating a fresh pending entry.
-        let mut collided = false;
-        if let Some(pi) = self.pending.remove(&hash) {
-            let first = self.groups[pi as usize].content;
-            let first_body = prims.body_of(first.array_id).map(|(_, b)| b).unwrap_or(&[]);
-            let first_backing = first.backing_size(first_body, self.header_size);
-            if str_content_eq(&first, first_body, &cur, cur_body) {
-                // Second occurrence: Java folds the pair into content_map with
-                // count 2 and counts the first backing array unconditionally.
-                let claimed = self.claimed.insert(cur.array_id);
-                let g = &mut self.groups[pi as usize];
-                g.count = 2;
-                g.backing_count = 1;
-                g.backing_bytes = first_backing;
-                if claimed {
-                    g.backing_count += 1;
-                    g.backing_bytes += backing;
-                }
-                self.open(hash, pi as usize);
-                return;
-            }
-            // 32-bit hash collision.
-            let claimed_cur = self.claimed.insert(cur.array_id);
-            {
-                let g = &mut self.groups[pi as usize];
-                g.backing_count = 1;
-                g.backing_bytes = first_backing;
-            }
-            self.open(hash, pi as usize);
-            if let Some(eq) = self.find_materialised(hash, &cur, cur_body, prims) {
-                let g = &mut self.groups[eq as usize];
-                g.count += 1;
-                if claimed_cur {
-                    g.backing_count += 1;
-                    g.backing_bytes += backing;
-                }
-                return;
-            }
-            collided = true;
-        } else if let Some(eq) = self.find_materialised(hash, &cur, cur_body, prims) {
-            let claimed = self.claimed.insert(cur.array_id);
-            let g = &mut self.groups[eq as usize];
-            g.count += 1;
-            if claimed {
-                g.backing_count += 1;
-                g.backing_bytes += backing;
-            }
-            return;
-        }
-
-        if collided {
-            let claimed = self.claimed.insert(cur.array_id);
-            let gi = self.groups.len();
-            self.groups.push(StrGroup {
-                content: cur,
-                obj_id,
-                count: 1,
-                backing_count: u32::from(claimed),
-                backing_bytes: if claimed { backing } else { 0 },
-            });
-            self.next.push(-1);
-            self.open(hash, gi);
-        } else {
-            // First content for this hash: Java claims the array but keeps the
-            // content in pending, so no backing is attributed yet.
-            self.claimed.insert(cur.array_id);
-            let gi = self.groups.len();
-            self.groups.push(StrGroup { content: cur, obj_id, count: 1, backing_count: 0, backing_bytes: 0 });
-            self.next.push(-1);
-            self.pending.insert(hash, gi as u32);
-        }
-    }
-
-    /// Java content_map.size() + pending.size(): every group is in one of the two.
-    fn unique_count(&self) -> usize {
-        self.groups.len()
-    }
-
-    /// The report's duplicate groups, i.e. materialised entries with count > 1.
-    fn report_groups(
-        &self,
-        prims: &PrimBodies<'_>,
-        string_body_size: i64,
-    ) -> Vec<ss_stats::duplicate_strings::DupStringGroup> {
-        let mut out = Vec::new();
-        for (gi, g) in self.groups.iter().enumerate() {
-            prims.pace(gi);
-            if g.count <= 1 {
-                continue;
-            }
-            let body = prims.body_of(g.content.array_id).map(|(_, b)| b).unwrap_or(&[]);
-            let extra = (g.count - 1) as i64;
-            let mut wasted = extra * string_body_size;
-            if g.backing_count > 1 {
-                wasted += (g.backing_bytes / g.backing_count as i64) * (g.backing_count as i64 - 1);
-            }
-            out.push(ss_stats::duplicate_strings::DupStringGroup {
-                content: String::from_utf16_lossy(&g.content.units(body)),
-                count: g.count as usize,
-                wasted_bytes: wasted,
-                backing_array_count: g.backing_count as usize,
-                sample_obj_ids: vec![g.obj_id],
-            });
-        }
-        out
-    }
-}
-
 
 /// Body lookups over the object-array index.
 struct ObjBodies<'a> {
@@ -2613,120 +3536,6 @@ fn boxed_primitive_size(name: &str) -> i32 {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PrimDupNode {
-    /// Representative array: the one that created this node.
-    array_idx: u32,
-    count: u32,
-    next: i32,
-}
-
-/// One PrimitiveArraySizeAccumulator: pending first-seen hashes plus the
-/// hash -> node chain map, exactly as in the Java reference. The per-array group
-/// ids the Java code threads through are not kept: nothing observable reads them.
-struct PrimDupAccumulator {
-    group_map: HashMap<i32, u32>,
-    pending: HashMap<i32, u32>,
-    nodes: Vec<PrimDupNode>,
-    /// Members of hash-0 nodes, kept for the opt-in forensic dump only.
-    hash0_members: HashMap<u32, Vec<u64>>,
-    per_type_total: [u32; 8],
-    per_type_distinct: [u32; 8],
-    per_type_waste: [i64; 8],
-}
-
-impl PrimDupAccumulator {
-    fn new() -> Self {
-        Self {
-            group_map: HashMap::new(),
-            pending: HashMap::new(),
-            nodes: Vec::new(),
-            hash0_members: HashMap::new(),
-            per_type_total: [0; 8],
-            per_type_distinct: [0; 8],
-            per_type_waste: [0; 8],
-        }
-    }
-
-    fn add_node(&mut self, array_idx: u32, count: u32, hash: i32, members: &[u64]) -> u32 {
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(PrimDupNode { array_idx, count, next: -1 });
-        if hash == 0 {
-            self.hash0_members.insert(idx, members.to_vec());
-        }
-        idx
-    }
-
-    fn add_member(&mut self, node_idx: u32, obj_id: u64) {
-        if let Some(members) = self.hash0_members.get_mut(&node_idx) {
-            members.push(obj_id);
-        }
-    }
-}
-
-/// Mirror of PrimitiveArraySizeAccumulator.processArray. Bodies are compared out
-/// of the mapping, so nothing per array is held beyond the accumulator's chains.
-fn process_prim_dup_array(
-    acc: &mut PrimDupAccumulator,
-    prims: &PrimBodies<'_>,
-    prim_hashes: &[i32],
-    prim_class_id: &[u64; 8],
-    idx: usize,
-) {
-    let arr = prims.recs[idx];
-    let hash = prim_hashes[idx];
-    let type_idx = prim_type_code_index(arr.prim_type);
-    let arr_class_id = prim_class_id[type_idx];
-    let arr_body = prims.body(&arr);
-    acc.per_type_total[type_idx] += 1;
-
-    if let Some(first_idx) = acc.pending.remove(&hash) {
-        let first = prims.recs[first_idx as usize];
-        let first_class_id = prim_class_id[prim_type_code_index(first.prim_type)];
-        let equal = first_class_id == arr_class_id
-            && first.length == arr.length
-            && prims.body(&first) == arr_body;
-        if equal {
-            let node = acc.add_node(idx as u32, 2, hash, &[first.obj_id, arr.obj_id]);
-            acc.group_map.insert(hash, node);
-        } else {
-            let first_node = acc.add_node(first_idx, 1, hash, &[first.obj_id]);
-            let second_node = acc.add_node(idx as u32, 1, hash, &[arr.obj_id]);
-            acc.nodes[first_node as usize].next = second_node as i32;
-            acc.per_type_distinct[type_idx] += 1;
-            acc.group_map.insert(hash, first_node);
-        }
-        return;
-    }
-
-    if let Some(&head) = acc.group_map.get(&hash) {
-        let mut cur = head as i32;
-        let mut last: i32 = -1;
-        loop {
-            let node = acc.nodes[cur as usize];
-            let rep = prims.recs[node.array_idx as usize];
-            let rep_class_id = prim_class_id[prim_type_code_index(rep.prim_type)];
-            if rep_class_id == arr_class_id && rep.length == arr.length && prims.body(&rep) == arr_body {
-                acc.nodes[cur as usize].count += 1;
-                acc.add_member(cur as u32, arr.obj_id);
-                return;
-            }
-            last = cur;
-            if node.next < 0 {
-                break;
-            }
-            cur = node.next;
-        }
-        let node = acc.add_node(idx as u32, 1, hash, &[arr.obj_id]);
-        acc.nodes[last as usize].next = node as i32;
-        acc.per_type_distinct[type_idx] += 1;
-        return;
-    }
-
-    // First array with this hash: remember it, no group node yet.
-    acc.pending.insert(hash, idx as u32);
-    acc.per_type_distinct[type_idx] += 1;
-}
 
 /// Java's per-primitive-type display names, indexed by Java's primitive type
 /// code order (boolean, byte, char, short, int, float, long, double).
@@ -2741,154 +3550,6 @@ const PRIM_TYPE_DISPLAY: [&str; 8] = [
     "double[]",
 ];
 
-fn detect_duplicate_prim_arrays(
-    prims: &PrimBodies<'_>,
-    prim_hashes: &[i32],
-    prim_class_id: &[u64; 8],
-    header_size: i64,
-    string_backing: &std::collections::HashSet<u64>,
-    container_backing: &std::collections::HashSet<u64>,
-    stats: &StatsEngine,
-) {
-    let debug_on = ss_stats::debug_dump::enabled();
-    let mut pass2 = PrimDupAccumulator::new();
-    let mut pass1 = PrimDupAccumulator::new();
-
-    // Pass 2: every non-char primitive array, in dump order.
-    for (idx, rec) in prims.recs.iter().enumerate() {
-        prims.pace(idx);
-        if rec.prim_type == PrimitiveArrayType::Char {
-            continue;
-        }
-        process_prim_dup_array(&mut pass2, prims, prim_hashes, prim_class_id, idx);
-    }
-
-    // Pass 1: char arrays that String/StringBuilder processing did not claim.
-    for (idx, rec) in prims.recs.iter().enumerate() {
-        prims.pace(idx);
-        if rec.prim_type != PrimitiveArrayType::Char || string_backing.contains(&rec.obj_id) {
-            continue;
-        }
-        process_prim_dup_array(&mut pass1, prims, prim_hashes, prim_class_id, idx);
-    }
-
-    // Java's mergeAndBuildReport() iterates only the first bucket of each
-    // groupMap. fastutil stores key 0 in slot 0, so the first bucket is the
-    // hash-0 chain (all empty arrays hash to 0).
-    let mut per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = Vec::new();
-    let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
-    let mut debug_groups: Vec<ss_stats::debug_dump::DupPrimGroupDebug> = Vec::new();
-    let mut iterated_nodes: usize = 0;
-    let mut arrays_in_groups: usize = 0;
-    let mut waste_total: i64 = 0;
-
-    for acc in [&pass2, &pass1] {
-        let mut type_waste = acc.per_type_waste;
-        if let Some(&head) = acc.group_map.get(&0) {
-            let mut cur = head as i32;
-            while cur >= 0 {
-                iterated_nodes += 1;
-                let node = acc.nodes[cur as usize];
-                if node.count > 1 {
-                    let rep = prims.recs[node.array_idx as usize];
-                    let body = array_shallow_size(rep.length as i32, rep.elem_size(), header_size);
-                    let wasted = body * (node.count as i64 - 1);
-                    waste_total += wasted;
-                    arrays_in_groups += node.count as usize;
-                    let type_idx = prim_type_code_index(rep.prim_type);
-                    type_waste[type_idx] += wasted;
-
-                    let class_name = prim_type_display_name(rep.prim_type).to_string();
-                    if debug_on {
-                        let members = acc.hash0_members.get(&(cur as u32));
-                        debug_groups.push(ss_stats::debug_dump::DupPrimGroupDebug {
-                            class_name: class_name.clone(),
-                            array_length: rep.length as i32,
-                            element_size: rep.elem_size(),
-                            body_size: body,
-                            count: node.count as usize,
-                            wasted_bytes: wasted,
-                            content_hash: ss_stats::debug_dump::fnv1a64(prims.body(&rep)),
-                            members: members
-                                .map(|ids| {
-                                    ids.iter()
-                                        .map(|obj_id| ss_stats::debug_dump::DupPrimMemberDebug {
-                                            obj_id: *obj_id,
-                                            string_backing: string_backing.contains(obj_id),
-                                            container_backing: container_backing.contains(obj_id),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        });
-                    }
-
-                    top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
-                        class_name,
-                        count: node.count as usize,
-                        wasted_bytes: wasted,
-                        size_bytes: body,
-                        group_id: 0,
-                        representative_obj_id: rep.obj_id,
-                        description: format!(
-                            "{}[{}]",
-                            PRIM_TYPE_DISPLAY[type_idx].trim_end_matches("[]"),
-                            rep.length
-                        ),
-                        sample_obj_ids: vec![rep.obj_id],
-                    });
-                }
-                cur = node.next;
-            }
-        }
-
-        // Java's DuplicateClassEntry.instanceCount is the class' total instance
-        // count, available to both accumulators; only types with
-        // duplicateSize > 0 are reported.
-        for type_idx in 0..8 {
-            if type_waste[type_idx] > 0 {
-                per_class_entries.push(ss_stats::duplicate_arrays::DupArrayClassEntry {
-                    class_name: PRIM_TYPE_DISPLAY[type_idx].to_string(),
-                    instance_count: acc.per_type_total[type_idx] as usize,
-                    unique_count: acc.per_type_distinct[type_idx] as usize,
-                    wasted_bytes: type_waste[type_idx],
-                });
-            }
-        }
-    }
-
-    // Java's totalArrayCount only counts arrays that entered an accumulator:
-    // all non-char arrays + char arrays not claimed by String/StringBuilder.
-    let total_processed: usize = pass2.per_type_total.iter().map(|&v| v as usize).sum::<usize>()
-        + pass1.per_type_total.iter().map(|&v| v as usize).sum::<usize>();
-
-    // report.totalGroupCount = enumerated nodes + both pending maps.
-    let unique_count = iterated_nodes + pass2.pending.len() + pass1.pending.len();
-
-    eprintln!(
-        "Duplicate prim arrays: {} processed, {} unique/group count, {} reported groups, {} bytes waste",
-        total_processed,
-        unique_count,
-        top_groups.len(),
-        waste_total
-    );
-
-    if debug_on {
-        ss_stats::debug_dump::record_dup_prim_totals(ss_stats::debug_dump::DupPrimScanTotals {
-            scanned_arrays: total_processed,
-            eligible_arrays: total_processed,
-            arrays_in_groups,
-            groups: debug_groups.len(),
-            waste_bytes: waste_total,
-            unique_count,
-        });
-        ss_stats::debug_dump::record_dup_prim_groups(debug_groups);
-    }
-
-    stats
-        .dup_prim_arrays
-        .set_results(total_processed, unique_count, per_class_entries, top_groups);
-}
 
 /// Java `JavaClassInfo.isArray()` for the class names Rust keeps: HPROF array
 /// names start with '[', while the parser's synthetic primitive-array classes
@@ -4806,14 +5467,21 @@ pub fn resolve_field_values(
     // Read the requested objects only, one body at a time.
     let mut instances: HashMap<u64, (u32, Vec<u8>)> = HashMap::new();
     let mut obj_arrays: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut prim_arrays: HashMap<u64, (Vec<u8>, PrimitiveArrayType)> = HashMap::new();
+    let mut prim_arrays: HashMap<u64, (PrimBody, PrimitiveArrayType)> = HashMap::new();
     let mut addr_to_class_idx: HashMap<u64, u32> = HashMap::new();
 
+    let mut prefix_bytes_prim: u64 = 0;
+    let mut full_bytes_prim: u64 = 0;
+    let mut max_body: u64 = 0;
+    let mut prim_count: u64 = 0;
+
     for &addr in obj_addrs {
-        let body = match bodies.get(addr) {
+        let body = match bodies.get_bounded(addr) {
             Some(b) => b,
             None => continue,
         };
+        let n = body.bytes.len() as u64;
+        max_body = max_body.max(n);
         match body.kind {
             DI_KIND_INSTANCE => {
                 if (body.class_idx as usize) < heap.classes.len() {
@@ -4826,15 +5494,34 @@ pub fn resolve_field_values(
                 addr_to_class_idx.insert(addr, body.class_idx);
             }
             DI_KIND_PRIM_ARRAY => {
-                // prim_arrays keeps owned bodies: this pass outlives any single read.
+                // Only a bounded prefix is kept: the renderer prints the element
+                // count and the String decode reads a short head.
                 if !body.bytes.is_empty() {
                     if let Some(prim_type) = PrimitiveArrayType::from_type_code(body.prim_type) {
-                        prim_arrays.insert(addr, (body.bytes, prim_type));
+                        let full_len = body.len as usize * body.elem as usize;
+                        prefix_bytes_prim += n;
+                        full_bytes_prim += full_len as u64;
+                        prim_count += 1;
+                        prim_arrays.insert(
+                            addr,
+                            (PrimBody { prefix: body.bytes, full_len }, prim_type),
+                        );
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    if ss_support::mem_trace::enabled() {
+        eprintln!(
+            "[mem] rv-bodies addrs={} prim_arrays={} prefix={}KB full_prim={}KB max_read={}KB",
+            obj_addrs.len(),
+            prim_count,
+            prefix_bytes_prim / 1024,
+            full_bytes_prim / 1024,
+            max_body / 1024
+        );
     }
 
     // Resolve String contents: every String instance whose backing array is
@@ -4871,7 +5558,7 @@ pub fn resolve_field_values(
                 class_name,
                 fields: Vec::new(),
                 array_elements: None,
-                prim_array_display: Some(format!("[{} bytes]", body.len())),
+                prim_array_display: Some(format!("[{} bytes]", body.full_len)),
             },
         );
     }

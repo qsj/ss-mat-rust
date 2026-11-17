@@ -254,7 +254,9 @@ impl MainReportGenerator {
             return;
         }
 
-        let gc_root_set = crate::ref_chain_render::build_gc_root_set(&data.root_of);
+        // Borrowed, not cloned: the root set has one entry per GC root and the
+        // renderer only needs to look members up.
+        let gc_root_set = &data.gc_roots;
 
         // Preserve caller's order; map each obj_id to ProblemObj.
         let problem_objs: Vec<ProblemObj> = sample_obj_ids.iter()
@@ -294,6 +296,7 @@ impl MainReportGenerator {
                 cur = p;
             }
         }
+        let live_before = ss_support::mem_trace::live_bytes();
         let resolved = self.hprof_path.as_ref().and_then(|path| {
             if chain_addrs.is_empty() {
                 None
@@ -301,12 +304,20 @@ impl MainReportGenerator {
                 Some(ss_traversal::resolve_field_values(&self.heap, path, &chain_addrs))
             }
         });
+        if let Some(_rv) = &resolved {
+            let held = ss_support::mem_trace::live_bytes().saturating_sub(live_before);
+            ss_support::mem_trace::trace(&format!(
+                "rv-held addrs={} held={}KB",
+                chain_addrs.len(),
+                held / 1024
+            ));
+        }
 
         let renderer = crate::ref_chain_render::RefChainRenderer::new(
             &self.heap,
             data,
             &data.field_pool,
-            &gc_root_set,
+            gc_root_set,
         );
         let renderer = match &resolved {
             Some(rv) => renderer.with_resolved_values(rv),
@@ -333,75 +344,99 @@ impl MainReportGenerator {
 
         // --- Section 1: Top-Level Stats ---
         self.section_top_level_stats(&mut html);
+        ss_support::mem_trace::trace("s01-top-stats");
 
         // --- Section 2: Thread throwing OutOfMemoryError ---
         self.section_oom_thread(&mut html);
+        ss_support::mem_trace::trace("s02-oom-thread");
 
         // --- Section 3: Where Memory Goes, by Class ---
         self.section_memory_by_class(&mut html);
+        ss_support::mem_trace::trace("s03-by-class");
 
         // --- Section 4: Where Memory Goes, by GC Root ---
         self.section_memory_by_gc_root(&mut html);
+        ss_support::mem_trace::trace("s04-by-gc-root");
 
         // --- Section 5: Live vs Garbage Objects ---
         self.section_live_vs_garbage(&mut html);
+        ss_support::mem_trace::trace("s05-live-vs-garbage");
 
         // --- Section 6: Fixed per-object overhead ---
         self.section_fixed_overhead(&mut html);
+        ss_support::mem_trace::trace("s06-fixed-overhead");
 
         // --- Section 7: Objects Awaiting Finalization ---
         self.section_finalization(&mut html);
+        ss_support::mem_trace::trace("s07-finalization");
 
         // --- Section 8: Duplicate Strings ---
         self.section_duplicate_strings(&mut html);
+        ss_support::mem_trace::trace("s08-dup-strings");
 
         // --- Section 9: Bad Collections ---
         self.section_bad_collections(&mut html);
+        ss_support::mem_trace::trace("s09-bad-collections");
 
         // --- Section 10: Bad Object Arrays ---
         self.section_bad_obj_arrays(&mut html);
+        ss_support::mem_trace::trace("s10-bad-obj-arrays");
 
         // --- Section 11: Bad Primitive Arrays ---
         self.section_bad_prim_arrays(&mut html);
+        ss_support::mem_trace::trace("s11-bad-prim-arrays");
 
         // --- Section 12: Boxed Numbers ---
         self.section_boxed_numbers(&mut html);
+        ss_support::mem_trace::trace("s12-boxed-numbers");
 
         // --- Section 13: Duplicate Objects ---
         self.section_duplicate_objects(&mut html);
+        ss_support::mem_trace::trace("s13-dup-objects");
 
         // --- Section 14: Duplicate Primitive Arrays ---
         self.section_dup_prim_arrays(&mut html);
+        ss_support::mem_trace::trace("s14-dup-prim-arrays");
 
         // --- Section 15: Duplicate Object Arrays ---
         self.section_dup_obj_arrays(&mut html);
+        ss_support::mem_trace::trace("s15-dup-obj-arrays");
 
         // --- Section 16: Duplicate Lists ---
         self.section_dup_lists(&mut html);
+        ss_support::mem_trace::trace("s16-dup-lists");
 
         // --- Section 17: WeakHashMaps ---
         self.section_weak_hashmaps(&mut html);
+        ss_support::mem_trace::trace("s17-weak-hashmaps");
 
         // --- Section 18: Off-heap DirectByteBuffer memory ---
         self.section_direct_byte_buffers(&mut html);
+        ss_support::mem_trace::trace("s18-direct-buffers");
 
         // --- Section 19: Humongous objects ---
         self.section_humongous_objects(&mut html);
+        ss_support::mem_trace::trace("s19-humongous");
 
         // --- Section 20: Heap Size Configuration ---
         self.section_heap_config(&mut html);
+        ss_support::mem_trace::trace("s20-heap-config");
 
         // --- Section 21: Very Long Reference Chains ---
         self.section_long_ref_chains(&mut html);
+        ss_support::mem_trace::trace("s21-long-chains");
 
         // --- Section 22: Thread stacks ---
         self.section_thread_stacks(&mut html);
+        ss_support::mem_trace::trace("s22-thread-stacks");
 
         // --- Section 23: System Properties ---
         self.section_system_properties(&mut html);
+        ss_support::mem_trace::trace("s23-sys-props");
 
         // --- Section 24: JVM Flags ---
         self.section_jvm_flags(&mut html);
+        ss_support::mem_trace::trace("s24-jvm-flags");
 
         // Close last section
         html.append_details_close_tag();
@@ -1245,23 +1280,27 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         // (EMPTY/SINGLE_ELEM/SMALL/SPARSE/MANY_NULLS), reached during the live
         // traversal. We captured EMPTY/SINGLE_ELEM collections during the scan
         // (each contributing its full shallow body as waste). Filter to live.
-        let records = self.stats.bad_collection_records.lock().unwrap().clone();
-
         // Java's processContainer runs for both live and garbage objects
         // (the second traversal pass), so do not filter to live here.
-        // Aggregate bad-collection waste per class.
+        // Aggregate bad-collection waste per class. The record vector carries one
+        // entry per bad collection — millions of them on a large dump — so it is
+        // read under the lock and aggregated into a per-class table instead of
+        // being cloned into a second copy of the same size.
         let mut per_class: std::collections::HashMap<u32, (u64, i64)> = std::collections::HashMap::new();
         let mut total_collection_bytes: i64 = 0;
         let mut total_bad_count: u64 = 0;
-        for r in &records {
-            if r.kind == ss_stats::problem_types::COLLECTION_KIND_NONE {
-                continue;
+        {
+            let records = self.stats.bad_collection_records.lock().unwrap();
+            for r in records.iter() {
+                if r.kind == ss_stats::problem_types::COLLECTION_KIND_NONE {
+                    continue;
+                }
+                let (c, b) = per_class.entry(r.class_idx).or_insert((0, 0));
+                *c += 1;
+                *b += r.waste;
+                total_collection_bytes += r.waste;
+                total_bad_count += 1;
             }
-            let (c, b) = per_class.entry(r.class_idx).or_insert((0, 0));
-            *c += 1;
-            *b += r.waste;
-            total_collection_bytes += r.waste;
-            total_bad_count += 1;
         }
         let total_collections: u64 = self.stats.per_class.iter()
             .filter(|pc| is_collection_class_name_for_report(&pc.class_name))
@@ -1404,19 +1443,31 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         // Java only counts bad object arrays reached during the LIVE reachability
         // traversal (processingLiveObjects=true). The linear scan captured ALL
         // bad arrays (live+garbage); filter to live-only here using BFS `visited`.
-        let records = self.stats.bad_array_records.lock().unwrap().clone();
         // Java's container traversal marks every container backing array visited
-        // before processObjectArray(); those arrays never enter Section 10.
-        let container_backing: std::collections::HashSet<u64> = self
-            .stats
-            .container_backing_ids
-            .lock()
-            .unwrap()
-            .clone();
-        let live_records: Vec<_> = records
-            .iter()
-            .filter(|r| !container_backing.contains(&r.obj_id))
-            .collect();
+        // before processObjectArray(); those arrays never enter Section 10. The
+        // per-array records are aggregated under the lock: hundreds of millions of
+        // bytes on a large dump, and a clone plus a filtered copy doubled them.
+        let mut kind_count = [0u64; 5];
+        let mut kind_bytes = [0i64; 5];
+        let mut sample_ids: Vec<u64> = Vec::with_capacity(15);
+        {
+            let records = self.stats.bad_array_records.lock().unwrap();
+            let container_backing = self.stats.container_backing_ids.lock().unwrap();
+            for r in records.iter() {
+                if container_backing.contains(&r.obj_id) {
+                    continue;
+                }
+                let kind = r.kind as usize;
+                if kind < kind_count.len() {
+                    kind_count[kind] += 1;
+                    kind_bytes[kind] += r.size;
+                }
+                if sample_ids.len() < 15 {
+                    sample_ids.push(r.obj_id);
+                }
+            }
+        }
+        sample_ids.dedup();
 
         // Java S10's total = sum of instanceCount for classes with
         // problemObjectCount==2, i.e. object arrays excluding multi-dimensional
@@ -1429,16 +1480,16 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             .map(|pc| pc.array_live_count.load(Relaxed) as u64)
             .sum();
 
-        let empty_count = live_records.iter().filter(|r| r.kind == 0).count() as u64;
-        let empty_bytes: i64 = live_records.iter().filter(|r| r.kind == 0).map(|r| r.size).sum();
-        let single_count = live_records.iter().filter(|r| r.kind == 1).count() as u64;
-        let single_bytes: i64 = live_records.iter().filter(|r| r.kind == 1).map(|r| r.size).sum();
-        let all_null_count = live_records.iter().filter(|r| r.kind == 2).count() as u64;
-        let all_null_bytes: i64 = live_records.iter().filter(|r| r.kind == 2).map(|r| r.size).sum();
-        let one_nonnull_count = live_records.iter().filter(|r| r.kind == 3).count() as u64;
-        let one_nonnull_bytes: i64 = live_records.iter().filter(|r| r.kind == 3).map(|r| r.size).sum();
-        let sparse_count = live_records.iter().filter(|r| r.kind == 4).count() as u64;
-        let sparse_bytes: i64 = live_records.iter().filter(|r| r.kind == 4).map(|r| r.size).sum();
+        let empty_count = kind_count[0];
+        let empty_bytes = kind_bytes[0];
+        let single_count = kind_count[1];
+        let single_bytes = kind_bytes[1];
+        let all_null_count = kind_count[2];
+        let all_null_bytes = kind_bytes[2];
+        let one_nonnull_count = kind_count[3];
+        let one_nonnull_bytes = kind_bytes[3];
+        let sparse_count = kind_count[4];
+        let sparse_bytes = kind_bytes[4];
 
         let total_bad = empty_count + single_count + all_null_count + one_nonnull_count + sparse_count;
         let total_bad_bytes = empty_bytes + single_bytes + all_null_bytes + one_nonnull_bytes + sparse_bytes;
@@ -1511,13 +1562,8 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 </font></td></tr></table>\n");
             html.append_raw("</div>\n</details>\n");
 
-            // Per-instance ref chain for sample bad object arrays.
-            // Take the largest live bad arrays as samples.
-            let mut sample_ids: Vec<u64> = live_records.iter()
-                .take(15)
-                .map(|r| r.obj_id)
-                .collect();
-            sample_ids.dedup();
+            // Per-instance ref chain for sample bad object arrays: the first live
+            // bad arrays, collected with the aggregates above.
             self.render_instance_ref_chains(
                 html,
                 "Per-instance reference chains for sample bad object arrays",
@@ -1535,9 +1581,65 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
     fn section_bad_prim_arrays(&mut self, html: &mut HtmlStringBuilder) {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
-        let records = self.stats.bad_prim_array_records.lock().unwrap().clone();
-        let total_bad = records.len() as u64;
-        let total_bad_bytes: i64 = records.iter().map(|r| r.waste).sum();
+        // Aggregates over the per-array records, taken under the lock: there is one
+        // record per bad primitive array, hundreds of millions of bytes on a large
+        // dump, and a clone would keep a second copy alive for the sake of a few sums.
+        let (total_bad, total_bad_bytes, categories, groups, sample_ids) = {
+            let records = self.stats.bad_prim_array_records.lock().unwrap();
+            let mut kind_tally = [(0u64, 0i64); 6];
+            let mut by_class: std::collections::HashMap<(u32, u8), (u64, i64)> =
+                std::collections::HashMap::new();
+            let mut total_bad_bytes: i64 = 0;
+            for r in records.iter() {
+                total_bad_bytes += r.waste;
+                let kind = r.kind as usize;
+                if kind < kind_tally.len() {
+                    kind_tally[kind].0 += 1;
+                    kind_tally[kind].1 += r.waste;
+                }
+                let entry = by_class.entry((r.class_idx, r.kind)).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += r.waste;
+            }
+            // Java's processPrimitiveArray categories, sorted by waste.
+            let mut categories: Vec<(u8, u64, i64)> = kind_tally
+                .iter()
+                .enumerate()
+                .map(|(kind, &(count, bytes))| (kind as u8, count, bytes))
+                .filter(|(_, count, _)| *count > 0)
+                .collect();
+            categories.sort_by(|a, b| b.2.cmp(&a.2));
+
+            // Per-class + per-problem breakdown.
+            let mut groups: Vec<((u32, u8), (u64, i64))> = by_class.into_iter().collect();
+            groups.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+
+            // The problem arrays the report renders chains for: the ten largest by
+            // waste, keeping record order among equal sizes, which is what the
+            // full sort used to give.
+            let mut best: Vec<(i64, u64)> = Vec::with_capacity(11);
+            for r in records.iter() {
+                if best.len() == 10 && r.waste <= best[9].0 {
+                    continue;
+                }
+                let pos = best
+                    .iter()
+                    .position(|&(waste, _)| waste < r.waste)
+                    .unwrap_or(best.len());
+                best.insert(pos, (r.waste, r.obj_id));
+                if best.len() > 10 {
+                    best.truncate(10);
+                }
+            }
+            let sample_ids: Vec<u64> = best.iter().map(|&(_, id)| id).collect();
+            (
+                records.len() as u64,
+                total_bad_bytes,
+                categories,
+                groups,
+                sample_ids,
+            )
+        };
 
         let is_primitive_array = |name: &str| {
             matches!(
@@ -1581,20 +1683,6 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             ]);
             html.end_table();
 
-            // Java's processPrimitiveArray categories, sorted by waste.
-            let mut categories: Vec<(u8, u64, i64)> = (0u8..=5)
-                .map(|kind| {
-                    let count = records.iter().filter(|r| r.kind == kind).count() as u64;
-                    let bytes = records
-                        .iter()
-                        .filter(|r| r.kind == kind)
-                        .map(|r| r.waste)
-                        .sum();
-                    (kind, count, bytes)
-                })
-                .filter(|(_, count, _)| *count > 0)
-                .collect();
-            categories.sort_by(|a, b| b.2.cmp(&a.2));
 
             html.begin_table(true, 0, &["Problem type", "# arrays", "Size"]);
             for (kind, count, bytes) in &categories {
@@ -1606,16 +1694,6 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             }
             html.end_table();
 
-            // Per-class + per-problem breakdown.
-            let mut groups: std::collections::HashMap<(u32, u8), (u64, i64)> =
-                std::collections::HashMap::new();
-            for record in &records {
-                let entry = groups.entry((record.class_idx, record.kind)).or_insert((0, 0));
-                entry.0 += 1;
-                entry.1 += record.waste;
-            }
-            let mut groups: Vec<((u32, u8), (u64, i64))> = groups.into_iter().collect();
-            groups.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
 
             html.append_raw(
                 "<details><summary>Per-class breakdown</summary><div class=\"scroll-wrap\">",
@@ -1644,10 +1722,6 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_raw("</div>\n</details>\n");
 
             // Per-instance reference chains for the largest problem arrays.
-            let mut samples: Vec<(i64, u64)> =
-                records.iter().map(|r| (r.waste, r.obj_id)).collect();
-            samples.sort_by(|a, b| b.0.cmp(&a.0));
-            let sample_ids: Vec<u64> = samples.iter().take(10).map(|(_, id)| *id).collect();
             self.render_instance_ref_chains(
                 html,
                 "Per-instance reference chains for sample bad primitive arrays",
@@ -2449,43 +2523,42 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             };
 
             // Walk parent[] for every visited object, compute chain depth.
-            let mut depths: Vec<u32> = vec![0; data.object_count as usize];
+            let mut depths = DepthMemo::new(data.object_count);
             let mut visited_chain: Vec<u32> = Vec::with_capacity(64);
-            let mut long_chains: Vec<(u32, u32)> = Vec::new(); // (depth, obj_idx)
+            // The section renders long_chains.len() rows at most, so the collector
+            // keeps that many entries. Recording one entry per node of every deep
+            // chain instead costs a megabyte per ten thousand nodes, and a heap full
+            // of caches and linked lists has hundreds of millions of them.
+            let mut long_chains: Vec<(u32, u32)> = Vec::with_capacity(top_n); // (depth, obj_idx)
 
-            for idx in 0..data.object_count as usize {
-                if !data.visited.get(idx as u32) || depths[idx] > 0 {
+            for idx in 0..data.object_count {
+                if !data.visited.get(idx) || depths.get(idx) > 0 {
                     continue;
                 }
                 visited_chain.clear();
-                let mut current = idx as u32;
+                let mut current = idx;
                 loop {
-                    let cur = current as usize;
-                    if depths[cur] > 0 {
+                    if depths.get(current) > 0 {
                         // Found a known depth — backfill.
-                        let mut d = depths[cur];
+                        let mut d = depths.get(current);
                         for &node in visited_chain.iter().rev() {
                             d += 1;
-                            depths[node as usize] = d;
+                            depths.set(node, d);
                             if d >= threshold {
-                                long_chains.push((d, node));
+                                record_long_chain(&mut long_chains, d, node, top_n);
                             }
                         }
                         break;
                     }
-                    let parent = data.parent.parent_of(cur as u32).0;
+                    let parent = data.parent.parent_of(current).0;
                     if parent == u32::MAX {
-                        depths[cur] = 1;
-                        for &node in visited_chain.iter().rev() {
-                            let d = depths[node as usize] + 1;
-                            // depths[node] hasn't been set yet. Use a counter.
-                        }
+                        depths.set(current, 1);
                         let mut d = 1u32;
                         for &node in visited_chain.iter().rev() {
                             d += 1;
-                            depths[node as usize] = d;
+                            depths.set(node, d);
                             if d >= threshold {
-                                long_chains.push((d, node));
+                                record_long_chain(&mut long_chains, d, node, top_n);
                             }
                         }
                         break;
@@ -3213,3 +3286,111 @@ fn format_root_description(meta: &ss_stats::ref_chain::GcRootMeta) -> String {
     }
 }
 
+
+
+
+/// Keep the `limit` deepest chains, ties in discovery order — the order the
+/// section's stable sort by depth then truncation used to keep.
+fn record_long_chain(chains: &mut Vec<(u32, u32)>, depth: u32, obj_idx: u32, limit: usize) {
+    if chains.len() >= limit && depth <= chains[limit - 1].0 {
+        return;
+    }
+    let pos = chains
+        .iter()
+        .position(|&(d, _)| d < depth)
+        .unwrap_or(chains.len());
+    chains.insert(pos, (depth, obj_idx));
+    if chains.len() > limit {
+        chains.truncate(limit);
+    }
+}
+/// Depth memo for the long-chain section: one root distance per object.
+///
+/// The section needs the distance of every object to find the chains deeper than
+/// its threshold, which is 4 B per object — 480 MB on a 120 M-object dump, and the
+/// largest single allocation the report makes. Above DEPTH_MEMO_RAM_OBJECTS the
+/// distances live in a scratch file the kernel pages in and out, the same shape the
+/// pipeline already uses for its parent log and dump-order table, so the allocator
+/// stays bounded while the section computes the same distances.
+enum DepthMemo {
+    Ram(Vec<u32>),
+    File {
+        map: memmap2::MmapMut,
+        path: std::path::PathBuf,
+    },
+}
+
+/// Objects a depth memo may hold in RAM before it moves to a scratch file.
+const DEPTH_MEMO_RAM_OBJECTS: u32 = 8 << 20;
+
+impl DepthMemo {
+    fn new(objects: u32) -> Self {
+        let bytes = objects as usize * std::mem::size_of::<u32>();
+        if objects <= DEPTH_MEMO_RAM_OBJECTS {
+            return Self::Ram(vec![0u32; objects as usize]);
+        }
+        let dir = std::env::var_os("SS_MAT_TEMP_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("ss-mat-depth-{}.rec", std::process::id()));
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .and_then(|file| {
+                file.set_len(bytes as u64)?;
+                // SAFETY: the map is only ever read and written through this type,
+                // and the file is private to this process.
+                let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
+                Ok(map)
+            });
+        match opened {
+            Ok(map) => Self::File { map, path },
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                Self::Ram(vec![0u32; objects as usize])
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: u32) -> u32 {
+        match self {
+            Self::Ram(values) => values.get(idx as usize).copied().unwrap_or(0),
+            Self::File { map, .. } => {
+                let off = idx as usize * 4;
+                match map.get(off..off + 4) {
+                    Some(bytes) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    None => 0,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: u32, value: u32) {
+        match self {
+            Self::Ram(values) => {
+                if let Some(slot) = values.get_mut(idx as usize) {
+                    *slot = value;
+                }
+            }
+            Self::File { map, .. } => {
+                let off = idx as usize * 4;
+                if off + 4 <= map.len() {
+                    map[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DepthMemo {
+    fn drop(&mut self) {
+        if let Self::File { path, .. } = self {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}

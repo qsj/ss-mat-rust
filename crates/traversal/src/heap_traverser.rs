@@ -1,5 +1,5 @@
 use std::collections::hash_map::HashMap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -15,7 +15,8 @@ use ss_heap_model::root::{HeapRootReference, RootType};
 use ss_stats::engine::StatsEngine;
 use ss_stats::ref_chain::{ChainStep, ClassRefChains, RefChainGroup, RefChainStore};
 use ss_stats::traversal_data::{
-    entry_of, object_kind, DumpOrder, FieldPool, LiveSet, ObjectEntry, ParentStore, TraversalData,
+    entry_of, object_kind, DumpOrder, FieldPool, LiveSet, ObjectEntry, ParentStore, RootStore,
+    TraversalData,
     NO_PARENT, PARENT_REC_SIZE,
 };
 use ss_support::external_sort::ExternalSorter;
@@ -119,11 +120,14 @@ impl<'a> ObjectStore<'a> {
     /// skipping references that point at class dumps (the BFS never followed
     /// those, and never counted them).
     ///
-    /// The callback receives the child address rank, its kind and class index
-    /// (both already resolved from the directory) and the field key.
-    fn for_each_ref<F>(&self, rank: u32, pool: &mut FieldPool, buf: &mut Vec<u8>, f: &mut F)
+    /// The callback receives the child address rank, the child directory record
+    /// (already resolved) and the field key. Callers that need more of the child
+    /// than its kind read it here instead of querying the directory again: one
+    /// extra lookup per edge against a multi-gigabyte directory is the difference
+    /// between a sequential pass and a random one.
+    fn walk_refs<F>(&self, rank: u32, pool: &mut FieldPool, buf: &mut Vec<u8>, f: &mut F)
     where
-        F: FnMut(u32, u8, u32, u32),
+        F: FnMut(u32, ObjRec, u32),
     {
         let rec = match self.rec(rank) {
             Some(r) => r,
@@ -167,7 +171,7 @@ impl<'a> ObjectStore<'a> {
                                         if let Some((child, crec)) = self.resolve(addr) {
                                             if crec.kind != 3 {
                                                 let fk = pool.intern(fd.name.as_ref());
-                                                f(child, crec.kind, crec.class_idx, fk);
+                                                f(child, crec, fk);
                                             }
                                         }
                                     }
@@ -210,9 +214,116 @@ impl<'a> ObjectStore<'a> {
                             if addr != 0 {
                                 if let Some((child, crec)) = self.resolve(addr) {
                                     if crec.kind != 3 {
-                                        f(child, crec.kind, crec.class_idx, 0);
+                                        f(child, crec, 0);
                                     }
                                 }
+                            }
+                        }
+                    }
+                    i += cnt;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// walk_refs reduced to the arguments callers that ignore the child record
+    /// need: its kind and class index.
+    fn for_each_ref<F>(&self, rank: u32, pool: &mut FieldPool, buf: &mut Vec<u8>, f: &mut F)
+    where
+        F: FnMut(u32, u8, u32, u32),
+    {
+        self.walk_refs(rank, pool, buf, &mut |child, rec, fk| {
+            f(child, rec.kind, rec.class_idx, fk)
+        });
+    }
+
+    /// Decode the outgoing references of one object as raw target addresses.
+    ///
+    /// The reverse-index pass only asks whether a target is one of the wanted
+    /// objects, so resolving every edge against the directory — one 128 KiB block
+    /// read per miss — would be wasted: a few thousand targets match and only
+    /// those are looked up.
+    fn walk_ref_addr<F>(&self, rec: ObjRec, pool: &mut FieldPool, buf: &mut Vec<u8>, f: &mut F)
+    where
+        F: FnMut(u64, u32),
+    {
+        match object_kind(rec.kind) {
+            0 => {
+                let cls = match self.heap.classes.get(rec.class_idx as usize) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let need = self.instance_body_width(cls);
+                if need == 0 {
+                    return;
+                }
+                let got = self.read_at(rec.file_offset, need, buf);
+                if got == 0 {
+                    return;
+                }
+                let mut offset = 0usize;
+                let mut cid = Some(cls.class_object_id);
+                while let Some(id) = cid {
+                    let c = if id == cls.class_object_id {
+                        Some(cls)
+                    } else {
+                        self.super_class(id)
+                    };
+                    let c = match c {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    for fd in &c.instance_fields {
+                        if fd.type_code == 2 {
+                            let skip = self.skip_instance_fields.iter().any(|(cn, fnn)| {
+                                *cn == c.name.as_ref() && *fnn == fd.name.as_ref()
+                            });
+                            if !skip {
+                                if let Some(addr) = read_id_from(&buf[..got], offset, self.id_bytes)
+                                {
+                                    if addr != 0 {
+                                        let fk = pool.intern(fd.name.as_ref());
+                                        f(addr, fk);
+                                    }
+                                }
+                            }
+                            offset += self.id_bytes;
+                        } else {
+                            offset += field_type_size(fd.type_code, self.id_bytes);
+                        }
+                    }
+                    cid = if c.super_class_id != 0 {
+                        Some(c.super_class_id)
+                    } else {
+                        None
+                    };
+                }
+            }
+            2 => {
+                let len = rec.len as usize;
+                if len == 0 || rec.file_offset == 0 {
+                    return;
+                }
+                let mut i = 0usize;
+                while i < len {
+                    let want = (len - i) * self.id_bytes;
+                    let chunk = want.min(ARRAY_READ_CHUNK);
+                    let got =
+                        self.read_at(rec.file_offset + (i * self.id_bytes) as u64, chunk, buf);
+                    if got == 0 {
+                        break;
+                    }
+                    let cnt = got / self.id_bytes;
+                    if cnt == 0 {
+                        break;
+                    }
+                    for k in 0..cnt {
+                        if let Some(addr) =
+                            read_id_from(&buf[..got], k * self.id_bytes, self.id_bytes)
+                        {
+                            if addr != 0 {
+                                f(addr, 0);
                             }
                         }
                     }
@@ -499,6 +610,7 @@ impl HeapObjectTraverser {
         // lists objects in, plus the class-dump static references (the only
         // class-dump edges that matter, and only for the root tree display).
         eprintln!("BFS Phase 1: reading the dump object order...");
+        let bfs_t0 = std::time::Instant::now();
         let mut class_statics: Vec<(u32, Vec<(u64, u32)>)> = Vec::new();
         {
             let pass = DumpPass::open(hprof_path)?;
@@ -612,6 +724,7 @@ impl HeapObjectTraverser {
         // Phase 2: sort (address, dump rank) by address and invert it into the
         // dump-order table, so the report can still enumerate objects in the
         // dump's own order while everything else runs on address ranks.
+        let bfs_t_order = bfs_t0.elapsed().as_secs_f64();
         eprintln!("BFS Phase 2: building the dump-order table...");
         {
             let sorter = ExternalSorter::new(ADDR_RANK_REC, SORT_MEM_BUDGET);
@@ -652,6 +765,7 @@ impl HeapObjectTraverser {
             let _ = std::fs::remove_file(&sorted_path);
         }
         let order = DumpOrder::open(&order_path, object_count)?;
+        let bfs_t_sort = bfs_t0.elapsed().as_secs_f64() - bfs_t_order;
         ss_support::mem_trace::trace("bfs-object-table");
 
         // Aggregates that used to fall out of the in-memory object table.
@@ -697,13 +811,21 @@ impl HeapObjectTraverser {
             skip_instance_fields: &skip_instance_field_pairs,
         };
 
-        // Phase 3: BFS traversal from GC roots. Reference lists are decoded from
-        // the dump on demand; the parent log goes straight into a mmapped file.
+        // Phase 3: BFS traversal from GC roots. The frontier of one BFS batch is
+        // a file of address ranks: sorting it and merge-joining it with the
+        // address-ordered object directory turns the batch into one ascending
+        // directory sweep, and the bodies are read in ascending dump offset.
         let mut visited = LiveSet::new(object_count);
-        let mut deferred_queue: VecDeque<u32> = VecDeque::new();
-        let mut root_of: Vec<u32> = vec![GC_ROOT_GARBAGE_SENTINEL; object_count as usize];
         let mut root_metas: HashMap<u32, ss_stats::ref_chain::GcRootMeta> = HashMap::new();
-        let mut queue: VecDeque<u32> = VecDeque::with_capacity(65536);
+        let mut gc_roots: HashSet<u32> = HashSet::new();
+        let roots_path = temp_dir.join(format!("bfs-roots-{pid}.rec"));
+        let mut root_store = RootStore::create(&roots_path, object_count)?;
+        let mut scratch = Scratch::new();
+        let seed_normal_path = scratch.path(&temp_dir, &format!("bfs-{pid}-seed-n.frt"));
+        let seed_defer_path = scratch.path(&temp_dir, &format!("bfs-{pid}-seed-d.frt"));
+        let mut seed_normal = FrontierWriter::new(&seed_normal_path)?;
+        let mut seed_defer = FrontierWriter::new(&seed_defer_path)?;
+        let class_field_bytes = precompute_class_field_bytes(&self.heap, &class_obj_to_idx, id_bytes);
         let mut ref_buf: Vec<u8> = Vec::with_capacity(4096);
 
         let parent_file = std::fs::OpenOptions::new()
@@ -826,14 +948,15 @@ impl HeapObjectTraverser {
                 if priority != 0 {
                     if !visited.get(rank) {
                         visited.set(rank);
-                        root_of[rank as usize] = rank;
+                        root_store.write_direct(rank, rank)?;
+                        gc_roots.insert(rank);
                         if priority == 1 {
-                            deferred_queue.push_back(rank);
+                            seed_defer.push(rank, rank, &rec)?;
                             if let Some(r) = row.as_mut() {
                                 r.action = "seeded_deferred";
                             }
                         } else {
-                            queue.push_back(rank);
+                            seed_normal.push(rank, rank, &rec)?;
                             if let Some(r) = row.as_mut() {
                                 r.action = "seeded_normal";
                             }
@@ -866,186 +989,47 @@ impl HeapObjectTraverser {
             }
         }
 
-        let mut visited_count: u64 = 0;
-        let mut class_object_visited: u64 = 0;
+        let bfs_t_seed = bfs_t0.elapsed().as_secs_f64() - bfs_t_order - bfs_t_sort;
+        let seed_normal = seed_normal.finish()?;
+        let seed_defer = seed_defer.finish()?;
 
-        // Phase A: Normal BFS
-        while let Some(rank) = queue.pop_front() {
-            visited_count += 1;
-            let rec = match store.rec(rank) {
-                Some(r) => r,
-                None => continue,
+        let (visited_count, class_object_visited) = {
+            let mut bfs = Bfs {
+                store: &store,
+                id_bytes,
+                class_field_bytes: &class_field_bytes,
+                class_aligned_body: &class_aligned_body,
+                defer_class_indices: &defer_class_indices,
+                tree_set_idx,
+                tree_map_idx,
+                keys: [map_key, backing_map_key, root_key, left_key, right_key],
+                value_key,
+                stats: Arc::clone(&self.stats),
+                oop_size,
+                header_size,
+                temp_dir: temp_dir.clone(),
+                pid,
+                scratch,
+                gen: 0,
+                visited_count: 0,
+                class_object_visited: 0,
             };
-            let entry = entry_of(&self.heap, rec);
-            if entry.kind == 3 {
-                class_object_visited += 1;
-            }
-
-            if (entry.class_idx as usize) < self.heap.classes.len() {
-                let shallow = if entry.kind == 0 {
-                    class_aligned_body[entry.class_idx as usize]
-                } else if entry.kind == 1 {
-                    compute_obj_shallow(&entry, oop_size as i32, header_size)
-                } else {
-                    array_shallow_size(entry.array_length, oop_size as i32, header_size)
+            {
+                let mut ctx = BfsCtx {
+                    visited: &mut visited,
+                    roots: &mut root_store,
+                    parent: &mut parent_map,
+                    pool: &mut field_pool,
+                    set_backing_maps: &mut set_backing_maps,
+                    set_entries: &mut set_entries,
                 };
-                if let Some(pc) = self.stats.get_per_class(entry.class_idx) {
-                    pc.retained_size.fetch_add(shallow, Relaxed);
-                }
+                bfs.run(&mut ctx, seed_normal, seed_defer)?;
             }
+            (bfs.visited_count, bfs.class_object_visited)
+        };
 
-            if entry.kind != 3 {
-                prepare_tree_set_entries(
-                    &store,
-                    rank,
-                    entry.class_idx,
-                    tree_set_idx,
-                    tree_map_idx,
-                    &mut field_pool,
-                    &mut ref_buf,
-                    [map_key, backing_map_key, root_key, left_key, right_key],
-                    &mut set_backing_maps,
-                    &mut set_entries,
-                );
-                let in_set_entries = set_entries.contains(&rank);
-                store.for_each_ref(rank, &mut field_pool, &mut ref_buf, &mut |child, kind, class_idx, fk| {
-                    if in_set_entries && fk == value_key {
-                        return;
-                    }
-                    if visited.get(child) {
-                        return;
-                    }
-                    visited.set(child);
-                    let off = child as usize * PARENT_REC_SIZE;
-                    parent_map[off..off + 4].copy_from_slice(&rank.to_le_bytes());
-                    parent_map[off + 4..off + 8].copy_from_slice(&fk.to_le_bytes());
-                    root_of[child as usize] = root_of[rank as usize];
-                    if kind == 0 && defer_class_indices.contains(&class_idx) {
-                        deferred_queue.push_back(child);
-                    } else {
-                        queue.push_back(child);
-                    }
-                });
-            }
-        }
-
-        // Phase B: Process deferred (weak/finalizer/cleaner) objects. Java's second
-        // pass follows every child, so the two queues drain together.
-        while !deferred_queue.is_empty() || !queue.is_empty() {
-            while let Some(rank) = deferred_queue.pop_front() {
-                visited_count += 1;
-                let rec = match store.rec(rank) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let entry = entry_of(&self.heap, rec);
-                if entry.kind == 3 {
-                    class_object_visited += 1;
-                }
-                if (entry.class_idx as usize) < self.heap.classes.len() {
-                    let shallow = if entry.kind == 0 {
-                        class_aligned_body[entry.class_idx as usize]
-                    } else if entry.kind == 1 {
-                        compute_obj_shallow(&entry, oop_size as i32, header_size)
-                    } else {
-                        array_shallow_size(entry.array_length, oop_size as i32, header_size)
-                    };
-                    if let Some(pc) = self.stats.get_per_class(entry.class_idx) {
-                        pc.retained_size.fetch_add(shallow, Relaxed);
-                    }
-                }
-
-                prepare_tree_set_entries(
-                    &store,
-                    rank,
-                    entry.class_idx,
-                    tree_set_idx,
-                    tree_map_idx,
-                    &mut field_pool,
-                    &mut ref_buf,
-                    [map_key, backing_map_key, root_key, left_key, right_key],
-                    &mut set_backing_maps,
-                    &mut set_entries,
-                );
-                let in_set_entries = set_entries.contains(&rank);
-                store.for_each_ref(rank, &mut field_pool, &mut ref_buf, &mut |child, kind, class_idx, fk| {
-                    if in_set_entries && fk == value_key {
-                        return;
-                    }
-                    if visited.get(child) {
-                        return;
-                    }
-                    visited.set(child);
-                    let off = child as usize * PARENT_REC_SIZE;
-                    parent_map[off..off + 4].copy_from_slice(&rank.to_le_bytes());
-                    parent_map[off + 4..off + 8].copy_from_slice(&fk.to_le_bytes());
-                    root_of[child as usize] = root_of[rank as usize];
-                    if kind == 0 && defer_class_indices.contains(&class_idx) {
-                        deferred_queue.push_back(child);
-                    } else {
-                        queue.push_back(child);
-                    }
-                });
-            }
-
-            // Drain regular queue items discovered from deferred objects
-            while let Some(rank) = queue.pop_front() {
-                visited_count += 1;
-                let rec = match store.rec(rank) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let entry = entry_of(&self.heap, rec);
-                if entry.kind == 3 {
-                    class_object_visited += 1;
-                }
-                if (entry.class_idx as usize) < self.heap.classes.len() {
-                    let shallow = if entry.kind == 0 {
-                        class_aligned_body[entry.class_idx as usize]
-                    } else if entry.kind == 1 {
-                        compute_obj_shallow(&entry, oop_size as i32, header_size)
-                    } else {
-                        array_shallow_size(entry.array_length, oop_size as i32, header_size)
-                    };
-                    if let Some(pc) = self.stats.get_per_class(entry.class_idx) {
-                        pc.retained_size.fetch_add(shallow, Relaxed);
-                    }
-                }
-
-                prepare_tree_set_entries(
-                    &store,
-                    rank,
-                    entry.class_idx,
-                    tree_set_idx,
-                    tree_map_idx,
-                    &mut field_pool,
-                    &mut ref_buf,
-                    [map_key, backing_map_key, root_key, left_key, right_key],
-                    &mut set_backing_maps,
-                    &mut set_entries,
-                );
-                let in_set_entries = set_entries.contains(&rank);
-                store.for_each_ref(rank, &mut field_pool, &mut ref_buf, &mut |child, kind, class_idx, fk| {
-                    if in_set_entries && fk == value_key {
-                        return;
-                    }
-                    if visited.get(child) {
-                        return;
-                    }
-                    visited.set(child);
-                    let off = child as usize * PARENT_REC_SIZE;
-                    parent_map[off..off + 4].copy_from_slice(&rank.to_le_bytes());
-                    parent_map[off + 4..off + 8].copy_from_slice(&fk.to_le_bytes());
-                    root_of[child as usize] = root_of[rank as usize];
-                    if kind == 0 && defer_class_indices.contains(&class_idx) {
-                        deferred_queue.push_back(child);
-                    } else {
-                        queue.push_back(child);
-                    }
-                });
-            }
-        }
-
+        root_store.flush()?;
+        let bfs_t_run = bfs_t0.elapsed().as_secs_f64() - bfs_t_order - bfs_t_sort - bfs_t_seed;
         parent_map.flush()?;
         drop(parent_map);
         drop(parent_file);
@@ -1161,13 +1145,17 @@ impl HeapObjectTraverser {
             );
         }
 
+        let bfs_t_garbage = bfs_t0.elapsed().as_secs_f64()
+            - bfs_t_order - bfs_t_sort - bfs_t_seed - bfs_t_run;
         // Phase 3c: Build GC root trees for Section 4
         ss_support::mem_trace::trace("bfs-traversal-done");
+        let bfs_t_3c = std::time::Instant::now();
         eprintln!("BFS Phase 3c: building GC root trees...");
         let parent = ParentStore::open(&parent_path, object_count)?;
         let mut gc_root_store = build_gc_root_trees(
             &store,
-            &root_of,
+            &root_store,
+            &gc_roots,
             &visited,
             &class_static_edges,
             &root_metas,
@@ -1206,8 +1194,10 @@ impl HeapObjectTraverser {
         );
         *self.stats.gc_roots.lock().expect("stats mutex poisoned") = gc_root_store;
 
+        let bfs_t_roottree = bfs_t_3c.elapsed().as_secs_f64();
         // Phase 4: Reference chain analysis for top classes
         ss_support::mem_trace::trace("bfs-root-trees");
+        let bfs_t_4 = std::time::Instant::now();
         eprintln!("BFS Phase 4: analyzing reference chains...");
         let ref_chain_store = analyze_ref_chains(
             hprof_path,
@@ -1219,8 +1209,10 @@ impl HeapObjectTraverser {
             &self.heap,
             oop_size,
             header_size,
-        );
+        )?;
+        let bfs_t_chains = bfs_t_4.elapsed().as_secs_f64();
         ss_support::mem_trace::trace("phase4-ref-chains");
+        let bfs_t_4b = std::time::Instant::now();
         let chain_count = ref_chain_store.chains.len();
 
         // Phase 4b: Humongous-specific reference chain analysis for Section 19
@@ -1241,8 +1233,21 @@ impl HeapObjectTraverser {
             header_size,
             humongous_threshold,
         );
+        let bfs_t_humongous = bfs_t_4b.elapsed().as_secs_f64();
+        if std::env::var_os("SS_MAT_BFS_DEBUG").is_some() {
+            eprintln!(
+                "  [bfs-phases] order={:.2} order_sort={:.2} seed={:.2} run={:.2} garbage={:.2} root_trees={:.2} chains={:.2} humongous={:.2}",
+                bfs_t_order, bfs_t_sort, bfs_t_seed, bfs_t_run, bfs_t_garbage, bfs_t_roottree, bfs_t_chains, bfs_t_humongous
+            );
+        }
         ss_support::mem_trace::trace("phase4b-humongous");
         ref_chain_store.humongous_chains = humongous_chains;
+
+        if let Some(dir) = ss_stats::debug_dump::debug_dir() {
+            if let Err(e) = ss_stats::debug_dump::write_ref_chains(&dir, &ref_chain_store) {
+                eprintln!("Debug: failed to write ref_chains.tsv: {}", e);
+            }
+        }
 
         *self.stats.ref_chains.lock().expect("stats mutex poisoned") = ref_chain_store;
 
@@ -1253,7 +1258,8 @@ impl HeapObjectTraverser {
                 object_count,
                 order,
                 parent,
-                root_of,
+                root_of: root_store,
+                gc_roots,
                 visited,
                 field_pool,
             });
@@ -1389,6 +1395,1083 @@ pub(crate) fn array_shallow_size(length: i32, element_size: i32, header_size: i6
     (raw + 7) & !7
 }
 
+// ============================================================
+// Sequential BFS: frontier records, scratch files, batch pipeline
+// ============================================================
+
+/// Frontier and body-plan record: one pending object of a batch.
+///
+/// The record carries everything the BFS needs from the object directory (the
+/// directory answers it once, when the object is claimed), so a batch never has
+/// to sweep the directory for its own members. The file offset is the sort key of
+/// the body pass, which is what turns a batch into one ascending body scan.
+///
+/// [0..8] file_offset, [8..12] rank, [12..16] pop_index, [16..20] root,
+/// [20..24] len, [24..28] class_idx, [28] kind, [29] elem
+const PLAN_REC: usize = 40;
+
+/// Outgoing edge, keyed by child address so that resolving it is one ascending
+/// sweep over the object directory.
+///
+/// [0..8] child address, [8..12] pop_index, [12..16] edge seq, [16..20] field
+/// key, [20..24] root
+const EDGE_REC: usize = 24;
+
+/// One claimed object, keyed by (pop index, edge seq) so sorting it recovers the
+/// discovery order the FIFO queue would have produced.
+///
+/// [0..8] key, [8..12] rank, [12..16] parent rank, [16..20] field key,
+/// [20..24] root, [24..28] len, [28..32] class_idx, [32..40] file_offset,
+/// [40] kind, [41] elem
+const CLAIM_REC: usize = 48;
+
+/// Bodies are read in runs covering at most this many bytes.
+const BODY_RUN_BYTES: usize = 1 << 20;
+
+/// Frontier records the driver keeps in memory instead of in a file.
+const RAM_FRONTIER_BYTES: usize = 8 << 20;
+
+/// Frontiers up to this many members take the direct object-store path.
+const TINY_BATCH: u32 = 256;
+
+/// Fixed-record files up to this size are sorted in memory.
+const SORT_IN_MEMORY_LIMIT: usize = 64 << 20;
+
+#[inline]
+fn rd_u32(rec: &[u8], off: usize) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&rec[off..off + 4]);
+    u32::from_le_bytes(b)
+}
+
+#[inline]
+fn rd_u64(rec: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&rec[off..off + 8]);
+    u64::from_le_bytes(b)
+}
+
+#[inline]
+fn put_u32(rec: &mut [u8], off: usize, value: u32) {
+    rec[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn put_u64(rec: &mut [u8], off: usize, value: u64) {
+    rec[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Sort a fixed-record file by a 64-bit key, in memory when it fits.
+///
+/// The external sorter allocates 256 bucket files per call, which costs more than
+/// the sort itself for the many tiny batches of a deep object graph.
+fn sort_records<K>(input: &Path, out: &Path, rec_size: usize, key: K) -> std::io::Result<u64>
+where
+    K: Fn(&[u8]) -> u64,
+{
+    let len = std::fs::metadata(input)?.len() as usize;
+    if len > SORT_IN_MEMORY_LIMIT {
+        return ExternalSorter::new(rec_size, SORT_MEM_BUDGET).sort_file(input, out, key);
+    }
+    let mut buf = vec![0u8; len];
+    std::io::Read::read_exact(&mut std::fs::File::open(input)?, &mut buf)?;
+    let count = len / rec_size;
+    let mut order: Vec<u32> = (0..count as u32).collect();
+    order.sort_unstable_by_key(|&index| {
+        let start = index as usize * rec_size;
+        key(&buf[start..start + rec_size])
+    });
+    let mut writer = std::io::BufWriter::with_capacity(1 << 18, std::fs::File::create(out)?);
+    for &index in order.iter() {
+        let start = index as usize * rec_size;
+        std::io::Write::write_all(&mut writer, &buf[start..start + rec_size])?;
+    }
+    std::io::Write::flush(&mut writer)?;
+    Ok(count as u64)
+}
+
+/// Field bytes HPROF stores for one instance of each class, i.e. how much of an
+/// object body the BFS must read to see every reference field.
+fn precompute_class_field_bytes(
+    heap: &HeapDump,
+    class_by_address: &HashMap<u64, u32>,
+    id_bytes: usize,
+) -> Vec<u32> {
+    let mut out = vec![0u32; heap.classes.len()];
+    for cls in &heap.classes {
+        let width = class_chain_field_bytes(cls, class_by_address, &heap.classes, id_bytes);
+        out[cls.index as usize] = width.min(u32::MAX as usize) as u32;
+    }
+    out
+}
+
+/// Files the BFS creates, removed when this guard drops.
+struct Scratch {
+    paths: Vec<PathBuf>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn path(&mut self, dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        self.paths.push(path.clone());
+        path
+    }
+
+    fn remove(&mut self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A batch of pending objects, in processing order.
+struct Frontier {
+    path: PathBuf,
+    len: u32,
+    /// Records held in memory instead of in `path`: a long chain of deferred
+    /// objects produces frontiers of one or two members for tens of thousands of
+    /// consecutive rounds, where a file per round costs more than the traversal.
+    ram: Option<Vec<u8>>,
+}
+
+/// Append-only writer for one frontier.
+struct FrontierWriter {
+    out: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    len: u32,
+}
+
+impl FrontierWriter {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            out: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?),
+            path: path.to_path_buf(),
+            len: 0,
+        })
+    }
+
+    /// Append one member from its object-directory record.
+    fn push(&mut self, rank: u32, root: u32, rec: &ObjRec) -> std::io::Result<()> {
+        let mut out = [0u8; PLAN_REC];
+        put_u64(&mut out, 0, rec.file_offset);
+        put_u32(&mut out, 8, rank);
+        put_u32(&mut out, 12, self.len);
+        put_u32(&mut out, 16, root);
+        put_u32(&mut out, 20, rec.len);
+        put_u32(&mut out, 24, rec.class_idx);
+        out[28] = rec.kind;
+        out[29] = rec.elem;
+        self.out.write_all(&out)?;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Append one member from a claim record.
+    fn push_claim(&mut self, claim: &[u8]) -> std::io::Result<()> {
+        let mut out = [0u8; PLAN_REC];
+        out[0..8].copy_from_slice(&claim[32..40]);
+        put_u32(&mut out, 8, rd_u32(claim, 8));
+        put_u32(&mut out, 12, self.len);
+        put_u32(&mut out, 16, rd_u32(claim, 20));
+        put_u32(&mut out, 20, rd_u32(claim, 24));
+        put_u32(&mut out, 24, rd_u32(claim, 28));
+        out[28] = claim[40];
+        out[29] = claim[41];
+        self.out.write_all(&out)?;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<Frontier> {
+        self.out.flush()?;
+        Ok(Frontier {
+            path: self.path.clone(),
+            len: self.len,
+            ram: None,
+        })
+    }
+}
+
+/// Append one frontier to another, renumbering the pop index so it stays the
+/// record's position inside the combined batch.
+///
+/// The append is in place: a growing pending list must cost one write of the new
+/// members, not a copy of everything already pending.
+fn append_into(target: &mut Frontier, addition: Frontier) -> anyhow::Result<()> {
+    if addition.len == 0 {
+        if addition.ram.is_none() {
+            let _ = std::fs::remove_file(&addition.path);
+        }
+        return Ok(());
+    }
+    if target.len == 0 {
+        *target = addition;
+        return Ok(());
+    }
+    let mut index = target.len;
+    // Keep the combined list in memory while it stays small.
+    let keep_in_ram = target.ram.is_some() || addition.ram.is_some();
+    if keep_in_ram && (target.len as usize + addition.len as usize) * PLAN_REC <= RAM_FRONTIER_BYTES {
+        let mut combined: Vec<u8> = Vec::with_capacity((target.len as usize + addition.len as usize) * PLAN_REC);
+        let mut index = 0u32;
+        let mut push = |rec: &[u8], index: &mut u32, combined: &mut Vec<u8>| {
+            let mut copy = [0u8; PLAN_REC];
+            copy.copy_from_slice(rec);
+            put_u32(&mut copy, 12, *index);
+            *index += 1;
+            combined.extend_from_slice(&copy);
+        };
+        for_each_frontier_rec(target, |rec| {
+            push(rec, &mut index, &mut combined);
+            Ok(())
+        })?;
+        for_each_frontier_rec(&addition, |rec| {
+            push(rec, &mut index, &mut combined);
+            Ok(())
+        })?;
+        // The file a spilled target left behind is superseded by the buffer.
+        if target.ram.is_none() {
+            let _ = std::fs::remove_file(&target.path);
+        }
+        target.ram = Some(combined);
+        target.len = index;
+        let _ = std::fs::remove_file(&addition.path);
+        return Ok(());
+    }
+    spill_frontier(target)?;
+    let mut addition = addition;
+    spill_frontier(&mut addition)?;
+    {
+        let file = std::fs::OpenOptions::new().append(true).open(&target.path)
+            .map_err(|e| anyhow!("append target {}: {}", target.path.display(), e))?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        for_each_rec(&addition.path, PLAN_REC, |rec| {
+            let mut copy = [0u8; PLAN_REC];
+            copy.copy_from_slice(rec);
+            put_u32(&mut copy, 12, index);
+            index += 1;
+            out.write_all(&copy)
+        })?;
+        out.flush()?;
+    }
+    target.len = index;
+    let _ = std::fs::remove_file(&addition.path);
+    Ok(())
+}
+
+/// Visit the records of a frontier held in memory or in a file.
+fn for_each_frontier_rec<F>(frontier: &Frontier, mut f: F) -> anyhow::Result<()>
+where
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    match frontier.ram.as_deref() {
+        Some(records) => {
+            for rec in records.chunks_exact(PLAN_REC) {
+                f(rec)?;
+            }
+            Ok(())
+        }
+        None => for_each_rec(&frontier.path, PLAN_REC, f)
+            .map_err(|e| anyhow!("read frontier {}: {}", frontier.path.display(), e)),
+    }
+}
+
+/// Move an in-memory frontier to its file.
+fn spill_frontier(frontier: &mut Frontier) -> anyhow::Result<()> {
+    let records = match frontier.ram.take() {
+        Some(records) => records,
+        None => return Ok(()),
+    };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&frontier.path)
+        .map_err(|e| anyhow!("spill {}: {}", frontier.path.display(), e))?);
+    std::io::Write::write_all(&mut out, &records)?;
+    std::io::Write::flush(&mut out)?;
+    Ok(())
+}
+
+/// Stream a fixed-record file, one record at a time.
+fn for_each_rec<F>(path: &Path, rec_size: usize, mut f: F) -> std::io::Result<()>
+where
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    let file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len() as usize / rec_size;
+    let mut reader = std::io::BufReader::with_capacity(1 << 18, file);
+    let per = ((1 << 18) / rec_size).max(1);
+    let mut buf = vec![0u8; per * rec_size];
+    let mut done = 0usize;
+    while done < total {
+        let count = per.min(total - done).max(1);
+        let bytes = count * rec_size;
+        std::io::Read::read_exact(&mut reader, &mut buf[..bytes])?;
+        for record in buf[..bytes].chunks_exact(rec_size) {
+            f(record)?;
+        }
+        done += count;
+    }
+    Ok(())
+}
+
+/// Mutable traversal state the batch pipeline updates.
+struct BfsCtx<'a> {
+    visited: &'a mut LiveSet,
+    roots: &'a mut RootStore,
+    parent: &'a mut MmapMut,
+    pool: &'a mut FieldPool,
+    set_backing_maps: &'a mut HashSet<u32>,
+    set_entries: &'a mut HashSet<u32>,
+}
+
+/// Result of processing one batch: the same-queue continuation and the objects
+/// discovered for the other queue, both in discovery order.
+struct BatchOut {
+    same: Frontier,
+    other: Frontier,
+}
+
+/// Sequential BFS engine: every object body is read once in ascending dump
+/// offset, and every directory lookup happens in an ascending sweep.
+struct Bfs<'a> {
+    store: &'a ObjectStore<'a>,
+    id_bytes: usize,
+    class_field_bytes: &'a [u32],
+    class_aligned_body: &'a [i64],
+    defer_class_indices: &'a HashSet<u32>,
+    tree_set_idx: Option<u32>,
+    tree_map_idx: Option<u32>,
+    keys: [u32; 5],
+    value_key: u32,
+    stats: Arc<StatsEngine>,
+    oop_size: usize,
+    header_size: i64,
+    temp_dir: PathBuf,
+    pid: u32,
+    scratch: Scratch,
+    gen: u32,
+    visited_count: u64,
+    class_object_visited: u64,
+}
+
+impl<'a> Bfs<'a> {
+    /// Drive the two queues exactly like the FIFO version: phase A drains the
+    /// normal queue, then each outer round drains the deferred queue to empty and
+    /// the normal queue to empty, in that order.
+    fn run(
+        &mut self,
+        ctx: &mut BfsCtx<'_>,
+        normal: Frontier,
+        deferred: Frontier,
+    ) -> anyhow::Result<()> {
+        let mut normal = normal;
+        let mut deferred = deferred;
+
+        while normal.len > 0 {
+            let out = self.step(ctx, &mut normal, false)?;
+            let BatchOut { same, other } = out;
+            append_into(&mut deferred, other)?;
+            normal = same;
+        }
+
+        loop {
+            if deferred.len == 0 && normal.len == 0 {
+                break;
+            }
+            while deferred.len > 0 {
+                let out = self.step(ctx, &mut deferred, true)?;
+                let BatchOut { same, other } = out;
+                append_into(&mut normal, other)?;
+                deferred = same;
+            }
+            while normal.len > 0 {
+                let out = self.step(ctx, &mut normal, false)?;
+                let BatchOut { same, other } = out;
+                append_into(&mut deferred, other)?;
+                normal = same;
+            }
+        }
+        Ok(())
+    }
+
+    fn scratch_file(&mut self, suffix: &str) -> PathBuf {
+        let name = format!("bfs-{}-{}-{}", self.pid, self.gen, suffix);
+        self.scratch.path(&self.temp_dir, &name)
+    }
+
+    /// Bytes the BFS must read to see every reference of one object.
+    fn read_len_of(&self, kind: u8, class_idx: u32, len: u32, file_offset: u64) -> usize {
+        match object_kind(kind) {
+            0 => self
+                .class_field_bytes
+                .get(class_idx as usize)
+                .copied()
+                .unwrap_or(0) as usize,
+            2 => {
+                if len == 0 || file_offset == 0 {
+                    0
+                } else {
+                    len as usize * self.id_bytes
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Process one frontier, choosing the path that fits its size.
+    fn step(
+        &mut self,
+        ctx: &mut BfsCtx<'_>,
+        frontier: &mut Frontier,
+        deferred_batch: bool,
+    ) -> anyhow::Result<BatchOut> {
+        if frontier.len == 0 {
+            let same_path = self.scratch_file("empty-same.frt");
+            let other_path = self.scratch_file("empty-other.frt");
+            return Ok(BatchOut {
+                same: Frontier {
+                    path: same_path,
+                    len: 0,
+                    ram: Some(Vec::new()),
+                },
+                other: Frontier {
+                    path: other_path,
+                    len: 0,
+                    ram: Some(Vec::new()),
+                },
+            });
+        }
+        if frontier.len <= TINY_BATCH {
+            let out = self.process_tiny(ctx, frontier, deferred_batch)?;
+            if frontier.ram.is_none() {
+                self.scratch.remove(&frontier.path);
+            }
+            return Ok(out);
+        }
+        spill_frontier(frontier)?;
+        let out = self.process_frontier(ctx, frontier, deferred_batch)?;
+        self.scratch.remove(&frontier.path);
+        Ok(out)
+    }
+
+    /// Process a frontier of a few objects straight from the object store.
+    ///
+    /// Nothing is gained from planning, sorting and streaming a handful of
+    /// objects, and a chain of deferred objects produces such frontiers for tens
+    /// of thousands of consecutive rounds.
+    fn process_tiny(
+        &mut self,
+        ctx: &mut BfsCtx<'_>,
+        frontier: &Frontier,
+        deferred_batch: bool,
+    ) -> anyhow::Result<BatchOut> {
+        self.gen += 1;
+        let mut same: Vec<u8> = Vec::new();
+        let mut other: Vec<u8> = Vec::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut children: Vec<(u32, u8, u32, u32)> = Vec::new();
+        for_each_frontier_rec(frontier, |rec| {
+            let rank = rd_u32(rec, 8);
+            let root = rd_u32(rec, 16);
+            let class_idx = rd_u32(rec, 24);
+            let kind_raw = rec[28];
+            let len = rd_u32(rec, 20);
+            self.visited_count += 1;
+            if kind_raw == 3 {
+                self.class_object_visited += 1;
+            }
+            if (class_idx as usize) < self.store.heap.classes.len() {
+                let kind = object_kind(kind_raw);
+                let shallow = if kind == 0 {
+                    self.class_aligned_body[class_idx as usize]
+                } else if kind == 1 {
+                    array_shallow_size(len as i32, rec[29] as i32, self.header_size)
+                } else {
+                    array_shallow_size(len as i32, self.oop_size as i32, self.header_size)
+                };
+                if let Some(pc) = self.stats.get_per_class(class_idx) {
+                    pc.retained_size.fetch_add(shallow, Relaxed);
+                }
+            }
+            if kind_raw == 3 {
+                return Ok(());
+            }
+            prepare_tree_set_entries(
+                self.store,
+                rank,
+                class_idx,
+                self.tree_set_idx,
+                self.tree_map_idx,
+                ctx.pool,
+                &mut buf,
+                self.keys,
+                ctx.set_backing_maps,
+                ctx.set_entries,
+            );
+            let in_set = ctx.set_entries.contains(&rank);
+            children.clear();
+            self.store.for_each_ref(rank, ctx.pool, &mut buf, &mut |child, kind, cls, fk| {
+                if in_set && fk == self.value_key {
+                    return;
+                }
+                children.push((child, kind, cls, fk));
+            });
+            for &(child, kind, _cls, field_key) in children.iter() {
+                if ctx.visited.get(child) {
+                    continue;
+                }
+                ctx.visited.set(child);
+                let off = child as usize * PARENT_REC_SIZE;
+                ctx.parent[off..off + 4].copy_from_slice(&rank.to_le_bytes());
+                ctx.parent[off + 4..off + 8].copy_from_slice(&field_key.to_le_bytes());
+                ctx.roots.write_seq(child, root)?;
+                let child_rec = match self.store.rec(child) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let is_deferred = kind == 0 && self.defer_class_indices.contains(&child_rec.class_idx);
+                let target = if is_deferred == deferred_batch {
+                    &mut same
+                } else {
+                    &mut other
+                };
+                let mut out = [0u8; PLAN_REC];
+                put_u64(&mut out, 0, child_rec.file_offset);
+                put_u32(&mut out, 8, child);
+                put_u32(&mut out, 12, (target.len() / PLAN_REC) as u32);
+                put_u32(&mut out, 16, root);
+                put_u32(&mut out, 20, child_rec.len);
+                put_u32(&mut out, 24, child_rec.class_idx);
+                out[28] = child_rec.kind;
+                out[29] = child_rec.elem;
+                target.extend_from_slice(&out);
+            }
+            Ok(())
+        })?;
+        // The paths are reserved even while the records live in memory, so a
+        // frontier that outgrows the RAM budget can be spilled without a rename.
+        let same_path = self.scratch_file("tiny-same.frt");
+        let other_path = self.scratch_file("tiny-other.frt");
+        Ok(BatchOut {
+            same: Frontier {
+                path: same_path,
+                len: (same.len() / PLAN_REC) as u32,
+                ram: Some(same),
+            },
+            other: Frontier {
+                path: other_path,
+                len: (other.len() / PLAN_REC) as u32,
+                ram: Some(other),
+            },
+        })
+    }
+
+    /// Process one batch: the work the FIFO traversal did for every member it
+    /// popped, with the directory and dump reads reordered into ascending sweeps
+    /// and the discovery order recovered from record keys.
+    fn process_frontier(
+        &mut self,
+        ctx: &mut BfsCtx<'_>,
+        frontier: &Frontier,
+        deferred_batch: bool,
+    ) -> anyhow::Result<BatchOut> {
+        self.gen += 1;
+        let members = frontier.len;
+        let mut timing = [0f64; 8];
+        let timer = std::time::Instant::now();
+
+        // 1. TreeSet/TreeMap side effects, in the batch pop order: they decide
+        //    which entry objects skip their value field, and the order matters.
+        let mut in_set = vec![0u8; members as usize];
+        {
+            let mut targets: Vec<(u32, u32)> = Vec::new();
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            for_each_rec(&frontier.path, PLAN_REC, |rec| {
+                let pop_index = rd_u32(rec, 12);
+                let rank = rd_u32(rec, 8);
+                let class_idx = rd_u32(rec, 24);
+                let kind_raw = rec[28];
+                // Per-object accounting the FIFO traversal did when it popped.
+                self.visited_count += 1;
+                if kind_raw == 3 {
+                    self.class_object_visited += 1;
+                }
+                if (class_idx as usize) < self.store.heap.classes.len() {
+                    let kind = object_kind(kind_raw);
+                    let len = rd_u32(rec, 20);
+                    let shallow = if kind == 0 {
+                        self.class_aligned_body[class_idx as usize]
+                    } else if kind == 1 {
+                        array_shallow_size(len as i32, rec[29] as i32, self.header_size)
+                    } else {
+                        array_shallow_size(len as i32, self.oop_size as i32, self.header_size)
+                    };
+                    if let Some(pc) = self.stats.get_per_class(class_idx) {
+                        pc.retained_size.fetch_add(shallow, Relaxed);
+                    }
+                }
+                if kind_raw == 0
+                    && (self.tree_set_idx == Some(class_idx)
+                        || self.tree_map_idx == Some(class_idx))
+                {
+                    targets.push((pop_index, rank));
+                }
+                Ok(())
+            })?;
+            if !targets.is_empty() || !ctx.set_entries.is_empty() {
+                targets.sort_unstable_by_key(|&(pop, _)| pop);
+                let mut next = 0usize;
+                let mut index: u32 = 0;
+                for_each_rec(&frontier.path, PLAN_REC, |rec| {
+                    let rank = rd_u32(rec, 8);
+                    if next < targets.len() && targets[next].0 == index {
+                        let class_idx = rd_u32(rec, 24);
+                        prepare_tree_set_entries(
+                            self.store,
+                            targets[next].1,
+                            class_idx,
+                            self.tree_set_idx,
+                            self.tree_map_idx,
+                            ctx.pool,
+                            &mut buf,
+                            self.keys,
+                            ctx.set_backing_maps,
+                            ctx.set_entries,
+                        );
+                        next += 1;
+                    }
+                    if let Some(flag) = in_set.get_mut(index as usize) {
+                        *flag = if ctx.set_entries.contains(&rank) { 1 } else { 0 };
+                    }
+                    index += 1;
+                    Ok(())
+                })?;
+            }
+        }
+        timing[0] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+
+        // 2. Bodies in ascending dump offset: one ascending pread run at a time.
+        let plan_sorted = self.scratch_file("plan.srt");
+        sort_records(&frontier.path, &plan_sorted, PLAN_REC, |rec| rd_u64(rec, 0))?;
+        timing[1] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+
+        let edges_raw = self.scratch_file("edge.raw");
+        {
+            let mut out =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&edges_raw)?);
+            let mut buf: Vec<u8> = Vec::new();
+            let mut pending: Vec<u8> = Vec::new();
+            let mut run_start: u64 = 0;
+            let mut run_end: u64 = 0;
+            let mut seq: u32 = 0;
+
+            for_each_rec(&plan_sorted, PLAN_REC, |rec| {
+                let file_offset = rd_u64(rec, 0);
+                let len = rd_u32(rec, 20);
+                let class_idx = rd_u32(rec, 24);
+                let kind = rec[28];
+                let read_len = self.read_len_of(kind, class_idx, len, file_offset);
+                if read_len == 0 {
+                    return Ok(());
+                }
+                let pop_index = rd_u32(rec, 12);
+                let root = rd_u32(rec, 16);
+                let skip_value = in_set.get(pop_index as usize).copied().unwrap_or(0) == 1;
+                if read_len > BODY_RUN_BYTES {
+                    if !pending.is_empty() {
+                        self.flush_body_run(
+                            run_start,
+                            run_end,
+                            &pending,
+                            &mut buf,
+                            &mut out,
+                            &in_set,
+                            ctx.pool,
+                            &mut seq,
+                        )?;
+                        pending.clear();
+                    }
+                    let mut offset = 0u64;
+                    seq = 0;
+                    while offset < read_len as u64 {
+                        let want = std::cmp::min(BODY_RUN_BYTES as u64, read_len as u64 - offset);
+                        self.read_window(file_offset + offset, want as usize, &mut buf);
+                        let got = buf.len();
+                        if got == 0 {
+                            break;
+                        }
+                        self.emit_edges(
+                            kind,
+                            class_idx,
+                            &buf[..got],
+                            pop_index,
+                            root,
+                            skip_value,
+                            ctx.pool,
+                            &mut seq,
+                            &mut out,
+                        )?;
+                        offset += got as u64;
+                        if got < want as usize {
+                            break;
+                        }
+                    }
+                    return Ok(());
+                }
+                let end = file_offset + read_len as u64;
+                if pending.is_empty() {
+                    run_start = file_offset;
+                    run_end = end;
+                    pending.extend_from_slice(rec);
+                } else if end - run_start <= BODY_RUN_BYTES as u64 {
+                    run_end = std::cmp::max(run_end, end);
+                    pending.extend_from_slice(rec);
+                } else {
+                    self.flush_body_run(
+                        run_start,
+                        run_end,
+                        &pending,
+                        &mut buf,
+                        &mut out,
+                        &in_set,
+                        ctx.pool,
+                        &mut seq,
+                    )?;
+                    pending.clear();
+                    run_start = file_offset;
+                    run_end = end;
+                    pending.extend_from_slice(rec);
+                }
+                Ok(())
+            })?;
+            if !pending.is_empty() {
+                self.flush_body_run(
+                    run_start,
+                    run_end,
+                    &pending,
+                    &mut buf,
+                    &mut out,
+                    &in_set,
+                    ctx.pool,
+                    &mut seq,
+                )?;
+            }
+            out.flush()?;
+        }
+        self.scratch.remove(&plan_sorted);
+        timing[2] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+        let edge_count = std::fs::metadata(&edges_raw)?.len() / EDGE_REC as u64;
+
+        // 3. Edges in ascending child address: one ascending directory sweep that
+        //    resolves each address and immediately folds it into its claim.
+        let edge_sorted = self.scratch_file("edge.srt");
+        sort_records(&edges_raw, &edge_sorted, EDGE_REC, |rec| rd_u64(rec, 0))?;
+        self.scratch.remove(&edges_raw);
+        timing[3] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+
+        let claims_raw = self.scratch_file("claim.raw");
+        let claim_count;
+        {
+            let mut out =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&claims_raw)?);
+            // pop index -> parent rank, so edge records stay 24 bytes wide.
+            let mut parents: Vec<u32> = Vec::with_capacity(members as usize);
+            for_each_rec(&frontier.path, PLAN_REC, |rec| {
+                parents.push(rd_u32(rec, 8));
+                Ok(())
+            })?;
+            let mut best = [0u8; CLAIM_REC];
+            let mut have = false;
+            let mut current: u32 = u32::MAX;
+            let mut last_addr: u64 = 0;
+            let mut seen_addr = false;
+            let mut last_hit: Option<(u32, ObjRec)> = None;
+            for_each_rec(&edge_sorted, EDGE_REC, |edge| {
+                let addr = rd_u64(edge, 0);
+                if !seen_addr || addr != last_addr {
+                    seen_addr = true;
+                    last_addr = addr;
+                    last_hit = match self.store.resolve(addr) {
+                        Some((rank, rec)) if rec.kind != 3 => Some((rank, rec)),
+                        _ => None,
+                    };
+                }
+                let (child_rank, rec) = match last_hit {
+                    Some(hit) => hit,
+                    None => return Ok(()),
+                };
+                if child_rank == 1488 {
+                    eprintln!("[after-edge] parent={} pop={} seq={} fk={}", parents.get(rd_u32(edge, 8) as usize).copied().unwrap_or(0), rd_u32(edge, 8), rd_u32(edge, 12), rd_u32(edge, 16));
+                }
+                if child_rank != current {
+                    if have {
+                        Self::flush_claim(ctx, current, &best, &mut out)?;
+                        have = false;
+                    }
+                    current = child_rank;
+                }
+                let key = ((rd_u32(edge, 8) as u64) << 32) | rd_u32(edge, 12) as u64;
+                if !have || key < rd_u64(&best, 0) {
+                    put_u64(&mut best, 0, key);
+                    put_u32(&mut best, 8, child_rank);
+                    put_u32(&mut best, 12, parents.get(rd_u32(edge, 8) as usize).copied().unwrap_or(0));
+                    put_u32(&mut best, 16, rd_u32(edge, 16));
+                    put_u32(&mut best, 20, rd_u32(edge, 20));
+                    put_u32(&mut best, 24, rec.len);
+                    put_u32(&mut best, 28, rec.class_idx);
+                    put_u64(&mut best, 32, rec.file_offset);
+                    best[40] = rec.kind;
+                    best[41] = rec.elem;
+                    have = true;
+                }
+                Ok(())
+            })?;
+            if have {
+                Self::flush_claim(ctx, current, &best, &mut out)?;
+            }
+            out.flush()?;
+            claim_count = std::fs::metadata(&claims_raw)?.len() / CLAIM_REC as u64;
+        }
+        self.scratch.remove(&edge_sorted);
+        timing[4] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+
+        // 4. Claims in processing order, split into the two queues.
+        let claims_sorted = self.scratch_file("claim.srt");
+        sort_records(&claims_raw, &claims_sorted, CLAIM_REC, |rec| rd_u64(rec, 0))?;
+        self.scratch.remove(&claims_raw);
+        timing[5] = timer.elapsed().as_secs_f64();
+        let timer = std::time::Instant::now();
+
+        let same_path = self.scratch_file("same.frt");
+        let other_path = self.scratch_file("other.frt");
+        let mut same = FrontierWriter::new(&same_path)?;
+        let mut other = FrontierWriter::new(&other_path)?;
+        for_each_rec(&claims_sorted, CLAIM_REC, |rec| {
+            let class_idx = rd_u32(rec, 28);
+            let kind = rec[40];
+            let is_deferred = kind == 0 && self.defer_class_indices.contains(&class_idx);
+            // `same` continues the queue this batch was drained from, so the
+            // deferral rule only means "the other queue" while draining the
+            // normal queue.
+            if is_deferred == deferred_batch {
+                same.push_claim(rec)
+            } else if is_deferred {
+                other.push_claim(rec)
+            } else {
+                other.push_claim(rec)
+            }
+        })?;
+        self.scratch.remove(&claims_sorted);
+        timing[6] = timer.elapsed().as_secs_f64();
+
+        let out = BatchOut {
+            same: same.finish()?,
+            other: other.finish()?,
+        };
+        if std::env::var_os("SS_MAT_BFS_DEBUG").is_some() {
+            eprintln!(
+                "  [bfs] gen={} members={} edges={} claims={} same={} other={}",
+                self.gen, members, edge_count, claim_count, out.same.len, out.other.len
+            );
+            eprintln!(
+                "  [bfs-t] treeset={:.3} plansort={:.3} body={:.3} edgesort={:.3} claim={:.3} claimsort={:.3} split={:.3}",
+                timing[0], timing[1], timing[2], timing[3], timing[4], timing[5], timing[6]
+            );
+        }
+        Ok(out)
+    }
+
+    /// Read [start, start+want) into buf, short only at end of file. Reads
+    /// advance monotonically, so the page cache sees a forward scan.
+    fn read_window(&self, start: u64, want: usize, buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.resize(want, 0);
+        let mut done = 0usize;
+        while done < want {
+            match read_some_at(&self.store.dump, &mut buf[done..], start + done as u64) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(_) => break,
+            }
+        }
+        buf.truncate(done);
+    }
+
+    /// Read one run of bodies and emit the edges of every member it covers.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_body_run(
+        &mut self,
+        start: u64,
+        end: u64,
+        pending: &[u8],
+        buf: &mut Vec<u8>,
+        out: &mut impl std::io::Write,
+        in_set: &[u8],
+        pool: &mut FieldPool,
+        seq: &mut u32,
+    ) -> std::io::Result<()> {
+        let want = (end - start) as usize;
+        self.read_window(start, want, buf);
+        let got = buf.len();
+        for rec in pending.chunks_exact(PLAN_REC) {
+            let file_offset = rd_u64(rec, 0);
+            let len = rd_u32(rec, 20);
+            let class_idx = rd_u32(rec, 24);
+            let kind = rec[28];
+            let read_len = self.read_len_of(kind, class_idx, len, file_offset);
+            if read_len == 0 || file_offset < start {
+                continue;
+            }
+            let offset = (file_offset - start) as usize;
+            if offset >= got {
+                continue;
+            }
+            let available = std::cmp::min(got - offset, read_len);
+            let pop_index = rd_u32(rec, 12);
+            *seq = 0;
+            self.emit_edges(
+                kind,
+                class_idx,
+                &buf[offset..offset + available],
+                pop_index,
+                rd_u32(rec, 16),
+                in_set.get(pop_index as usize).copied().unwrap_or(0) == 1,
+                pool,
+                seq,
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Decode the references of one object body and append them as edge records.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_edges(
+        &mut self,
+        kind: u8,
+        class_idx: u32,
+        data: &[u8],
+        pop_index: u32,
+        root: u32,
+        skip_value: bool,
+        pool: &mut FieldPool,
+        seq: &mut u32,
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        match object_kind(kind) {
+            0 => {
+                let cls = match self.store.heap.classes.get(class_idx as usize) {
+                    Some(c) => c,
+                    None => return Ok(()),
+                };
+                let value_key = self.value_key;
+                let mut offset = 0usize;
+                let mut cid = Some(cls.class_object_id);
+                while let Some(id) = cid {
+                    let current = if id == cls.class_object_id {
+                        Some(cls)
+                    } else {
+                        self.store.super_class(id)
+                    };
+                    let current = match current {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    for fd in &current.instance_fields {
+                        if fd.type_code == 2 {
+                            let skipped = self.store.skip_instance_fields.iter().any(|(cn, fnn)| {
+                                *cn == current.name.as_ref() && *fnn == fd.name.as_ref()
+                            });
+                            if !skipped {
+                                if let Some(addr) = read_id_from(data, offset, self.id_bytes) {
+                                    if addr != 0 {
+                                        let field_key = pool.intern(fd.name.as_ref());
+                                        if !(skip_value && field_key == value_key) {
+                                            let mut rec = [0u8; EDGE_REC];
+                                            put_u64(&mut rec, 0, addr);
+                                            put_u32(&mut rec, 8, pop_index);
+                                            put_u32(&mut rec, 12, *seq);
+                                            put_u32(&mut rec, 16, field_key);
+                                            put_u32(&mut rec, 20, root);
+                                            *seq += 1;
+                                            out.write_all(&rec)?;
+                                        }
+                                    }
+                                }
+                            }
+                            offset += self.id_bytes;
+                        } else {
+                            offset += field_type_size(fd.type_code, self.id_bytes);
+                        }
+                    }
+                    cid = if current.super_class_id != 0 {
+                        Some(current.super_class_id)
+                    } else {
+                        None
+                    };
+                }
+            }
+            2 => {
+                let count = data.len() / self.id_bytes;
+                let mut rec = [0u8; EDGE_REC];
+                for k in 0..count {
+                    if let Some(addr) = read_id_from(data, k * self.id_bytes, self.id_bytes) {
+                        if addr != 0 {
+                            put_u64(&mut rec, 0, addr);
+                            put_u32(&mut rec, 8, pop_index);
+                            put_u32(&mut rec, 12, *seq);
+                            put_u32(&mut rec, 16, 0);
+                            put_u32(&mut rec, 20, root);
+                            *seq += 1;
+                            out.write_all(&rec)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Record the claim of one child and write its claim row.
+    fn flush_claim(
+        ctx: &mut BfsCtx<'_>,
+        child: u32,
+        best: &[u8],
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        if ctx.visited.get(child) {
+            return Ok(());
+        }
+        let parent_rank = rd_u32(best, 12);
+        let field_key = rd_u32(best, 16);
+        let root = rd_u32(best, 20);
+
+        ctx.visited.set(child);
+        let off = child as usize * PARENT_REC_SIZE;
+        ctx.parent[off..off + 4].copy_from_slice(&parent_rank.to_le_bytes());
+        ctx.parent[off + 4..off + 8].copy_from_slice(&field_key.to_le_bytes());
+        ctx.roots.write_seq(child, root)?;
+        out.write_all(best)
+    }
+}
+
 pub struct TraversalResult {
     pub visited_count: u64,
     pub total_objects: u64,
@@ -1410,7 +2493,7 @@ fn analyze_ref_chains(
     heap: &HeapDump,
     oop_size: usize,
     header_size: i64,
-) -> RefChainStore {
+) -> Result<RefChainStore> {
     // Find top 50 classes by total_instance_bytes, in one pass over the directory.
     let mut per_class: Vec<i64> = vec![0i64; heap.classes.len()];
     for rank in 0..store.len() {
@@ -1427,6 +2510,7 @@ fn analyze_ref_chains(
                 compute_obj_shallow(&entry, oop_size as i32, header_size);
         }
     }
+
     ss_support::mem_trace::trace("chain-class-sizes");
     let mut class_sizes: Vec<(u32, i64)> = per_class
         .into_iter()
@@ -1442,12 +2526,35 @@ fn analyze_ref_chains(
         .map(|(slot, &cls)| (cls, slot))
         .collect();
 
-    // Collect the sampled object indices of every top class. The old shape walked
-    // the object table once per class; one pass over the dump order buckets by
-    // class instead, which keeps the per-class insertion order identical.
-    let mut live_by_class: Vec<Vec<(i64, u32)>> = vec![Vec::new(); top_classes.len()];
+    // One (effective size, address rank) record per live object of a top class,
+    // spilled to one file per class. This was a Vec per class -- 16 B per live
+    // object of the top 50, i.e. gigabytes on a large dump -- for a report that
+    // renders at most 200 samples per class. The spill keeps the pass bounded; the
+    // selection reads back only the sorted positions the report samples.
+    let temp_dir = bfs_temp_dir();
+    let mut scratch = Scratch::new();
+    let mut spill_paths: Vec<PathBuf> = Vec::with_capacity(top_classes.len());
+    let mut spill_out: Vec<std::io::BufWriter<std::fs::File>> =
+        Vec::with_capacity(top_classes.len());
+    let mut spill_count: Vec<u32> = vec![0; top_classes.len()];
+    let mut spill_max: Vec<i64> = vec![0; top_classes.len()];
+    for slot in 0..top_classes.len() {
+        let path = scratch.path(
+            &temp_dir,
+            &format!("chain-spill-{}-{slot}.rec", std::process::id()),
+        );
+        spill_paths.push(path.clone());
+        spill_out.push(std::io::BufWriter::with_capacity(
+            1 << 16,
+            std::fs::File::create(&path)?,
+        ));
+    }
+
     let mut ref_buf: Vec<u8> = Vec::with_capacity(4096);
-    let _ = order.for_each(|_, addr_rank| {
+    let mut rec_buf: Vec<u8> = Vec::with_capacity(CHAIN_REC);
+    let mut write_err: Option<std::io::Error> = None;
+    let t_collect = std::time::Instant::now();
+    order.for_each(|_, addr_rank| {
         let rec = match store.rec(addr_rank) {
             Some(r) => r,
             None => return,
@@ -1462,56 +2569,69 @@ fn analyze_ref_chains(
         let entry = entry_of(heap, rec);
         let mut sz = compute_obj_shallow(&entry, oop_size as i32, header_size);
         // For instance objects (especially String), add the shallow size of
-        // referenced arrays (the main data holders) so ranking is meaningful.
+        // referenced arrays (the main data holders) so ranking is meaningful. The
+        // child's directory record arrives with the edge, so no second lookup.
         if rec.kind == 0 {
-            store.for_each_ref(addr_rank, field_pool, &mut ref_buf, &mut |child, kind, _cls, _fk| {
-                if kind == 1 || kind == 2 {
-                    if let Some(child_entry) = store.entry(child) {
-                        sz += compute_obj_shallow(&child_entry, oop_size as i32, header_size);
-                    }
+            store.walk_refs(addr_rank, field_pool, &mut ref_buf, &mut |_child, crec, _fk| {
+                if crec.kind == 1 || crec.kind == 2 {
+                    sz += compute_obj_shallow(&entry_of(heap, crec), oop_size as i32, header_size);
                 }
             });
         }
-        live_by_class[slot].push((sz, addr_rank));
-    });
-
-    let mut all_sampled_indices: Vec<u32> = Vec::new();
-    let mut per_class_samples: Vec<(u32, Vec<u32>, Vec<u32>)> = Vec::new();
-
-    for (slot, &class_idx) in top_classes.iter().enumerate() {
-        let live_objs = std::mem::take(&mut live_by_class[slot]);
-        if live_objs.is_empty() {
-            continue;
-        }
-        let mut live_objs = live_objs;
-        // Sort by effective size descending
-        live_objs.sort_by(|a, b| b.0.cmp(&a.0));
-        let top_by_size: Vec<u32> = live_objs.iter().take(100).map(|(_, idx)| *idx).collect();
-
-        // Random portion: deterministic step sampling from the full set
-        let step = (live_objs.len() / 100).max(1);
-        let random_samples: Vec<u32> = live_objs
-            .iter()
-            .step_by(step)
-            .take(100)
-            .map(|(_, idx)| *idx)
-            .collect();
-
-        // Merge and deduplicate
-        let mut seen: HashMap<u32, ()> = HashMap::new();
-        let mut samples: Vec<u32> = Vec::new();
-        for &idx in top_by_size.iter().chain(random_samples.iter()) {
-            if !seen.contains_key(&idx) {
-                seen.insert(idx, ());
-                samples.push(idx);
+        rec_buf.clear();
+        put_chain_rec(&mut rec_buf, sz, addr_rank);
+        if write_err.is_none() {
+            if let Err(e) = spill_out[slot].write_all(&rec_buf) {
+                write_err = Some(e);
             }
         }
-        samples.truncate(200);
-
-        let live_obj_indices: Vec<u32> = live_objs.iter().map(|(_, idx)| *idx).collect();
-        all_sampled_indices.extend_from_slice(&samples);
-        per_class_samples.push((class_idx, live_obj_indices, samples));
+        spill_count[slot] += 1;
+        if sz > spill_max[slot] {
+            spill_max[slot] = sz;
+        }
+    })?;
+    for writer in spill_out.iter_mut() {
+        writer.flush()?;
     }
+    drop(spill_out);
+    if let Some(e) = write_err {
+        return Err(e.into());
+    }
+    if std::env::var_os("SS_MAT_BFS_DEBUG").is_some() {
+        let total: u32 = spill_count.iter().sum();
+        eprintln!(
+            "  [chains-collect] records={} classes={} t={:.2}s",
+            total,
+            top_classes.len(),
+            t_collect.elapsed().as_secs_f64()
+        );
+    }
+
+    // Address ranks are object indices in the whole directory, so the packed sort
+    // key keeps room for the largest of them, not for the number of records a
+    // single class holds.
+    let rank_bits = (u32::BITS - store.len().saturating_sub(1).leading_zeros()).max(1);
+    let mut all_sampled_indices: Vec<u32> = Vec::new();
+    let mut per_class_samples: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (slot, &class_idx) in top_classes.iter().enumerate() {
+        if spill_count[slot] == 0 {
+            continue;
+        }
+        let positions = chain_sample_positions(spill_count[slot]);
+        let samples = take_chain_samples(
+            &spill_paths[slot],
+            spill_max[slot],
+            rank_bits,
+            &positions,
+            &mut scratch,
+            &temp_dir,
+            slot,
+        )?;
+        scratch.remove(&spill_paths[slot]);
+        all_sampled_indices.extend_from_slice(&samples);
+        per_class_samples.push((class_idx, samples));
+    }
+    drop(spill_paths);
 
     ss_support::mem_trace::trace("chain-samples");
     // Build rich descriptions for all sampled objects via a targeted HPROF pass
@@ -1525,7 +2645,7 @@ fn analyze_ref_chains(
 
     let mut store_out = RefChainStore::default();
 
-    for (class_idx, _live_objs, samples) in &per_class_samples {
+    for (class_idx, samples) in &per_class_samples {
         let mut groups: HashMap<Vec<(u32, u32)>, Vec<u32>> = HashMap::new();
         for &obj_idx in samples {
             let chain = trace_chain(obj_idx, parent, store);
@@ -1614,7 +2734,7 @@ fn analyze_ref_chains(
         store_out.chains.insert(*class_idx, class_chains);
     }
 
-    store_out
+    Ok(store_out)
 }
 
 /// Analyze reference chains specifically for humongous objects (>= half G1 region size).
@@ -1665,8 +2785,37 @@ fn analyze_humongous_chains(
     // incoming edge, and the walk continues through ordinary objects, so the
     // reverse index covers every object. It lives in a dense 8-byte-per-object
     // file instead of two arrays sized by the object count.
-    let first_src = FirstSrc::build(store, order, field_pool, class_static_edges, statics_slot)
-        .unwrap_or_else(|| FirstSrc::empty());
+    // The reverse index is only consulted for a humongous object the BFS never
+    // reached: a live one is traced through the BFS parent log alone. Building it
+    // costs one resolved edge per reference in the whole dump, so skip it when
+    // every humongous object is reachable.
+    // Only an unreachable humongous object needs the reverse direction; a reachable
+    // one is traced through the BFS parent log alone.
+    let seed: Vec<u32> = humongous_objs
+        .iter()
+        .copied()
+        .filter(|&rank| parent.parent_of(rank).0 == NO_PARENT)
+        .collect();
+    let t_first = std::time::Instant::now();
+    let first_src = FirstSrc::build(
+        store,
+        order,
+        field_pool,
+        class_static_edges,
+        statics_slot,
+        parent,
+        &seed,
+    );
+    if std::env::var_os("SS_MAT_BFS_DEBUG").is_some() {
+        eprintln!(
+            "  [humongous] objs={} unreachable={} index={} levels={} t_firstsrc={:.2}s",
+            humongous_objs.len(),
+            seed.len(),
+            first_src.len(),
+            first_src.levels,
+            t_first.elapsed().as_secs_f64()
+        );
+    }
 
     // Trace chains using the BFS parent for live objects, the reverse ref otherwise
     let mut groups: HashMap<Vec<(u32, u32)>, Vec<u32>> = HashMap::new();
@@ -2352,44 +3501,229 @@ fn format_number(n: i64) -> String {
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
-/// First incoming edge of every object, in a dense 8-byte-per-object file.
-///
-/// Only objects that never became reachable need it, but the walk continues
-/// through ordinary objects, so the index is dense. The file goes away with the
-/// store.
-struct FirstSrc {
-    file: std::fs::File,
-    path: PathBuf,
-    len: u32,
+/// Bytes of one record in a reference-chain spill: effective size, then address
+/// rank, then four bytes of padding so a record stays 8-byte aligned.
+const CHAIN_REC: usize = 16;
+
+/// Largest chain spill one class sorts in memory before the external sorter
+/// takes over. The in-memory path keeps a small dump out of the sorter's 256
+/// bucket files; the cap is what bounds the phase on a large one.
+const CHAIN_RAM_SORT_BYTES: u64 = 32 << 20;
+
+fn put_chain_rec(out: &mut Vec<u8>, sz: i64, rank: u32) {
+    out.extend_from_slice(&sz.to_le_bytes());
+    out.extend_from_slice(&rank.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
 }
 
+fn chain_rec_sz(rec: &[u8]) -> i64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&rec[0..8]);
+    i64::from_le_bytes(b)
+}
+
+fn chain_rec_rank(rec: &[u8]) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&rec[8..12]);
+    u32::from_le_bytes(b)
+}
+
+/// Positions the report samples out of one class's object list, ordered by
+/// effective size descending and, within equal sizes, by dump order.
+///
+/// The list holds the top 100 by size followed by every step-th object of the
+/// whole list (100 more), merged without duplicates and capped at 200. These are
+/// the positions that merge produced, so taking them from a spill sorted the same
+/// way yields the same samples without ever materialising the list.
+fn chain_sample_positions(count: u32) -> Vec<u32> {
+    let n = count as usize;
+    let mut positions: Vec<u32> = Vec::with_capacity(200);
+    let mut seen: HashSet<u32> = HashSet::with_capacity(256);
+    let mut push = |pos: usize, positions: &mut Vec<u32>, seen: &mut HashSet<u32>| {
+        if seen.insert(pos as u32) {
+            positions.push(pos as u32);
+        }
+    };
+    for pos in 0..n.min(100) {
+        push(pos, &mut positions, &mut seen);
+    }
+    let step = (n / 100).max(1);
+    let mut pos = 0usize;
+    let mut taken = 0usize;
+    while pos < n && taken < 100 {
+        push(pos, &mut positions, &mut seen);
+        pos += step;
+        taken += 1;
+    }
+    positions
+}
+
+/// Read one record, reporting end of file instead of erroring on a short tail.
+fn read_chain_rec<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let mut done = 0usize;
+    while done < buf.len() {
+        match reader.read(&mut buf[done..])? {
+            0 => return Ok(false),
+            n => done += n,
+        }
+    }
+    Ok(true)
+}
+
+/// Address ranks of one class at the sampled positions of its size-ordered list.
+///
+/// The sort key packs the reversed effective size above the address rank, so the
+/// order is size descending and then dump order, and every key is distinct: equal
+/// keys, which an unstable sort is free to reorder, cannot occur. The size field
+/// takes whatever the address rank leaves of the 64 bits, and a dump whose largest
+/// object does not fit there (the object would have to be a sizeable fraction of
+/// 2^64 / object_count bytes) has its largest sizes clamped together, which is the
+/// one case where the sample order can differ from an in-memory sort.
+#[allow(clippy::too_many_arguments)]
+fn take_chain_samples(
+    spill: &Path,
+    max_sz: i64,
+    rank_bits: u32,
+    positions: &[u32],
+    scratch: &mut Scratch,
+    dir: &Path,
+    slot: usize,
+) -> std::io::Result<Vec<u32>> {
+    let sz_bits = 64 - rank_bits;
+    let clamp: i128 = if sz_bits >= 64 {
+        i128::from(u64::MAX)
+    } else {
+        (1i128 << sz_bits) - 1
+    };
+    let key = move |rec: &[u8]| {
+        let delta = (max_sz as i128 - chain_rec_sz(rec) as i128).clamp(0, clamp) as u64;
+        (delta << rank_bits) | u64::from(chain_rec_rank(rec))
+    };
+
+    let len = std::fs::metadata(spill)?.len();
+    let mut out: Vec<u32> = Vec::with_capacity(positions.len());
+    if len <= CHAIN_RAM_SORT_BYTES {
+        use std::io::Read as _;
+        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+        std::fs::File::open(spill)?.read_to_end(&mut buf)?;
+        let mut items: Vec<(u64, u32)> = buf
+            .chunks_exact(CHAIN_REC)
+            .map(|rec| (key(rec), chain_rec_rank(rec)))
+            .collect();
+        items.sort_unstable_by_key(|item| item.0);
+        for &pos in positions {
+            if let Some(item) = items.get(pos as usize) {
+                out.push(item.1);
+            }
+        }
+        return Ok(out);
+    }
+
+    let sorted = scratch.path(dir, &format!("chain-sorted-{}-{slot}.rec", std::process::id()));
+    let sorter = ExternalSorter::new(CHAIN_REC, SORT_MEM_BUDGET);
+    sorter.sort_file(spill, &sorted, &key)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(&sorted)?);
+    let mut rec = [0u8; CHAIN_REC];
+    let mut pos = 0u32;
+    let mut next = 0usize;
+    while next < positions.len() {
+        if !read_chain_rec(&mut reader, &mut rec)? {
+            break;
+        }
+        while next < positions.len() && positions[next] == pos {
+            out.push(chain_rec_rank(&rec));
+            next += 1;
+        }
+        pos += 1;
+    }
+    scratch.remove(&sorted);
+    Ok(out)
+}
+
+/// First incoming edge of the objects an unreachable humongous chain walks.
+///
+/// A humongous object the BFS never reached has no parent, so its chain is
+/// rebuilt from the first edge that points at it; the walk then continues through
+/// ordinary objects, so the referrer of a referrer is needed too. That set stays
+/// small, which is why the index is a map over the objects a walk can ask about
+/// rather than a table sized by the object count: a dense 8-byte-per-object file
+/// costs 960 MB on a 120 M-object dump and, to be filled in dump order, resolves
+/// an edge for every reference in the dump — the single most expensive step of
+/// this phase.
+struct FirstSrc {
+    /// Target address rank -> (referrer address rank, field key).
+    map: HashMap<u32, (u32, u32)>,
+    /// Levels the wanted set reached before it stopped growing.
+    levels: u32,
+}
+
+/// Levels a first-referrer walk can need. A humongous chain is traced for at most
+/// 60 steps and asks for a referrer at most once per step, so nothing a walk can
+/// consult lies deeper than this.
+const FIRSTSRC_MAX_LEVELS: u32 = 60;
+
 impl FirstSrc {
+    /// Degenerate index: no unreachable humongous object, so nothing is walked
+    /// through the reverse direction.
+    fn empty() -> Self {
+        Self {
+            map: HashMap::new(),
+            levels: 0,
+        }
+    }
+
+    fn get(&self, rank: u32) -> Option<(u32, u32)> {
+        self.map.get(&rank).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Build the index for the seed objects, then for every unreachable referrer
+    /// they reveal.
+    ///
+    /// One pass over the dump in dump order records the first edge into each
+    /// wanted object, which is the edge a dense table would have kept. A referrer
+    /// that is itself unreachable needs an entry of its own, so the wanted set
+    /// grows by one level per pass; objects that no pass finds an edge for have no
+    /// referrer at all and drop out, which is what makes the loop terminate.
     fn build(
         store: &ObjectStore<'_>,
         order: &DumpOrder,
         field_pool: &mut FieldPool,
         class_static_edges: &[(u32, Vec<(u32, u32)>)],
         statics_slot: &HashMap<u32, usize>,
-    ) -> Option<Self> {
-        let len = store.len();
-        let path = bfs_temp_dir().join(format!("bfs-firstsrc-{}.rec", std::process::id()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .ok()?;
-        file.set_len(len as u64 * PARENT_REC_SIZE as u64).ok()?;
-        let mut ref_buf: Vec<u8> = Vec::with_capacity(4096);
-        let mut pending: Vec<(u32, u32)> = Vec::new();
-        {
-            let mut map = unsafe { MmapMut::map_mut(&file).ok()? };
-            for slot in map.chunks_exact_mut(PARENT_REC_SIZE) {
-                slot[0..4].copy_from_slice(&NO_PARENT.to_le_bytes());
-                slot[4..8].copy_from_slice(&0u32.to_le_bytes());
+        parent: &ParentStore,
+        seed: &[u32],
+    ) -> Self {
+        let mut index = Self::empty();
+        if seed.is_empty() {
+            return index;
+        }
+        let mut wanted_rank: HashSet<u32> = seed.iter().copied().collect();
+        let mut wanted_addr: HashSet<u64> = HashSet::with_capacity(seed.len());
+        for &rank in seed {
+            if let Some(rec) = store.rec(rank) {
+                wanted_addr.insert(rec.addr);
             }
-            let _ = order.for_each(|_, addr_rank| {
+        }
+        let mut ref_buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut levels = 0u32;
+        while !wanted_rank.is_empty() && levels < FIRSTSRC_MAX_LEVELS {
+            levels += 1;
+            let scanned: Vec<u32> = wanted_rank.iter().copied().collect();
+            // Reverse dump order. An object discovered half way through the sweep
+            // then still meets the referrers that precede it — a referrer is
+            // allocated before what it refers to — so several levels of the chain
+            // close in one sweep instead of one sweep per level. Keeping the
+            // smallest dump rank seen is what makes "the first referrer" mean the
+            // same thing a forward sweep would have meant.
+            let mut hits: HashMap<u32, (u32, u32, u32)> = HashMap::new();
+            let mut dump_rank = order.len();
+            let _ = order.for_each_rev(|rank_of_dump, addr_rank| {
+                dump_rank = rank_of_dump;
                 let rec = match store.rec(addr_rank) {
                     Some(r) => r,
                     None => return,
@@ -2398,64 +3732,84 @@ impl FirstSrc {
                     // A class dump contributes its static field references; the
                     // dump lists class dumps first, so they are the first
                     // referrer of anything only a static field points at.
-                    if let Some(&idx) = statics_slot.get(&rec.class_idx) {
-                        for &(target, fk) in &class_static_edges[idx].1 {
-                            let off = target as usize * PARENT_REC_SIZE;
-                            if map[off..off + 4] == NO_PARENT.to_le_bytes() {
-                                map[off..off + 4].copy_from_slice(&addr_rank.to_le_bytes());
-                                map[off + 4..off + 8].copy_from_slice(&fk.to_le_bytes());
+                    if let Some(&slot) = statics_slot.get(&rec.class_idx) {
+                        for &(target, fk) in &class_static_edges[slot].1 {
+                            if wanted_rank.contains(&target) {
+                                record_first_hit(&mut hits, target, dump_rank, addr_rank, fk);
                             }
                         }
                     }
                     return;
                 }
-                pending.clear();
-                store.for_each_ref(addr_rank, field_pool, &mut ref_buf, &mut |child, _k, _c, fk| {
-                    pending.push((child, fk));
-                });
-                for &(child, fk) in pending.iter() {
-                    let off = child as usize * PARENT_REC_SIZE;
-                    if map[off..off + 4] == NO_PARENT.to_le_bytes() {
-                        map[off..off + 4].copy_from_slice(&addr_rank.to_le_bytes());
-                        map[off + 4..off + 8].copy_from_slice(&fk.to_le_bytes());
-                    }
+                if wanted_addr.is_empty() {
+                    return;
                 }
+                let src_addr = rec.addr;
+                let src_dump_rank = dump_rank;
+                // The target address is compared before anything is resolved: of
+                // hundreds of millions of edges only a few thousand can hit a
+                // wanted object, and only those need a directory lookup.
+                store.walk_ref_addr(rec, field_pool, &mut ref_buf, &mut |addr, fk| {
+                    if !wanted_addr.contains(&addr) {
+                        return;
+                    }
+                    let target = match store.resolve(addr) {
+                        Some((target, _)) => target,
+                        None => return,
+                    };
+                    record_first_hit(&mut hits, target, src_dump_rank, addr_rank, fk);
+                    // An unreachable referrer needs an entry of its own, and the
+                    // edges that precede it are still ahead in this sweep.
+                    if parent.parent_of(addr_rank).0 == NO_PARENT
+                        && !index.map.contains_key(&addr_rank)
+                        && wanted_rank.insert(addr_rank)
+                    {
+                        wanted_addr.insert(src_addr);
+                    }
+                });
             });
-            map.flush().ok()?;
+            for (target, (_, src, fk)) in hits {
+                index.map.insert(target, (src, fk));
+                wanted_rank.remove(&target);
+                if let Some(rec) = store.rec(target) {
+                    wanted_addr.remove(&rec.addr);
+                }
+            }
+            for &target in &scanned {
+                // A wanted object no edge in the whole dump points at has no
+                // first referrer, so it drops out instead of being rescanned.
+                if index.map.contains_key(&target) {
+                    continue;
+                }
+                wanted_rank.remove(&target);
+                if let Some(rec) = store.rec(target) {
+                    wanted_addr.remove(&rec.addr);
+                }
+            }
         }
-        Some(Self { file, path, len })
-    }
-
-    /// Degenerate store used when the index file cannot be created.
-    fn empty() -> Self {
-        Self {
-            file: std::fs::File::open("/dev/null").expect("/dev/null"),
-            path: PathBuf::new(),
-            len: 0,
-        }
-    }
-
-    fn get(&self, rank: u32) -> Option<(u32, u32)> {
-        if rank >= self.len {
-            return None;
-        }
-        let mut buf = [0u8; PARENT_REC_SIZE];
-        read_some_at(&self.file, &mut buf, rank as u64 * PARENT_REC_SIZE as u64).ok()?;
-        let mut p = [0u8; 4];
-        p.copy_from_slice(&buf[0..4]);
-        let src = u32::from_le_bytes(p);
-        if src == NO_PARENT {
-            return None;
-        }
-        let mut k = [0u8; 4];
-        k.copy_from_slice(&buf[4..8]);
-        Some((src, u32::from_le_bytes(k)))
+        index.levels = levels;
+        index
     }
 }
 
-impl Drop for FirstSrc {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+/// Keep the incoming edge of `target` that a dump-order sweep would have kept:
+/// the one from the earliest object, and for a single object the first field.
+fn record_first_hit(
+    hits: &mut HashMap<u32, (u32, u32, u32)>,
+    target: u32,
+    dump_rank: u32,
+    src: u32,
+    fk: u32,
+) {
+    match hits.entry(target) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            if dump_rank < slot.get().0 {
+                slot.insert((dump_rank, src, fk));
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert((dump_rank, src, fk));
+        }
     }
 }
 
@@ -2569,9 +3923,6 @@ fn matches_skip_class_pair(name: &str) -> bool {
 // GC Root tree building for Section 4
 // ============================================================
 
-/// Sentinel value in root_of[] marking unvisited/garbage objects.
-const GC_ROOT_GARBAGE_SENTINEL: u32 = u32::MAX - 1;
-
 const GC_ROOT_MAX_DEPTH: usize = 10;
 const GC_ROOT_MAX_CHILDREN: usize = 12;
 const GC_ROOT_TOP_N: usize = 100;
@@ -2580,7 +3931,8 @@ const GC_ROOT_SAMPLE_N: usize = 40;
 #[allow(clippy::too_many_arguments)]
 fn build_gc_root_trees(
     store: &ObjectStore<'_>,
-    root_of: &[u32],
+    root_of: &RootStore,
+    gc_roots: &HashSet<u32>,
     visited: &LiveSet,
     class_static_edges: &[(u32, Vec<(u32, u32)>)],
     root_metas: &HashMap<u32, ss_stats::ref_chain::GcRootMeta>,
@@ -2604,14 +3956,16 @@ fn build_gc_root_trees(
             continue;
         }
         let entry = entry_of(heap, rec);
-        let r = root_of[rank as usize];
-        if r == GC_ROOT_GARBAGE_SENTINEL {
-            if !visited.get(rank) {
-                garbage_bytes += compute_obj_shallow(&entry, oop_size, header_size);
-                garbage_count += 1;
+        let r = match root_of.get(rank) {
+            Some(r) => r,
+            None => {
+                if !visited.get(rank) {
+                    garbage_bytes += compute_obj_shallow(&entry, oop_size, header_size);
+                    garbage_count += 1;
+                }
+                continue;
             }
-            continue;
-        }
+        };
         let shallow = compute_obj_shallow(&entry, oop_size, header_size);
         let e = root_retained.entry(r).or_insert((0, 0));
         e.0 += shallow;
@@ -2639,7 +3993,7 @@ fn build_gc_root_trees(
             }
             // Only add as a static display root if the target is NOT already a
             // real root.
-            if root_of[target as usize] == target {
+            if gc_roots.contains(&target) {
                 continue;
             }
             let owning_class_name = if (*class_idx as usize) < heap.classes.len() {
@@ -2794,7 +4148,7 @@ fn build_gc_root_trees(
         if rec.kind == 3 {
             continue;
         }
-        if !visited.get(rank) && root_of[rank as usize] == GC_ROOT_GARBAGE_SENTINEL {
+        if !visited.get(rank) && root_of.get(rank).is_none() {
             let entry = entry_of(heap, rec);
             let shallow = compute_obj_shallow(&entry, oop_size, header_size);
             let e = garbage_class_map.entry(entry.class_idx).or_insert((0, 0));
@@ -2826,7 +4180,7 @@ fn build_single_root_tree(
     current_idx: u32,
     root_idx: u32,
     store: &ObjectStore<'_>,
-    root_of: &[u32],
+    root_of: &RootStore,
     field_pool: &mut FieldPool,
     buf: &mut Vec<u8>,
     oop_size: i32,
@@ -2875,7 +4229,7 @@ fn build_single_root_tree(
         if kind == 3 {
             return;
         }
-        if root_of[child as usize] != root_idx {
+        if root_of.get(child) != Some(root_idx) {
             return;
         }
         child_groups.entry((fk, class_idx)).or_default().push(child);
@@ -2957,6 +4311,71 @@ fn build_single_root_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bounded selection has to reproduce the report's sample rule exactly:
+    /// top 100 by effective size, then every step-th entry of the whole list,
+    /// merged without duplicates. This is the in-memory shape it replaced,
+    /// spelled out as the reference the spilled selection is compared against.
+    fn reference_samples(objs: &mut Vec<(i64, u32)>) -> Vec<u32> {
+        objs.sort_by(|a, b| b.0.cmp(&a.0));
+        let top_by_size: Vec<u32> = objs.iter().take(100).map(|(_, idx)| *idx).collect();
+        let step = (objs.len() / 100).max(1);
+        let random_samples: Vec<u32> = objs.iter().step_by(step).take(100).map(|(_, idx)| *idx).collect();
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut samples: Vec<u32> = Vec::new();
+        for &idx in top_by_size.iter().chain(random_samples.iter()) {
+            if seen.insert(idx) {
+                samples.push(idx);
+            }
+        }
+        samples.truncate(200);
+        samples
+    }
+
+    /// Positions selected out of a spill sorted by the same key must equal the
+    /// samples the in-memory rule produces, for every list length that changes
+    /// the step, the cap or the top-100 boundary.
+    #[test]
+    fn spill_sampling_matches_in_memory_rule() {
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for &count in &[1usize, 2, 7, 99, 100, 101, 199, 200, 201, 999, 1000, 1234, 5000] {
+            // Sizes repeat on purpose: equal sizes fall back to dump order, which
+            // is where a wrong tie-break would show up.
+            let mut objs: Vec<(i64, u32)> = (0..count)
+                .map(|rank| ((next() % 7) as i64 * 8 + 16, rank as u32))
+                .collect();
+            let expected = reference_samples(&mut objs);
+
+            let mut spilled = Vec::new();
+            for &(sz, rank) in objs.iter() {
+                put_chain_rec(&mut spilled, sz, rank);
+            }
+            let max_sz = objs.iter().map(|(sz, _)| *sz).max().unwrap_or(0);
+            let positions = chain_sample_positions(count as u32);
+            let max_rank = objs.iter().map(|(_, rank)| *rank).max().unwrap_or(0);
+            let rank_bits = (u32::BITS - max_rank.leading_zeros()).max(1);
+            let key = |rec: &[u8]| {
+                let delta = (max_sz - chain_rec_sz(rec)).max(0) as u64;
+                (delta << rank_bits) | u64::from(chain_rec_rank(rec))
+            };
+            let mut items: Vec<(u64, u32)> = spilled
+                .chunks_exact(CHAIN_REC)
+                .map(|rec| (key(rec), chain_rec_rank(rec)))
+                .collect();
+            items.sort_unstable_by_key(|item| item.0);
+            let got: Vec<u32> = positions
+                .iter()
+                .map(|&pos| items[pos as usize].1)
+                .collect();
+            assert_eq!(got, expected, "count {count}");
+        }
+    }
 
     #[test]
     fn primitive_array_shallow_size_uses_element_width() {

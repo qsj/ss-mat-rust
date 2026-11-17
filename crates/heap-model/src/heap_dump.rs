@@ -95,12 +95,6 @@ pub struct HeapDump {
     pub per_class_inst_count: Vec<u64>,
     /// Per-class total instance shallow bytes collected during parsing.
     pub per_class_inst_bytes: Vec<i64>,
-    /// Every indexed object address (instances and arrays), sorted.
-    ///
-    /// Membership tests are a binary search here instead of a hash probe: 8 bytes
-    /// per object against roughly 24 for the map, and the pipeline only ever asks
-    /// whether an address is indexed.
-    pub sorted_addresses: Vec<u64>,
     /// Stack traces indexed by thread serial number.
     pub stack_traces: HashMap<u32, ThreadStackTrace>,
     /// Thread serial -> thread object address mapping (from GcRootThreadObj roots).
@@ -116,8 +110,18 @@ pub struct HeapDump {
 
 impl HeapDump {
     /// True when the address was indexed by the parser (an instance or an array).
+    ///
+    /// Answered from the on-disk object directory. Class-dump records live in the
+    /// directory too but were never indexed as objects, so they answer false
+    /// (Section 10 counts class-dump array elements as null, as Java does).
+    /// Without a directory the answer is false; the linear scan collects its own
+    /// address set for that fallback.
     pub fn contains_object(&self, addr: u64) -> bool {
-        self.sorted_addresses.binary_search(&addr).is_ok()
+        let Some(dir) = self.obj_dir.as_ref() else { return false };
+        matches!(
+            dir.lookup(addr),
+            Ok(Some((_, rec))) if rec.kind != ss_support::obj_dir::KIND_CLASS_DUMP
+        )
     }
 
 
