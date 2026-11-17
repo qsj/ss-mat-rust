@@ -53,6 +53,22 @@ fn release_mapped_pages(map: &memmap2::Mmap) {
     };
 }
 
+/// Pass boundary: the memory snapshot, plus the time the pass took when
+/// SS_MAT_SCAN_DEBUG is set. Inert otherwise.
+fn mark(label: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(std::time::Instant::now()));
+    let elapsed = last.lock().map(|t| t.elapsed()).unwrap_or_default();
+    ss_support::mem_trace::trace(label);
+    if std::env::var_os("SS_MAT_SCAN_DEBUG").is_some() {
+        eprintln!("  [scan] {:<24} +{:.2}s", label, elapsed.as_secs_f64());
+    }
+    if let Ok(mut t) = last.lock() {
+        *t = std::time::Instant::now();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Random access to object bodies
 // ---------------------------------------------------------------------------
@@ -102,6 +118,101 @@ fn read_some_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::R
         }
     }
     Ok(done)
+}
+
+/// Bodies read through the mapping, with the pages handed back as they pile up.
+///
+/// The duplicate passes stream a group that does not fit their buffer one body at
+/// a time; keeping that on the mapping is right, but the pages it touches have to
+/// be released or the group's residency is however much it read. The returned slice
+/// borrows the dump, not this struct, so two bodies can be compared at once.
+struct PacedBodies<'a> {
+    data: &'a [u8],
+    map: &'a memmap2::Mmap,
+    reads: usize,
+}
+
+impl<'a> PacedBodies<'a> {
+    fn body(&mut self, off: u64, len: usize) -> &'a [u8] {
+        self.reads += 1;
+        if self.reads % BODY_RELEASE_STRIDE == 0 {
+            release_mapped_pages(self.map);
+        }
+        let off = off as usize;
+        &self.data[off..off + len]
+    }
+}
+
+/// The two bodies one duplicate-array equality check needs: from the group's
+/// gather when it fitted the buffer, otherwise from the mapping at a paced rate.
+fn paced_bodies<'b, 'a: 'b>(
+    gathered: bool,
+    arena: &'b BodyRun,
+    paced: &mut PacedBodies<'a>,
+    recs: [&DupSpill; 2],
+    members: [usize; 2],
+) -> (&'b [u8], &'b [u8]) {
+    if gathered {
+        (arena.bytes(members[0]), arena.bytes(members[1]))
+    } else {
+        let width = |r: &DupSpill| {
+            r.length as usize * prim_type_size(PRIM_TYPE_ORDER[r.type_idx as usize])
+        };
+        (
+            paced.body(recs[0].body_off, width(recs[0])),
+            paced.body(recs[1].body_off, width(recs[1])),
+        )
+    }
+}
+
+/// Interval at which a running pass hands the dump mapping's pages back.
+const SWEEP_INTERVAL_MS: u64 = 100;
+
+/// Hands a mapped dump's pages back while a pass reads it.
+///
+/// The passes that pace their own reads bound their window, but a pass that reads
+/// one huge array, or one whose reads the pacing cannot see, still pulls the dump
+/// into the resident set: 5.2 GB of an 8.6 GB dump was resident at the peak, and
+/// none of it live heap. This is the backstop — it drops the mapping's pages a few
+/// times a second, so residency follows the read rate instead of the number of
+/// passes over the file. Advising a read-only file mapping is always sound: a
+/// dropped page is re-read from the file and costs one fault.
+pub(crate) struct PageSweeper {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PageSweeper {
+    /// Start sweeping `map` until the returned value is dropped.
+    pub(crate) fn start(map: std::sync::Arc<memmap2::Mmap>) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("ss-mat-page-sweeper".to_string())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(SWEEP_INTERVAL_MS));
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // SAFETY: the mapping is a read-only file mapping; dropping its
+                    // pages only costs a re-read.
+                    let _ = unsafe { map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for PageSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// One object's payload, read out of the dump.
@@ -346,8 +457,10 @@ impl<'a> WindowCursor<'a> {
 // reads one bucket back at a time, so the resident set is one bucket plus the
 // report's aggregates instead of a per-object payload.
 
-/// Fixed width of one spilled primitive-array record.
-const PRIM_SPILL_REC: usize = 32;
+/// Fixed width of one spilled primitive-array record: the array's identity and
+/// hashes plus the Section 11 result, in the narrowest fixed layout that holds
+/// them, because one of these per primitive array is what the pass keeps resident.
+const PRIM_SPILL_REC: usize = 40;
 /// Fixed width of one spilled String / StringBuilder reference record.
 const STR_SPILL_REC: usize = 32;
 /// Fixed width of one duplicate-string candidate.
@@ -549,7 +662,6 @@ fn join_prim_and_strings(
     prim_class_idx: &[u32; 8],
     class_len: u32,
     header_sz: i64,
-    config: &ScanConfig,
     stats: &StatsEngine,
     debug_coll: bool,
     debug_enabled: bool,
@@ -573,7 +685,6 @@ fn join_prim_and_strings(
         out.debug_tsv.extend_from_slice(b"obj_id_hex\tlength\tbuilder\n");
     }
     let mut body_reads = 0usize;
-
     for bucket in 0..SPILL_BUCKETS {
         let prim_raw = prim_spill.read(bucket)?;
         let mut prims: Vec<PrimSpill> =
@@ -661,24 +772,21 @@ fn join_prim_and_strings(
                 && !(builder_owned && arr.length == 1))
             {
                 let class_idx = prim_class_idx[arr.type_idx as usize];
-                if class_idx < class_len && stats.get_per_class(class_idx).is_some() {
-                    let elem = arr.elem_size();
-                    let size = array_shallow_size(arr.length as i32, elem as i32, header_sz);
-                    if body_reads % BODY_RELEASE_STRIDE == 0 {
-                        release_mapped_pages(mmap);
-                    }
-                    body_reads += 1;
-                    if let Some((kind, waste)) =
-                        classify_prim_array(arr.length as i32, arr.body(data), elem as i32, config, size)
-                    {
-                        out.bad_prim.push(ss_stats::problem_types::BadPrimArrayRecord {
-                            obj_id: arr.obj_id,
-                            class_idx,
-                            kind,
-                            size,
-                            waste,
-                        });
-                    }
+                if class_idx < class_len
+                    && stats.get_per_class(class_idx).is_some()
+                    && arr.bad_kind != NO_BAD_PRIM
+                {
+                    // The walk already classified this array, with its body in
+                    // hand; all this pass adds is Java's claim filter.
+                    let size =
+                        array_shallow_size(arr.length as i32, arr.elem_size() as i32, header_sz);
+                    out.bad_prim.push(ss_stats::problem_types::BadPrimArrayRecord {
+                        obj_id: arr.obj_id,
+                        class_idx,
+                        kind: arr.bad_kind,
+                        size,
+                        waste: arr.bad_waste,
+                    });
                 }
             }
             let key = ((arr.hash as u32 as u64) << 32) | arr.order as u64;
@@ -711,6 +819,116 @@ fn join_prim_and_strings(
     Ok(out)
 }
 
+/// Bodies of one hash group, read in ascending dump offset.
+///
+/// The duplicate passes visit candidates in hash order, which jumps around the
+/// file: a group's members sit wherever the heap put them. Gathering the group's
+/// bodies first and reading them in ascending offset turns its reads into forward
+/// runs, and every comparison after that reads this buffer instead of faulting
+/// the mapping once more per candidate.
+struct BodyRun {
+    /// One buffer holding a group's bodies back to back.
+    buf: Vec<u8>,
+    /// (offset, length) of each member inside buf, in member order; kept only
+    /// while the group has bodies to read, so an all-empty group costs nothing.
+    spans: Vec<(u32, u32)>,
+    /// (dump offset, length, member index) of the bodies to read.
+    plan: Vec<(u64, u32, u32)>,
+    /// True when the last fill read the group into buf.
+    active: bool,
+}
+
+/// Bytes of group bodies one fill may hold. A group that does not fit keeps the
+/// streaming path, so the buffer never grows with the group.
+const GROUP_RUN_BYTES: u64 = 4 << 20;
+/// Longest read a fill issues: bodies that follow close enough share one read.
+const GROUP_READ_BYTES: u64 = 256 << 10;
+/// Members one group must stay under for the gather to be worth its span table.
+/// A larger group is the empty-array chain, whose bodies are all empty anyway.
+const GROUP_MEMBERS: usize = 1 << 16;
+/// Group body bytes read before the mapping's pages are handed back, the same
+/// pace the streaming path used so resident memory stays put.
+const MAPPING_RELEASE_BYTES: u64 = 32 << 20;
+
+impl BodyRun {
+    fn new() -> Self {
+        Self { buf: Vec::new(), spans: Vec::new(), plan: Vec::new(), active: false }
+    }
+
+    /// Whether the last fill put the group's bodies in the buffer.
+    fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Read the planned bodies in ascending dump offset. Returns false when the
+    /// group is larger than the buffer. A zero-length body needs no bytes and
+    /// keeps its empty span.
+    fn fill(&mut self, file: &std::fs::File, members: usize) -> bool {
+        self.active = false;
+        self.spans.clear();
+        self.buf.clear();
+        if self.plan.is_empty() || members > GROUP_MEMBERS {
+            return true;
+        }
+        self.plan.sort_unstable_by_key(|&(off, _, _)| off);
+        // Bytes the coalesced runs would read, checked before anything is read.
+        let mut total = 0u64;
+        let mut at = 0usize;
+        while at < self.plan.len() {
+            let (start, end, next) = self.run(at);
+            total += end - start;
+            at = next;
+        }
+        if total > GROUP_RUN_BYTES {
+            return false;
+        }
+        self.spans.resize(members, (0, 0));
+        let mut at = 0usize;
+        while at < self.plan.len() {
+            let (start, end, next) = self.run(at);
+            let from = self.buf.len();
+            self.buf.resize(from + (end - start) as usize, 0);
+            if read_exact_at(file, &mut self.buf[from..], start).is_err() {
+                return false;
+            }
+            for k in at..next {
+                let (off, len, member) = self.plan[k];
+                let pos = from + (off - start) as usize;
+                self.spans[member as usize] = (pos as u32, len);
+            }
+            at = next;
+        }
+        self.active = true;
+        true
+    }
+
+    /// One read: the bodies from plan entry i that lie within GROUP_READ_BYTES of
+    /// the run's start, and the first entry past them.
+    fn run(&self, i: usize) -> (u64, u64, usize) {
+        let start = self.plan[i].0;
+        let mut end = start + self.plan[i].1 as u64;
+        let mut k = i + 1;
+        while k < self.plan.len() {
+            let (off, len, _) = self.plan[k];
+            let next_end = (off + len as u64).max(end);
+            if next_end - start > GROUP_READ_BYTES {
+                break;
+            }
+            end = next_end;
+            k += 1;
+        }
+        (start, end, k)
+    }
+
+    /// The bytes gathered for one member; empty when the group was not gathered.
+    fn bytes(&self, member: usize) -> &[u8] {
+        if !self.active {
+            return &[];
+        }
+        let (at, len) = self.spans[member];
+        &self.buf[at as usize..at as usize + len as usize]
+    }
+}
 /// One duplicate String group, as the streaming replay accumulates it.
 struct DupStringAcc {
     /// Dump order of the group's first String: Java's group creation order.
@@ -738,11 +956,16 @@ struct DupStringAcc {
 fn replay_dup_strings(
     data: &[u8],
     mmap: &memmap2::Mmap,
+    file: &std::fs::File,
     spill: &SpillSet,
     header_sz: i64,
     string_body_size: i64,
     out: &mut Vec<DupStringAcc>,
 ) -> std::io::Result<u64> {
+    let mut arena = BodyRun::new();
+    // Bodies come from the arena now, so the mapping is only read by the fallback;
+    // its pages are still handed back at the same pace as before.
+    let mut gathered = 0u64;
     let mut unique_total = 0u64;
     for bucket in 0..SPILL_BUCKETS {
         let raw = spill.read(bucket)?;
@@ -759,10 +982,17 @@ fn replay_dup_strings(
                 &recs[first..end],
                 data,
                 mmap,
+                file,
+                &mut arena,
                 header_sz,
                 string_body_size,
                 out,
             );
+            gathered += arena.buf.len() as u64;
+            if gathered >= MAPPING_RELEASE_BYTES {
+                release_mapped_pages(mmap);
+                gathered = 0;
+            }
             first = end;
         }
     }
@@ -771,10 +1001,13 @@ fn replay_dup_strings(
 
 /// Replay one hash group of Java's StringContentDeduplicator; returns the number
 /// of groups it created.
+#[allow(clippy::too_many_arguments)]
 fn replay_dup_string_group(
     members: &[&[u8]],
     data: &[u8],
     mmap: &memmap2::Mmap,
+    file: &std::fs::File,
+    arena: &mut BodyRun,
     header_sz: i64,
     string_body_size: i64,
     out: &mut Vec<DupStringAcc>,
@@ -782,31 +1015,80 @@ fn replay_dup_string_group(
     #[derive(Clone, Copy)]
     struct Local {
         rec: S8Spill,
+        /// Position of this member in the group, where its bytes live.
+        member: u32,
         count: u32,
         backing_count: u32,
         backing_bytes: i64,
     }
+
+    // One body per member: only the content window the equality asks about, in
+    // ascending dump offset so the group is one forward run. Nothing per member is
+    // kept beyond what the gather already holds, so a group of empty contents
+    // costs no allocation at all.
+    arena.plan.clear();
+    for (i, raw) in members.iter().enumerate() {
+        let rec = S8Spill::decode(raw);
+        let unit = if rec.enc == STR_ENC_BYTE_LATIN1 { 1u64 } else { 2u64 };
+        let len = rec.take as u64 * unit;
+        if len == 0 {
+            continue;
+        }
+        let off = rec.body_off + rec.start as u64 * unit;
+        arena.plan.push((off, len as u32, i as u32));
+    }
+    let has_bodies = !arena.plan.is_empty();
+    arena.fill(file, members.len());
+    if has_bodies && !arena.active() {
+        // A group larger than the buffer reads the mapping one body at a time and
+        // hands its pages back afterwards; it is rare enough to stay off the path.
+        release_mapped_pages(mmap);
+    }
+    let gathered = arena.active();
+    // The content descriptor and body bytes of one member: from the gather when the
+    // group fitted, from the dump otherwise.
+    let content_at = |rec: &S8Spill| -> StrContent {
+        if gathered {
+            // The gathered bytes start at the content's first unit.
+            StrContent { array_id: 0, enc: rec.enc, start: 0, take: rec.take }
+        } else {
+            rec.content()
+        }
+    };
+    // One comparison's two bodies: from the gather when the group fitted, from the
+    // mapping otherwise. A group the buffer cannot hold is streamed, and streaming
+    // it through the mapping without a pace is what let a single large group pull
+    // its whole footprint into the resident set.
+    let mut paced = PacedBodies { data, map: mmap, reads: 0 };
 
     let mut local: Vec<Local> = Vec::new();
     // Java's content-map bucket for this hash: newest first.
     let mut chain: Vec<usize> = Vec::new();
     // Java's pending entry for this hash: the one group not yet in content_map.
     let mut pending: Option<usize> = None;
-    let mut reads = 0usize;
 
-    for raw in members {
-        let cur = S8Spill::decode(raw);
-        if reads % BODY_RELEASE_STRIDE == 0 {
-            release_mapped_pages(mmap);
-        }
-        reads += 1;
-        let cur_body = cur.body(data);
+    for index in 0..members.len() {
+        let cur = S8Spill::decode(members[index]);
 
         // Java findMaterialised(): content equality against this hash's groups.
         let mut found: Option<usize> = None;
         for &gi in &chain {
             let group = local[gi];
-            if str_content_eq(&group.rec.content(), group.rec.body(data), &cur.content(), cur_body) {
+            let member = group.member as usize;
+            let (member_body, cur_body) = if gathered {
+                (arena.bytes(member), arena.bytes(index))
+            } else {
+                (
+                    paced.body(group.rec.body_off, group.rec.body_len()),
+                    paced.body(cur.body_off, cur.body_len()),
+                )
+            };
+            if str_content_eq(
+                &content_at(&group.rec),
+                member_body,
+                &content_at(&cur),
+                cur_body,
+            ) {
                 found = Some(gi);
                 break;
             }
@@ -815,8 +1097,22 @@ fn replay_dup_string_group(
 
         if let Some(pi) = pending.take() {
             let first = local[pi];
+            let member = first.member as usize;
             let first_backing = first.rec.backing(header_sz);
-            if str_content_eq(&first.rec.content(), first.rec.body(data), &cur.content(), cur_body) {
+            let (first_body, cur_body) = if gathered {
+                (arena.bytes(member), arena.bytes(index))
+            } else {
+                (
+                    paced.body(first.rec.body_off, first.rec.body_len()),
+                    paced.body(cur.body_off, cur.body_len()),
+                )
+            };
+            if str_content_eq(
+                &content_at(&first.rec),
+                first_body,
+                &content_at(&cur),
+                cur_body,
+            ) {
                 // Second occurrence of the content: the pair moves into
                 // content_map with count 2, and the first backing array is
                 // counted unconditionally.
@@ -845,6 +1141,7 @@ fn replay_dup_string_group(
             let gi = local.len();
             local.push(Local {
                 rec: cur,
+                member: index as u32,
                 count: 1,
                 backing_count: u32::from(claimed_cur),
                 backing_bytes: if claimed_cur { cur.backing(header_sz) } else { 0 },
@@ -865,7 +1162,13 @@ fn replay_dup_string_group(
         // First content of this hash: Java claims the array and leaves the
         // content in pending, so no backing is attributed yet.
         let gi = local.len();
-        local.push(Local { rec: cur, count: 1, backing_count: 0, backing_bytes: 0 });
+        local.push(Local {
+            rec: cur,
+            member: index as u32,
+            count: 1,
+            backing_count: 0,
+            backing_bytes: 0,
+        });
         pending = Some(gi);
     }
 
@@ -914,14 +1217,14 @@ struct PrimHash0Node {
 /// does: same per-type class identity, same length, same body bytes.
 fn dup_spill_eq(
     a: &DupSpill,
-    a_data: &[u8],
+    a_body: &[u8],
     b: &DupSpill,
-    b_data: &[u8],
+    b_body: &[u8],
     prim_class_id: &[u64; 8],
 ) -> bool {
     prim_class_id[a.type_idx as usize] == prim_class_id[b.type_idx as usize]
         && a.length == b.length
-        && a.body(a_data) == b.body(b_data)
+        && a_body == b_body
 }
 
 /// Replay Java's PrimitiveArraySizeAccumulator over one spilled accumulator.
@@ -934,6 +1237,7 @@ fn dup_spill_eq(
 fn replay_dup_prim(
     data: &[u8],
     mmap: &memmap2::Mmap,
+    file: &std::fs::File,
     spill: &SpillSet,
     prim_class_id: &[u64; 8],
     debug: bool,
@@ -941,7 +1245,11 @@ fn replay_dup_prim(
     pending_groups: &mut u64,
     hash0: &mut Vec<PrimHash0Node>,
 ) -> std::io::Result<()> {
-    let mut reads = 0usize;
+    let mut arena = BodyRun::new();
+    // The mapping is only read by the fallback for an oversized group, at a pace
+    // that keeps its pages from accumulating.
+    let mut paced = PacedBodies { data, map: mmap, reads: 0 };
+    let mut gathered = 0u64;
     for bucket in 0..SPILL_BUCKETS {
         let raw = spill.read(bucket)?;
         let mut recs: Vec<&[u8]> = raw.chunks_exact(DUP_SPILL_REC).collect();
@@ -954,13 +1262,38 @@ fn replay_dup_prim(
                 end += 1;
             }
             let group = &recs[first..end];
+            first = end;
             if group.len() == 1 {
                 // A hash seen once keeps Java's pending entry and creates no node.
                 let only = DupSpill::decode(group[0]);
                 per_type_distinct[only.type_idx as usize] += 1;
                 *pending_groups += 1;
-                first = end;
                 continue;
+            }
+            // The bodies this group compares, read in ascending dump offset. The
+            // records are decoded where they are used, so a group of empty arrays
+            // (the hash-0 chain) gathers and allocates nothing.
+            arena.plan.clear();
+            for (i, raw) in group.iter().enumerate() {
+                let rec = DupSpill::decode(raw);
+                let elem = prim_type_size(PRIM_TYPE_ORDER[rec.type_idx as usize]) as u64;
+                let len = rec.length as u64 * elem;
+                if len == 0 {
+                    continue;
+                }
+                arena.plan.push((rec.body_off, len as u32, i as u32));
+            }
+            let has_bodies = !arena.plan.is_empty();
+            arena.fill(file, group.len());
+            let gathered_group = arena.active();
+            if has_bodies && !gathered_group {
+                // The group kept the streaming path, so hand its pages back after.
+                release_mapped_pages(mmap);
+            }
+            gathered += arena.buf.len() as u64;
+            if gathered >= MAPPING_RELEASE_BYTES {
+                release_mapped_pages(mmap);
+                gathered = 0;
             }
             // (member index, count, members) per node, in creation order.
             let mut nodes: Vec<(usize, u32, Vec<(u64, u32)>)> = Vec::new();
@@ -976,13 +1309,11 @@ fn replay_dup_prim(
                     continue;
                 }
                 if let Some(pi) = pending.take() {
-                    if reads % BODY_RELEASE_STRIDE == 0 {
-                        release_mapped_pages(mmap);
-                    }
-                    reads += 1;
                     let first_rec = DupSpill::decode(group[pi]);
                     let first_order = (first_rec.key & 0xffff_ffff) as u32;
-                    if dup_spill_eq(&first_rec, data, &cur, data, prim_class_id) {
+                    let (first_body, cur_body) =
+                        paced_bodies(gathered_group, &arena, &mut paced, [&first_rec, &cur], [pi, index]);
+                    if dup_spill_eq(&first_rec, first_body, &cur, cur_body, prim_class_id) {
                         nodes.push((
                             index,
                             2,
@@ -1007,12 +1338,15 @@ fn replay_dup_prim(
                 // Materialised: walk this hash's node chain, then append.
                 let mut matched: Option<usize> = None;
                 for (slot, node) in nodes.iter().enumerate() {
-                    if reads % BODY_RELEASE_STRIDE == 0 {
-                        release_mapped_pages(mmap);
-                    }
-                    reads += 1;
                     let rep_rec = DupSpill::decode(group[node.0]);
-                    if dup_spill_eq(&rep_rec, data, &cur, data, prim_class_id) {
+                    let (rep_body, cur_body) = paced_bodies(
+                        gathered_group,
+                        &arena,
+                        &mut paced,
+                        [&rep_rec, &cur],
+                        [node.0, index],
+                    );
+                    if dup_spill_eq(&rep_rec, rep_body, &cur, cur_body, prim_class_id) {
                         matched = Some(slot);
                         break;
                     }
@@ -1035,15 +1369,14 @@ fn replay_dup_prim(
                 }
             }
             if hash == 0 {
-                for (rep, count, members) in nodes {
+                for (rep, count, node_members) in nodes {
                     hash0.push(PrimHash0Node {
                         rep: DupSpill::decode(group[rep]),
                         count,
-                        members,
+                        members: node_members,
                     });
                 }
             }
-            first = end;
         }
     }
     Ok(())
@@ -1060,7 +1393,14 @@ struct PrimSpill {
     /// Position in dump order; also this array's bit in the claim bitmaps.
     order: u32,
     type_idx: u8,
+    /// Section 11 kind, or NO_BAD_PRIM when the array is not a problem.
+    bad_kind: u8,
+    /// Section 11 waste bytes, zero unless bad_kind says otherwise.
+    bad_waste: i64,
 }
+
+/// bad_kind of an array Section 11 does not report.
+const NO_BAD_PRIM: u8 = u8::MAX;
 
 impl PrimSpill {
     fn encode(&self) -> [u8; PRIM_SPILL_REC] {
@@ -1071,6 +1411,8 @@ impl PrimSpill {
         out[20..24].copy_from_slice(&self.hash.to_le_bytes());
         out[24..28].copy_from_slice(&self.order.to_le_bytes());
         out[28] = self.type_idx;
+        out[29] = self.bad_kind;
+        out[32..40].copy_from_slice(&self.bad_waste.to_le_bytes());
         out
     }
 
@@ -1082,6 +1424,8 @@ impl PrimSpill {
             hash: le_i32(bytes, 20),
             order: le_u32(bytes, 24),
             type_idx: bytes[28],
+            bad_kind: bytes[29],
+            bad_waste: le_u64(bytes, 32) as i64,
         }
     }
 
@@ -1288,10 +1632,16 @@ impl LinearScanCoordinator {
     /// they are re-read from the mapping by offset.
     pub fn run(&self, hprof_path: &Path) -> Result<()> {
         eprintln!("Linear scan: re-parsing HPROF for field data...");
-        ss_support::mem_trace::trace("run-start");
+        mark("run-start");
 
         let file = std::fs::File::open(hprof_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = std::sync::Arc::new(unsafe { Mmap::map(&file)? });
+        // The passes that stay on the mapping are the ones that walk it in dump
+        // order and release everything behind the cursor; file huge pages would
+        // make one stray read charge two megabytes of a window that is supposed to
+        // be a few pages wide, so the mapping is kept on ordinary pages.
+        let _ = mmap.advise(memmap2::Advice::NoHugePage);
+        let _sweeper = PageSweeper::start(std::sync::Arc::clone(&mmap));
         let data = &mmap[..];
 
         let hprof = jvm_hprof::parse_hprof(data)
@@ -1353,7 +1703,7 @@ impl LinearScanCoordinator {
         ] {
             prim_class_id[prim_type_code_index(pt)] = prim_array_class_id(&self.heap, pt);
         }
-        ss_support::mem_trace::trace("run-classidx");
+        mark("run-classidx");
 
         // ------------------------------------------------------------------
         // Pass 1: primitive arrays, in dump order. Nothing is kept per array:
@@ -1411,6 +1761,23 @@ impl LinearScanCoordinator {
                         }
                     }
                 }
+                // Section 11's classification is a pure function of the body, so
+                // it is taken here, where the body is already in hand for the
+                // hash: the aggregation passes then never read an array body again.
+                let bad = if class_idx < self.heap.classes.len() as u32
+                    && self.stats.get_per_class(class_idx).is_some()
+                {
+                    classify_prim_array(
+                        len as i32,
+                        &data[body_off..body_off + body_len],
+                        elem,
+                        &self.config,
+                        size,
+                    )
+                } else {
+                    None
+                };
+                let (bad_kind, bad_waste) = bad.unwrap_or((NO_BAD_PRIM, 0));
                 let spill = PrimSpill {
                     obj_id,
                     body_off: body_off as u64,
@@ -1418,13 +1785,15 @@ impl LinearScanCoordinator {
                     hash: java_hash_byte_array(&data[body_off..body_off + body_len]),
                     order: prim_count,
                     type_idx: type_idx as u8,
+                    bad_kind,
+                    bad_waste,
                 };
                 prim_count += 1;
                 prim_spill.push(spill_bucket(obj_id), &spill.encode())?;
             }
             Ok(())
         })?;
-        ss_support::mem_trace::trace("run-primindex");
+        mark("run-primindex");
 
         // ------------------------------------------------------------------
         // Pass 2: instances, in dump order. The string grouping runs here (Java
@@ -1701,7 +2070,7 @@ impl LinearScanCoordinator {
             }
             Ok(())
         })?;
-        ss_support::mem_trace::trace("scan-collected");
+        mark("scan-collected");
         eprintln!(
             "Collected for scan: {} strings, {} prim arrays",
             string_total, prim_count
@@ -1729,7 +2098,6 @@ impl LinearScanCoordinator {
             &prim_class_idx,
             self.heap.classes.len() as u32,
             header_sz,
-            &self.config,
             &self.stats,
             debug_coll,
             debug_enabled,
@@ -1741,7 +2109,7 @@ impl LinearScanCoordinator {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(dir.join("string_backing.tsv"), &joined.debug_tsv);
         }
-        ss_support::mem_trace::trace("scan-joined");
+        mark("scan-joined");
 
         // Duplicate strings: Java's StringContentDeduplicator result.
         // The report's "unique strings" is content_map.size() + pending.size(),
@@ -1753,10 +2121,17 @@ impl LinearScanCoordinator {
             .unwrap_or(24);
         s8_spill.flush()?;
         let mut s8_acc: Vec<DupStringAcc> = Vec::new();
-        let unique_count =
-            replay_dup_strings(data, &mmap, &s8_spill, header_sz, string_body_size, &mut s8_acc)?;
+        let unique_count = replay_dup_strings(
+            data,
+            &mmap,
+            &file,
+            &s8_spill,
+            header_sz,
+            string_body_size,
+            &mut s8_acc,
+        )?;
         drop(s8_spill);
-        ss_support::mem_trace::trace("scan-spans");
+        mark("scan-spans");
 
         eprintln!(
             "String scan: {} total, {} unique (content+pending), {} duplicate groups",
@@ -1928,7 +2303,7 @@ impl LinearScanCoordinator {
         let mut obj_order: Vec<u32> = (0..obj_recs.len() as u32).collect();
         obj_order.sort_unstable_by_key(|&i| obj_recs[i as usize].obj_id);
         let objs = ObjBodies { map: &mmap, data, recs: &obj_recs, order: &obj_order, id_bytes };
-        ss_support::mem_trace::trace("run-objagg");
+        mark("run-objagg");
 
         if humongous_count > 0 {
             eprintln!(
@@ -2263,7 +2638,7 @@ impl LinearScanCoordinator {
                 body,
             });
         }
-        ss_support::mem_trace::trace("run-collagg");
+        mark("run-collagg");
 
         // Duplicate primitive arrays (S14): replay Java's two accumulators, then
         // merge the way mergeAndBuildReport() does.
@@ -2277,11 +2652,11 @@ impl LinearScanCoordinator {
         dup2_spill.flush()?;
         dup1_spill.flush()?;
         replay_dup_prim(
-            data, &mmap, &dup2_spill, &prim_class_id, debug_on,
+            data, &mmap, &file, &dup2_spill, &prim_class_id, debug_on,
             &mut dup2_distinct, &mut dup2_pending, &mut hash0_pass2,
         )?;
         replay_dup_prim(
-            data, &mmap, &dup1_spill, &prim_class_id, debug_on,
+            data, &mmap, &file, &dup1_spill, &prim_class_id, debug_on,
             &mut dup1_distinct, &mut dup1_pending, &mut hash0_pass1,
         )?;
         drop(dup1_spill);
@@ -2397,7 +2772,7 @@ impl LinearScanCoordinator {
         self.stats
             .dup_prim_arrays
             .set_results(total_processed, unique_count, per_class_entries, top_groups);
-        ss_support::mem_trace::trace("run-dupprim");
+        mark("run-dupprim");
         // Java's primitiveArrayTotalSize sums refChainOverhead over the
         // single-dimension primitive-array classes: count*(header+4) plus the
         // sum of element lengths times the element size. primitiveArrayBytes is
@@ -2427,7 +2802,7 @@ impl LinearScanCoordinator {
             primitive_array_total_size,
             primitive_array_bytes,
         );
-        ss_support::mem_trace::trace("run-dup");
+        mark("run-dup");
 
         // Stash the records the report reads after BFS.
         *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
@@ -2449,7 +2824,7 @@ impl LinearScanCoordinator {
         // Hand back everything the passes touched before the BFS phase maps the
         // dump again.
         release_mapped_pages(&mmap);
-        ss_support::mem_trace::trace("scan-end");
+        mark("scan-end");
         Ok(())
     }
 }
@@ -3149,14 +3524,13 @@ const SCAN_RELEASE_WINDOW: usize = 24 << 20;
 
 /// How often the on-demand body readers hand the mapping's pages back.
 ///
-/// The duplicate-detection passes read bodies at pseudo-random addresses, so the
-/// pages they touch stay resident until something releases them. Releasing the
-/// whole mapping is a page-table walk proportional to the file size (tens of
-/// milliseconds on macOS), so the stride trades residency for syscall cost: a
-/// few thousand reads touch at most that many pages, which is a small window
-/// next to the dump, while a 128-read stride made the pass spend minutes inside
-/// `madvise`.
-const BODY_RELEASE_STRIDE: usize = 2048;
+/// The passes that follow spilled records read bodies at pseudo-random addresses,
+/// and a fault on one of them brings in the pages around it (64 KB of readahead on
+/// Linux), so a few thousand reads charge far more than their own pages: measured
+/// on an 8.6 GB dump, 2000 scattered reads left 129 MB resident. Releasing the
+/// whole map costs one page-table walk — 0.009 ms over the same dump — so the
+/// stride can stay small and keep the window near 32 MB.
+const BODY_RELEASE_STRIDE: usize = 512;
 
 /// One heap-dump object, located in the mapped dump by walk_heap.
 enum RawObj {

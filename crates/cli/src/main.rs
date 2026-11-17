@@ -71,6 +71,12 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ss-mat-{}", std::process::id())));
     let workspace = ss_hprof_parser::objdir_build::TempWorkspace::create(&temp_root)
         .with_context(|| format!("cannot prepare temp dir {}", temp_root.display()))?;
+    // Every writer in the pipeline takes its scratch directory from this variable.
+    // Pointing it at the workspace is what gives the run's temp files one owner:
+    // the BFS spilling used to fall back to its own /tmp/ss-mat-<pid> and outlive
+    // the run whenever the workspace was somewhere else.
+    std::env::set_var("SS_MAT_TEMP_DIR", workspace.path());
+    let _temp_files = TempFiles::new(workspace.path().to_path_buf());
     let obj_cfg = ss_hprof_parser::objdir_build::ObjDirConfig {
         temp_dir: workspace.path().to_path_buf(),
         cache_bytes: (flags.cache_mb.max(1) as usize) << 20,
@@ -542,6 +548,51 @@ fn extract_jvm_info(
     };
 
     stats.jvm_info.set(info);
+}
+
+/// Removes the files this run wrote into its temp workspace.
+///
+/// The object directory and the BFS spill files are the largest thing a run
+/// writes outside the report, and the workspace is only removed by its own guard
+/// when this run created it: with `--temp-dir` pointing at a directory that
+/// already existed, the artifacts stayed behind. The guard runs on the error path
+/// too, because `main` returns `Result` and the drop happens on the way out.
+struct TempFiles {
+    path: PathBuf,
+    /// Only this run's files: the names carry the pid, so a concurrent run
+    /// sharing the directory keeps its own.
+    pid_tag: String,
+}
+
+impl TempFiles {
+    fn new(path: PathBuf) -> Self {
+        Self { path, pid_tag: format!("-{}", std::process::id()) }
+    }
+}
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path.join("objects.objdir"));
+        let Ok(entries) = std::fs::read_dir(&self.path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("bfs-") || name.starts_with("ss-mat-scan-")) {
+                continue;
+            }
+            if !name.contains(&self.pid_tag) {
+                continue;
+            }
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
 }
 
 /// Parse a memory flag value like "512m", "2g", "1024k" into bytes.
