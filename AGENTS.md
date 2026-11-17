@@ -146,7 +146,7 @@ Section 22: 全部线程栈可折叠显示（OOM 线程优先）
 - Section 3 的 "Live shallow" 是 live shallow，不是 dominator retained；列名已改，避免误导
 - `ss-containers` 与 `ss-support` 尚未被主流程引用；`traversal/stats` 仍有若干 stub 模块
 - HPROF 仍会被完整重解析多次，GB 级 dump 需要后续性能优化
-- 内存优化：对象目录、记录走查器、流式线性扫描、BFS 去图化、窗口化 mmap 均已落地；task_dump 峰值 live heap 188.5 MB / footprint 230 MB / 18.0 s，appauditd 401.2 MB / 472 MB / 61.9 s；仍保留约 18 B/对象（`sorted_addresses`、BFS dump 序表、链采样），实测与复现见 `docs/memory-reduction-status.md`
+- 内存优化：对象目录、记录走查器、流式线性扫描、BFS 去图化 + 顺序化、引用链有界化、报告采样前缀化均已落地；实测 task_dump 峰值堆 148 MB / max RSS 222 MB / 7.5 s，appauditd 230 MB / 430 MB / 15.5 s，8.0 GiB / 1.2 亿对象的 ADG dump 468 MB / 924 MB / 888 s。逐对象常驻只剩 `visited` 位图（0.125 B/对象），parent 日志与 dump 序表在磁盘；实测、口径与遗留项见 `docs/memory-reduction-status.md`
 - `JAVA_BFS_VISITED_BEFORE_STRING` 是 Java BFS live/garbage 访问顺序的兼容表，目前含 task_dump 的 2 个和 appauditd 的 1 个 `String.value` 数组；新 dump 若出现同类顺序差异，需要按 Java 实际访问顺序补充或改为完整 BFS 调度复刻
 - `JAVA_BFS_VISITED_BEFORE_CONTAINER` 是同一类兼容表：Java `addInstanceBodySize` 只统计未被 BFS 访问过的对象，appauditd 的 WeakHashMap `0x604bec478` 的 entry/ReferenceQueue/lock 已被访问，SINGLE_ELEM body 少 88B；Rust 在 compute_body 中显式扣除。新 dump 若出现同类差异需补充
 - S15 非空时 group 行的 representative 地址取决于 Java BFS 访问顺序（Rust 用扫描顺序），因此逐组 representative 地址可能不同；totals/class/group count/waste/body/长度均对齐
