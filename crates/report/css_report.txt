@@ -1,35 +1,62 @@
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--primary:#2563eb;--primary-hover:#1d4ed8;--danger:#ef4444;--warning:#f59e0b;--success:#10b981;--bg:#f8fafc;--card:#fff;--text-main:#0f172a;--text-muted:#64748b;--border:#e2e8f0;--code-bg:#f1f5f9;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--font-mono:'JetBrains Mono','Fira Code','SF Mono',Monaco,Consolas,monospace}
-html{scroll-behavior:smooth}
+:root{--primary:#2563eb;--primary-hover:#1d4ed8;--danger:#ef4444;--warning:#f59e0b;--success:#10b981;--bg:#f8fafc;--card:#fff;--text-main:#0f172a;--text-muted:#64748b;--border:#e2e8f0;--code-bg:#f1f5f9;
+  /* --muted was used by the KPI strip and the nav group titles but never defined,
+     so they inherited the body colour and stopped receding. It is an alias. */
+  --muted:var(--text-muted);
+  --accent:#2563eb;--accent-soft:#eef2ff;
+  --danger-soft:#fef2f2;--warning-soft:#fffbeb;--success-soft:#ecfdf5;
+  /* One measured height drives every offset that has to clear the sticky nav. */
+  --nav-h:112px;--tools-h:0px;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--font-mono:'JetBrains Mono','Fira Code','SF Mono',Monaco,Consolas,monospace}
+/* Anchor jumps are instant: on a multi-megabyte report a smooth scroll over
+   20,000 px of table is slower than the jump it animates, and it needs frames
+   that a background tab never produces. */
+html{scroll-behavior:auto}
 body{font-family:var(--font-sans);background-color:var(--bg);color:var(--text-main);line-height:1.6;padding:24px}
 .container{max-width:1400px;margin:0 auto}
-.report-header{background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);color:#fff;padding:40px;border-radius:16px;margin-bottom:32px;box-shadow:0 10px 30px -10px rgba(15,23,42,.3)}
-.report-header h1{font-size:28px;margin-bottom:12px;font-weight:700;letter-spacing:-.5px}
-.report-header .meta{opacity:.85;font-size:14px;font-family:var(--font-mono)}
-details{background:var(--card);border-radius:10px;margin-bottom:16px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.02);overflow:hidden;transition:box-shadow .2s ease}
+.report-header{background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);color:#fff;padding:28px 32px;border-radius:14px;margin-bottom:20px;box-shadow:0 10px 30px -12px rgba(15,23,42,.35)}
+.report-header h1{font-size:26px;margin-bottom:6px;font-weight:700;letter-spacing:-.4px;line-height:1.25}
+.report-header .meta{opacity:.85;font-size:13px;font-family:var(--font-mono);line-height:1.45}
+/* overflow:clip keeps the rounded corners without turning <details> into a scroll
+   container, which would make position:sticky (nav, table headers) resolve against
+   the section box instead of the viewport. */
+details{background:var(--card);border-radius:10px;margin-bottom:14px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.02);overflow:clip;transition:box-shadow .2s ease}
 details:hover{box-shadow:0 4px 12px rgba(0,0,0,.04)}
 details details{background:#fafafa;border-radius:8px;margin:10px 16px;box-shadow:none;border:1px solid var(--border)}
-details details summary{padding:12px 16px;font-size:13.5px;background-color:#fff}
-summary{padding:16px 24px;font-weight:600;font-size:15px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;transition:background .2s,color .2s;user-select:none;background-color:var(--card)}
+details details summary{padding:10px 14px;font-size:13.5px;background-color:#fff}
+summary{padding:14px 20px;font-weight:600;font-size:15px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;transition:background .2s,color .2s;user-select:none;background-color:var(--card)}
 summary:hover{background-color:#f1f5f9;color:var(--primary)}
-summary::before{content:'';display:inline-block;width:6px;height:6px;border-top:2px solid var(--text-muted);border-right:2px solid var(--text-muted);transform:rotate(45deg);transition:transform .2s ease;margin-left:4px;margin-right:4px}
+summary::before{content:'';display:inline-block;width:6px;height:6px;border-top:2px solid var(--text-muted);border-right:2px solid var(--text-muted);transform:rotate(45deg);transition:transform .2s ease;margin-left:4px;margin-right:4px;flex:0 0 auto}
 details[open]>summary::before{transform:rotate(135deg)}
 details[open]>summary{border-bottom:1px solid var(--border);background-color:#f8fafc}
 details[open]>summary+*{margin-top:0}
 details br:first-child{display:none}
 .SecHdr{font-weight:600;font-size:16px;display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* Section titles are real headings now: the document has an outline for skim
+   reading, in-page search and screen readers. */
+h2.sec-h2{margin:0;font-size:15.5px;font-weight:600;line-height:1.3;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.sec-num{font-variant-numeric:tabular-nums;font-weight:700;font-size:11.5px;color:var(--primary);background:var(--accent-soft);border-radius:5px;padding:1px 6px;flex:0 0 auto}
+h3.sub-h3{margin:14px 0 4px;font-size:14px;font-weight:600;color:var(--text-main)}
 .Bigger{font-size:14.5px}
 .TSP_1{text-align:left}
 .TAL{text-align:left}
-.OvhdColorHigh,.OvhdColorMed,.OvhdColorLow{display:inline-block;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:#fff}
+.OvhdColorHigh,.OvhdColorMed,.OvhdColorLow,.OvhdColorGood{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#fff}
 .OvhdColorHigh{background-color:var(--danger)}
 .OvhdColorMed{background-color:var(--warning);color:#0f172a}
 .OvhdColorLow{background-color:var(--success)}
-table.dt{width:100%;border-collapse:collapse;font-size:14px;margin:12px 0;background-color:var(--card)}
-table.dt th{text-align:right;padding:14px 16px;background-color:#f1f5f9;color:#475569;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid var(--border)}
+/* Good news wears the success tone; it used to wear the alarm red. */
+.OvhdColorGood{background-color:var(--success-soft);color:#065f46;border:1px solid #a7f3d0}
+table.dt{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0;background-color:var(--card)}
+table.dt th{text-align:right;padding:8px 12px;background-color:#f1f5f9;color:#475569;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid var(--border);line-height:1.35;white-space:nowrap}
 table.dt th.TAL{text-align:left}
-table.dt td{padding:12px 16px;border-bottom:1px solid var(--border);color:#334155;text-align:right;vertical-align:middle}
-table.dt td.TAL{text-align:left}
+table.dt td{padding:6px 12px;border-bottom:1px solid var(--border);color:#334155;text-align:right;vertical-align:middle;line-height:1.35;
+  /* Digits line up in a column and a value never splits across two lines. */
+  white-space:nowrap;font-variant-numeric:tabular-nums}
+/* The name column is the only one that may wrap, and being last it absorbs the
+   slack the nowrap numeric columns leave. */
+table.dt td.TAL{text-align:left;white-space:normal}
+table.dt td.TAL:last-child{width:100%}
+table.dt td.TSP_1{white-space:normal;text-align:left}
 .C_01{background-color:#f8fafc}
 .C_01 td{font-weight:600;color:var(--text-main)}
 .C_02{background-color:#fff}
@@ -37,17 +64,29 @@ table.dt td.TAL{text-align:left}
 .C_04{background-color:#f0f9ff}
 .C_04 td{background-color:#f0f9ff}
 tr:hover td{background-color:#f1f5f9!important}
-.scroll-wrap{max-height:550px;overflow-y:auto;border-radius:8px;border:1px solid var(--border);box-shadow:inset 0 2px 4px rgba(0,0,0,.02)}
+/* Evidence folds live inside table cells: they must not inherit the section
+   header padding, or every row they sit in becomes twice as tall as its data. */
+table.dt summary{padding:2px 5px;font-size:12.5px;line-height:1.3}
+table.dt summary::before{margin-left:0;margin-right:2px;width:5px;height:5px}
+/* Header rows pin under the navigation, not under the viewport edge. */
+table.dt th{position:sticky;top:calc(var(--nav-h) + 1px);z-index:12;box-shadow:0 1px 0 var(--border)}
+table.dt.has-tools th{top:calc(var(--nav-h) + var(--tools-h) + 1px)}
+.scroll-wrap{border-radius:8px;border:1px solid var(--border)}
 .scroll-wrap table.dt{margin:0}
-.scroll-wrap table.dt th{position:sticky;top:0;z-index:10;box-shadow:0 1px 0 var(--border)}
 i-s{color:var(--success);font-size:12px}
-t-s{color:#0f766e;font-family:var(--font-mono);font-size:13px;background:#f0fdfa;padding:2px 4px;border-radius:4px}
+t-s{color:#0f766e;font-family:var(--font-mono);font-size:13px;background:#f0fdfa;padding:1px 4px;border-radius:4px}
 t-c{color:#b45309;font-weight:600;font-family:var(--font-mono)}
 t-f{color:#1d4ed8;font-weight:600;font-family:var(--font-mono)}
 t-m{color:#701a75;font-weight:600;font-style:italic;font-family:var(--font-mono)}
 cd{font-family:var(--font-mono);font-weight:500;background:var(--code-bg);padding:2px 6px;border-radius:4px;font-size:12.5px;color:#334155;border:1px solid #e2e8f0}
-[class^="rc_tab"]{display:block;position:relative;border-left:2px solid #cbd5e1;margin-top:4px;margin-bottom:4px}
-rc_tab1{padding-left:10px;margin-left:10px}rc_tab2{padding-left:10px;margin-left:20px}rc_tab3{padding-left:10px;margin-left:30px}rc_tab4{padding-left:10px;margin-left:40px}rc_tab5{padding-left:10px;margin-left:50px}rc_tab6{padding-left:10px;margin-left:60px}rc_tab7{padding-left:10px;margin-left:70px}rc_tab8{padding-left:10px;margin-left:80px}rc_tab9{padding-left:10px;margin-left:90px}rc_tab10{padding-left:10px;margin-left:100px}rc_tab11{padding-left:10px;margin-left:110px}rc_tab12{padding-left:10px;margin-left:120px}rc_tab13{padding-left:10px;margin-left:130px}rc_tab14{padding-left:10px;margin-left:140px}rc_tab15{padding-left:10px;margin-left:150px}rc_tab16{padding-left:10px;margin-left:160px}rc_tab17{padding-left:10px;margin-left:170px}rc_tab18{padding-left:10px;margin-left:180px}rc_tab19{padding-left:10px;margin-left:190px}rc_tab20{padding-left:10px;margin-left:200px}rc_tab21{padding-left:10px;margin-left:210px}rc_tab22{padding-left:10px;margin-left:220px}rc_tab23{padding-left:10px;margin-left:230px}rc_tab24{padding-left:10px;margin-left:240px}
+/* rc_tab1..rc_tab24 are element names, not classes: the old [class^="rc_tab"]
+   selector matched zero nodes, so every chain line stayed inline and wrapped
+   back to the left margin. */
+rc_tab1,rc_tab2,rc_tab3,rc_tab4,rc_tab5,rc_tab6,rc_tab7,rc_tab8,rc_tab9,rc_tab10,rc_tab11,rc_tab12,
+rc_tab13,rc_tab14,rc_tab15,rc_tab16,rc_tab17,rc_tab18,rc_tab19,rc_tab20,rc_tab21,rc_tab22,rc_tab23,rc_tab24{display:block;position:relative;border-left:2px solid #cbd5e1;margin-top:2px;margin-bottom:2px;padding-left:8px;line-height:1.45}
+rc_tab1{margin-left:6px}rc_tab2{margin-left:14px}rc_tab3{margin-left:22px}rc_tab4{margin-left:30px}rc_tab5{margin-left:38px}rc_tab6{margin-left:46px}
+rc_tab7,rc_tab8,rc_tab9,rc_tab10,rc_tab11,rc_tab12,rc_tab13,rc_tab14,rc_tab15,rc_tab16,
+rc_tab17,rc_tab18,rc_tab19,rc_tab20,rc_tab21,rc_tab22,rc_tab23,rc_tab24{margin-left:54px;padding-left:8px}
 li{position:relative;margin-left:-15px;list-style:none}
 li input{position:absolute;left:0;opacity:0;z-index:2;cursor:pointer;height:1em;width:1em;top:0}
 li input+ol:before{content:"+";position:absolute;margin-left:-40px;margin-top:-14px;color:var(--text-muted);font-weight:700}
@@ -56,7 +95,7 @@ li input+ol>li{display:none;margin-left:-18px!important;padding-left:1px}
 li label{cursor:pointer;display:block;padding-left:12px}
 li input:checked+ol>li{display:block;margin:0 0 .125em}
 li input:checked+ol>li:last-child{margin:0 0 .063em}
-button{background-color:var(--primary);color:#fff;border:none;padding:8px 18px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;transition:background-color .2s ease,transform .1s ease}
+button{background-color:var(--primary);color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;transition:background-color .2s ease,transform .1s ease}
 button:hover{background-color:var(--primary-hover)}
 button:active{transform:scale(.98)}
 .modal{display:none;position:fixed;z-index:200;left:0;top:0;width:100%;height:100%;background-color:rgba(15,23,42,.4);backdrop-filter:blur(4px)}
@@ -64,58 +103,149 @@ button:active{transform:scale(.98)}
 .close{color:var(--text-muted);float:right;font-size:28px;font-weight:500;cursor:pointer;line-height:1;transition:color .2s}
 .close:hover{color:var(--text-main)}
 .report-footer{text-align:center;padding:40px 0;color:var(--text-muted);font-size:13px;border-top:1px solid var(--border);margin-top:40px}
-@media(max-width:768px){body{padding:16px}.report-header{padding:24px;border-radius:12px}.report-header h1{font-size:20px}summary{padding:14px 18px;font-size:14px}table.dt th,table.dt td{padding:10px 12px;font-size:13px}}
 
-/* ---- diagnostic shell: KPI strip, grouped navigation, hash deep links ---- */
-.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 12px}
-.kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:4px}
-.kpi-k{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
-.kpi-v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
-.kpi-v em{font-size:13px;font-weight:500;font-style:normal;color:var(--muted)}
-.secnav{position:sticky;top:0;z-index:40;display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;
-  background:var(--card);border:1px solid var(--border);border-radius:10px;padding:6px 10px;margin-bottom:12px;
-  font-size:12px;line-height:1.5}
-.nav-home{font-weight:600;padding:2px 8px;border-radius:6px;text-decoration:none;background:var(--accent-soft,#eef2ff)}
-.navgrp{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;border-left:1px solid var(--border);padding-left:12px}
-.navgrp:first-of-type{border-left:0;padding-left:0}
-.navgrp-t{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-right:2px}
-.navlink{font-size:12px;text-decoration:none;color:inherit;padding:2px 6px;border-radius:6px;white-space:nowrap}
-.navlink:hover{background:var(--accent-soft,#eef2ff)}
-.navlink.is-current{background:var(--accent-soft,#eef2ff);font-weight:600}
-.report-body{display:block}
-details[id^="Section-"]:target>summary{outline:2px solid var(--accent,#2563eb);outline-offset:2px;border-radius:6px}
-@media (max-width:1100px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:768px){
-  .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-  .kpi-v{font-size:18px}
-  .secnav{position:static;max-height:none;overflow:visible}
-  .navgrp{border-left:0;padding-left:0}
+/* ---- diagnostic shell: KPI strip, section index, hash deep links ---- */
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0 10px}
+.kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.kpi-k{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi-v{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi-v em{font-size:12.5px;font-weight:500;font-style:normal;color:var(--muted)}
+/* Tone comes from each card's own number, through the same threshold the section
+   badges use, so a percentage means the same thing everywhere on the page. */
+.kpi--neutral{background:var(--card)}
+.kpi--low{border-color:#a7f3d0;background:var(--success-soft)}
+.kpi--low .kpi-v{color:#047857}
+.kpi--med{border-color:#fde68a;background:var(--warning-soft)}
+.kpi--med .kpi-v{color:#b45309}
+.kpi--high{border-color:#fecaca;background:var(--danger-soft)}
+.kpi--high .kpi-v{color:#b91c1c}
+.secnav{position:sticky;top:0;z-index:40;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:4px 10px;margin-bottom:10px;font-size:12px;line-height:1.3;transition:padding .15s ease,box-shadow .15s ease}
+body.nav-compact .secnav{padding:2px 8px;box-shadow:0 6px 16px -12px rgba(15,23,42,.5)}
+.nav-bar{display:flex;align-items:center;gap:10px;min-width:0}
+.nav-home{font-weight:600;padding:2px 8px;border-radius:6px;text-decoration:none;background:var(--accent-soft);color:var(--primary);flex:0 0 auto}
+.nav-cur{display:none;flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nav-toggle{display:none;margin-left:auto;flex:0 0 auto;background:var(--accent-soft);color:var(--primary);font-size:12px;font-weight:600;padding:5px 12px;border-radius:8px}
+.nav-toggle:hover{background:#e0e7ff;color:var(--primary-hover)}
+.nav-body{display:flex;flex-wrap:wrap;gap:1px 10px;align-items:flex-start;margin-top:2px}
+body.nav-compact .nav-body{margin-top:1px}
+.navgrp{display:flex;flex-wrap:wrap;gap:1px 6px;align-items:baseline;border-left:1px solid var(--border);padding-left:10px}
+/* Desktop: the group label and its links flow in the same wrapping index row,
+   so the bar stays a couple of rows tall instead of one block per group. */
+@media (min-width:769px){
+  .secnav{display:flex;align-items:flex-start;gap:12px}
+  .nav-body{flex:1 1 auto;margin-top:0;margin-left:2px}
+  .navgrp{display:contents}
 }
-@media (prefers-reduced-motion:reduce){.secnav,.navlink{transition:none}}
-
+.navgrp:first-child{border-left:0;padding-left:0}
+/* Group titles are a different weight and colour from the links they carry. */
+.navgrp-t{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-right:2px;flex:0 0 auto}
+.navlink{font-size:11px;text-decoration:none;color:#334155;padding:1px 4px;border-radius:6px;
+  display:inline-block;vertical-align:top;max-width:156px;max-height:2.7em;overflow:hidden;line-height:1.3;word-break:break-word}
+body.nav-compact .navlink{max-height:1.3em}
+body.nav-compact .navgrp-t{display:none}
+.navlink:hover{background:var(--accent-soft);color:var(--primary)}
+.navlink .navnum{font-weight:700;color:var(--muted);margin-right:4px;font-size:11px}
+.navlink.is-current{background:var(--accent-soft);color:var(--primary);font-weight:600}
+.navlink.is-current .navnum{color:var(--primary)}
+.report-body{display:block}
+details[id^="Section-"]:target>summary{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
 /* Anchored sections must not hide under the sticky navigation. */
-details[id^="Section-"], #summary-section { scroll-margin-top: 132px; }
-details[id^="Section-"] > summary { scroll-margin-top: 132px; }
-@media (max-width:768px){ details[id^="Section-"], #summary-section { scroll-margin-top: 16px; } }
+details[id^="Section-"],#summary-section{scroll-margin-top:calc(var(--nav-h) + 8px)}
+details[id^="Section-"]>summary{scroll-margin-top:calc(var(--nav-h) + 8px)}
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
-/* ---- phase 2: readable evidence ----
-   Deep reference chains used to indent 10px per level up to 24 levels, which pushed
-   content off-screen; cap the indent and let the container scroll instead. */
-[class^="rc_tab"]{margin-left:10px}
-rc_tab7,rc_tab8,rc_tab9,rc_tab10,rc_tab11,rc_tab12,rc_tab13,rc_tab14,rc_tab15,rc_tab16,
-rc_tab17,rc_tab18,rc_tab19,rc_tab20,rc_tab21,rc_tab22,rc_tab23,rc_tab24{margin-left:62px;padding-left:6px}
-.scroll-wrap{overflow:auto}
-table.dt{min-width:520px}
-@media (max-width:768px){ table.dt{min-width:420px} }
 /* Keyboard focus must stay visible now that summary rows are interactive. */
-summary:focus-visible,.navlink:focus-visible,.nav-home:focus-visible{
+summary:focus-visible,.navlink:focus-visible,.nav-home:focus-visible,.nav-toggle:focus-visible{
   outline:2px solid var(--primary);outline-offset:2px;border-radius:6px}
-.navlink[aria-current="true"]{background:var(--accent-soft,#eef2ff);font-weight:600}
-/* Per-table filter: only rendered for tables large enough to need it. */
-.table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 4px;font-size:12px;color:var(--text-muted)}
-.table-tools input{flex:1 1 220px;max-width:320px;padding:6px 10px;border:1px solid var(--border);
+/* Per-table filter: sticky, and pinned directly under the navigation. */
+.table-tools{display:flex;gap:8px;align-items:center;margin:6px 0 0;padding:4px 0;font-size:12px;color:var(--text-muted);
+  position:sticky;top:var(--nav-h);z-index:14;background:var(--bg)}
+.table-tools input{flex:1 1 220px;max-width:320px;padding:5px 10px;border:1px solid var(--border);
   border-radius:8px;font-size:13px;font-family:inherit;background:var(--card);color:inherit}
 .table-tools input:focus{outline:2px solid var(--primary);outline-offset:1px}
-.table-tools .count{font-variant-numeric:tabular-nums}
+.table-tools .count{font-variant-numeric:tabular-nums;white-space:nowrap}
 tr.is-filtered{display:none}
-@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+/* ---- advice panels ---- */
+details.adv>summary{padding:10px 14px;font-size:13.5px;border-left:3px solid transparent}
+details.adv>summary .adv-k{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;font-weight:600}
+details.adv .adv-body{padding:12px 18px 14px;font-size:13.5px;line-height:1.6}
+details.adv .adv-body p+p{margin-top:8px}
+details.adv .adv-more{margin-top:10px;color:var(--muted)}
+.adv-k.OvhdColorHigh{background-color:var(--danger)}
+.adv-k.OvhdColorMed{background-color:var(--warning);color:#0f172a}
+.adv-k.OvhdColorLow{background-color:var(--success)}
+.adv-k.OvhdColorGood{background-color:var(--success-soft);color:#065f46;border:1px solid #a7f3d0}
+details.adv.tone-good{border-color:#a7f3d0;background:var(--success-soft)}
+details.adv.tone-good>summary{background:#f0fdf4;border-left:3px solid var(--success)}
+
+/* ---- mobile: a phone gets content above the fold ---- */
+@media(max-width:768px){
+  body{padding:12px}
+  .report-header{padding:12px 16px;border-radius:10px;margin-bottom:10px}
+  .report-header h1{font-size:16px;margin-bottom:2px;letter-spacing:0}
+  .report-header .meta{font-size:10.5px}
+  .kpis{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:8px 0}
+  .kpi{padding:6px 8px;border-radius:8px;gap:0}
+  .kpi-k{font-size:8.5px;letter-spacing:.02em}
+  .kpi-v{font-size:13px}
+  .kpi-v em{display:block;font-size:10px;line-height:1.2}
+  .secnav{padding:4px 8px}
+  .nav-bar{min-height:32px;gap:8px}
+  .nav-cur{display:block}
+  .nav-toggle{display:inline-flex}
+  .nav-body{display:none;margin-top:6px}
+  .secnav.is-open .nav-body{display:flex;max-height:56vh;overflow:auto}
+  .navgrp{border-left:0;padding-left:0}
+  .navlink{max-width:none;max-height:none}
+  summary{padding:12px 16px;font-size:14px}
+  table.dt th,table.dt td{padding:5px 10px;font-size:12.5px}
+  .scroll-wrap{overflow-x:auto}
+  rc_tab1,rc_tab2,rc_tab3,rc_tab4,rc_tab5,rc_tab6,rc_tab7,rc_tab8,rc_tab9,rc_tab10,rc_tab11,rc_tab12,
+  rc_tab13,rc_tab14,rc_tab15,rc_tab16,rc_tab17,rc_tab18,rc_tab19,rc_tab20,rc_tab21,rc_tab22,rc_tab23,rc_tab24{margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){.secnav,.navlink{transition:none}html{scroll-behavior:auto}}
+/* ---- prose: real blocks, no <br> layout ---- */
+p.intro{margin:10px 0;font-size:13.5px;line-height:1.6;color:#334155;max-width:92ch}
+details.fix{margin:10px 0;border:1px solid var(--border);border-radius:8px;background:#fafafa}
+details.fix>summary{padding:10px 14px;font-size:13.5px;background:#fff}
+.fix-body{padding:10px 18px 12px;font-size:13.5px;line-height:1.6;color:#334155}
+.fix-body p+p,.fix-body ul+p{margin-top:8px}
+.fix-list{margin:6px 0 0 18px;list-style:disc}
+.fix-list li{margin:2px 0;list-style:disc}
+
+/* ---- round 2: index rows, single-line entries, balance tones ---- */
+.navlink{display:inline-block;vertical-align:top;max-width:156px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.25;padding:1px 4px}
+.navtext{font-weight:inherit}
+/* Balance figures (garbage share) are not a defect class: neutral, never red. */
+.OvhdColorNeutral{background-color:#e2e8f0;color:#334155}
+/* Good news reads in sentence case; shouting it across four phone lines does not. */
+details.adv.tone-good .adv-k{text-transform:none;letter-spacing:0;font-size:12.5px;line-height:1.4;font-weight:600}
+@media (min-width:769px){
+  .secnav{display:block;padding:3px 8px}
+  .nav-body{display:flex;flex-direction:column;gap:0;margin-top:1px}
+  /* Each group owns a row that starts with its label, and that label sits at the
+     same x on every row, so the index reads as five labelled shelves. */
+  .navgrp{display:flex;flex-wrap:nowrap;align-items:center;gap:0 4px;min-width:0;overflow:hidden;
+    border-left:0;padding-left:0}
+  .navgrp+.navgrp{border-top:1px solid #f1f5f9}
+  .navgrp-t{flex:0 0 112px;text-align:left;font-size:9.5px;letter-spacing:.035em;padding-right:6px;
+    margin-right:2px;border-right:1px solid var(--border);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .navlink{flex:0 1 auto;min-width:0;max-width:200px;font-size:10.5px;line-height:1.15;padding:0 3px;white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word}
+  .navlink .navnum{font-size:10px;margin-right:2px}
+  .navgrp{align-items:flex-start;padding-top:1px;padding-bottom:1px}
+}
+@media (max-width:768px){
+  .navlink{max-width:100%;max-height:none}
+}
+
+@media (min-width:769px){
+  /* The bar row would eat the height budget: on desktop "Top" rides in the first
+     index row instead, and only the rows of the index remain. */
+  .nav-bar{display:none}
+  .nav-home-inline{display:inline-block;font-size:10px;font-weight:600;padding:0 5px;border-radius:6px;
+    background:var(--accent-soft);color:var(--primary);white-space:nowrap;flex:0 0 auto}
+}
+@media (max-width:768px){ .nav-home-inline{display:none} }

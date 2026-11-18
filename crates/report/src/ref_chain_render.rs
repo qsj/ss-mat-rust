@@ -146,7 +146,7 @@ pub struct RefChainRenderInput<'a> {
     pub problem_objs: &'a [ProblemObj],
     /// Cap on objects rendered (typically 20).
     pub max_objs_to_render: usize,
-    /// When set, emits a `<font class="SecHdr">` sub-section header with this
+    /// When set, emits an `<h3 class="sub-h3">` sub-section header with this
     /// text and wraps the chains in a two-tier fold (mirroring Java's
     /// "Reference Chains for X" → Full reference chains structure).
     /// Example: `"Reference Chains for Duplicate Strings"`.
@@ -212,21 +212,21 @@ impl<'a> RefChainRenderer<'a> {
         // Java's "Reference Chains for X" → Full reference chains structure.
         if let Some(sub) = &input.sec_sub_title {
             html.push_str(&format!(
-                "<br><font class=\"SecHdr\">{}</font><br>\n",
+                "<h3 class=\"sub-h3\">{}</h3>\n",
                 sub,
             ));
             // Allocate an sd id for the full-chains fold so its encoded
             // placeholders decode on toggle.
             let sd_id = crate::encoded_strings::next_sd_id();
             html.push_str(&format!(
-                "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary><br>\n",
+                "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary>\n",
                 sd_id, sd_id,
             ));
         }
 
         let total_pct = calc_percent(input.size_bytes, input.total_bytes);
         html.push_str(&format!(
-            "<br><details><summary>{}&nbsp;{}&nbsp;({:.1}%)</summary><br>\n",
+            "<details><summary>{}&nbsp;{}&nbsp;({:.1}%)</summary>\n",
             input.title, format_bytes(input.size_bytes), total_pct,
         ));
         html.push_str("<div><table class=\"dt\">\n");
@@ -247,7 +247,7 @@ impl<'a> RefChainRenderer<'a> {
 
             // Skip if already in Section 4 root tree.
             if self.gc_root_set.contains(&prob.obj_idx) {
-                html.push_str("<rc_tab3>&nbsp;&nbsp;Already shown in <button onclick=\"openSection('Section-4')\">Section 4.</button><br></rc_tab3>\n");
+                html.push_str("<rc_tab3>&nbsp;&nbsp;Already shown in <button onclick=\"openSection('Section-4')\">Section 4.</button></rc_tab3>\n");
                 html.push_str("</details></td></tr>\n");
                 continue;
             }
@@ -261,7 +261,7 @@ impl<'a> RefChainRenderer<'a> {
                     let body = render_decoded_object_body(dec, prob_id, rv);
                     if !body.is_empty() {
                         html.push_str(&format!(
-                            "<rc_tab3>&nbsp;&nbsp;<t-c>{}</t-c>{}<br></rc_tab3>\n",
+                            "<rc_tab3>&nbsp;&nbsp;<t-c>{}</t-c>{}</rc_tab3>\n",
                             dec.class_name, body,
                         ));
                     }
@@ -271,13 +271,13 @@ impl<'a> RefChainRenderer<'a> {
             // Walk parent[] from problem object upward.
             let chain = self.trace_chain_from(prob.obj_idx);
             if chain.is_empty() {
-                html.push_str("<rc_tab3>&nbsp;&nbsp;No reference chain available.<br></rc_tab3>\n");
+                html.push_str("<rc_tab3>&nbsp;&nbsp;No reference chain available.</rc_tab3>\n");
             } else {
                 for (depth, step) in chain.iter().enumerate() {
                     let tab = (3 + depth).min(10);
                     html.push_str(&format!("<rc_tab{}>", tab));
                     html.push_str(step);
-                    html.push_str("<br></rc_tab");
+                    html.push_str("</rc_tab");
                     html.push_str(&tab.to_string());
                     html.push_str(">\n");
                 }
@@ -384,7 +384,7 @@ pub fn render_class_ref_chains(chains: &ClassRefChains, total_bytes: i64) -> Str
     if !chains.expensive_fields.is_empty() {
         let sd_id = crate::encoded_strings::next_sd_id();
         html.push_str(&format!(
-            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Expensive data fields</summary><br><div>",
+            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Expensive data fields</summary><div>",
             sd_id, sd_id,
         ));
         html.push_str(&render_chain_groups(&chains.expensive_fields, total_bytes));
@@ -397,7 +397,7 @@ pub fn render_class_ref_chains(chains: &ClassRefChains, total_bytes: i64) -> Str
         }
         let sd_id = crate::encoded_strings::next_sd_id();
         html.push_str(&format!(
-            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary><br><div>",
+            "<details id=\"sd-{}\" ontoggle=\"replEncStrs({})\"><summary>Full reference chains</summary><div>",
             sd_id, sd_id,
         ));
         html.push_str(&render_chain_groups(&chains.full_chains, total_bytes));
@@ -452,7 +452,7 @@ pub fn render_chain_groups(groups: &[ss_stats::ref_chain::RefChainGroup], total_
                 let tab_level = (3 + i).min(10);
                 html.push_str(&format!("<rc_tab{}>", tab_level));
                 html.push_str(step_str);
-                html.push_str("<br></rc_tab");
+                html.push_str("</rc_tab");
                 html.push_str(&tab_level.to_string());
                 html.push_str(">\n");
             }
@@ -487,7 +487,7 @@ pub fn render_humongous_ref_chains(
     total_bytes: i64,
 ) {
     if !chains.expensive_fields.is_empty() {
-        html.append_raw("<details><summary>Expensive data fields</summary><br><div>");
+        html.append_raw("<details><summary>Expensive data fields</summary><div>");
         html.begin_table(true, 0, &[]);
         for group in &chains.expensive_fields {
             let sample_html = render_samples(&group.samples);
@@ -520,7 +520,7 @@ pub fn render_humongous_ref_chains(
     }
 
     if !chains.full_chains.is_empty() {
-        html.append_raw("<br><details><summary>Full reference chains</summary><br><div>");
+        html.append_raw("<details><summary>Full reference chains</summary><div>");
         html.begin_table(true, 0, &[]);
         for group in &chains.full_chains {
             let sample_html = render_samples(&group.samples);

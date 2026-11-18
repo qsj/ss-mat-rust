@@ -1,8 +1,4 @@
 /* ---- SS-Mat report behaviour ----
-   Rebuilt because the previous file was truncated inside openModal(), which made the
-   whole inline script fail to parse: openSection, sortTable and the modal handlers
-   were dead and the encoded-string decoder never ran.
-
    Table shape (observed in the generator): optional leading rows (totals, header),
    then repeating pairs of (data row with N cells, detail row with a single spanning
    cell). Sorting and filtering therefore detect that structure instead of assuming a
@@ -98,15 +94,21 @@ function sortTable(tid, col) {
   }
 }
 
-/* ---- phase 2: table filter + aria-current ---- */
+/* ---- per-table filter ----
+   The filter is sticky under the navigation, and it is built from a row-count
+   guard first: grouping 655 tables at load is the only expensive work here, so a
+   table that cannot possibly need a filter never pays for it. */
 (function () {
   var MIN_ROWS_FOR_FILTER = 20;
 
   function attachFilter(table) {
     if (table.getAttribute('data-filter-ready') === '1') return;
+    var body = table.tBodies && table.tBodies.length ? table.tBodies[0] : table;
+    if (!body || !body.rows || body.rows.length < MIN_ROWS_FOR_FILTER * 2) return;
     var parts = ssmatTableGroups(table);
     if (parts.groups.length < MIN_ROWS_FOR_FILTER) return;
     table.setAttribute('data-filter-ready', '1');
+    table.classList.add('has-tools');
 
     var tools = document.createElement('div');
     tools.className = 'table-tools';
@@ -139,65 +141,199 @@ function sortTable(tid, col) {
     apply();
   }
 
-  function markCurrent() {
-    var links = document.querySelectorAll('.navlink');
-    for (var i = 0; i < links.length; i++) {
-      if (links[i].classList.contains('is-current')) links[i].setAttribute('aria-current', 'true');
-      else links[i].removeAttribute('aria-current');
-    }
-  }
-
   function boot() {
     var tables = document.querySelectorAll('table.dt');
     for (var i = 0; i < tables.length; i++) {
       try { attachFilter(tables[i]); } catch (e) { /* one bad table must not stop the rest */ }
     }
-    markCurrent();
+    /* One measurement for every sticky header that has to clear a tool row. */
+    var first = document.querySelector('.table-tools');
+    if (first) {
+      document.documentElement.style.setProperty('--tools-h', Math.round(first.getBoundingClientRect().height) + 'px');
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
-  window.addEventListener('hashchange', function () { setTimeout(markCurrent, 0); });
 })();
 
-/* ---- diagnostic shell: deep links and current-section highlight ---- */
+/* ---- navigation: one measured height, a shrinking bar, and a scroll-spy ----
+   --nav-h is measured from the sticky navigation itself and consumed by
+   scroll-margin-top, the sticky table headers and the sticky filter row, so all
+   three stay below the bar instead of sliding under it. */
 (function () {
-  function openById(id) {
-    var el = document.getElementById(id);
-    if (!el) return false;
-    el.open = true;
-    return true;
+  function init() {
+  var root = document.documentElement;
+  var nav = document.querySelector('.secnav');
+  if (!nav) return;
+  var links = Array.prototype.slice.call(document.querySelectorAll('.navlink'));
+  var linkBySec = {};
+  links.forEach(function (a) { linkBySec[a.getAttribute('data-sec')] = a; });
+  var targets = Array.prototype.slice.call(document.querySelectorAll('details[id^="Section-"], #summary-section'));
+  var labelById = {};
+  targets.forEach(function (t) {
+    var h = t.querySelector('summary h2, summary .SecHdr') || t.querySelector('summary');
+    labelById[t.id] = h ? h.textContent.replace(/\s+/g, ' ').trim() : '';
+  });
+  var curLabel = document.getElementById('nav-cur');
+  var home = Array.prototype.filter.call(document.querySelectorAll('.nav-home'),
+    function (el) { return el.getClientRects().length > 0; })[0] || null;
+  var currentId = null;
+
+  var navVarCache = '';
+  function syncNavHeight() {
+    var h = Math.round(nav.getBoundingClientRect().height) + 'px';
+    if (h === navVarCache) return;
+    navVarCache = h;
+    root.style.setProperty('--nav-h', h);
   }
-  function hashSection() {
-    var h = location.hash.replace(/^#/, '');
-    return /^Section-[0-9]+$/.test(h) ? h : '';
+  syncNavHeight();
+  if (window.ResizeObserver) { new ResizeObserver(syncNavHeight).observe(nav); }
+  window.addEventListener('resize', function () { syncNavHeight(); armSpy(); });
+
+  /* The bar shrinks as soon as the page scrolls, so an anchor is placed with the
+     height it will have after the jump, not the height it has right now. */
+  function jumpTo(el) {
+    document.body.classList.add('nav-compact');
+    syncNavHeight();
+    var y = el.getBoundingClientRect().top + window.scrollY - nav.getBoundingClientRect().height - 8;
+    window.scrollTo(0, Math.max(0, y));
+    lastY = window.scrollY;
+    syncCurrent();
   }
-  function highlight() {
-    var id = hashSection();
-    var links = document.querySelectorAll('.navlink');
+  window.ssmatJumpTo = jumpTo;
+
+  /* The line just under the bar decides which section is being read: the section
+     that owns it is the current one, whatever the collapse state of the others. */
+  function detectCurrent() {
+    var line = nav.getBoundingClientRect().bottom + 14;
+    var below = null;
+    for (var i = 0; i < targets.length; i++) {
+      var r = targets[i].getBoundingClientRect();
+      if (r.top <= line && r.bottom > line) return targets[i].id;
+      if (r.top > line) { below = targets[i].id; break; }
+    }
+    /* No box owns the line, so we are in a gap between two sections. A section
+       that starts within one bar height below the line is the one the reader
+       just jumped to (the anchor offset can lag behind a shrinking bar);
+       otherwise it is the section they scrolled past. */
+    if (below) {
+      var top = document.getElementById(below).getBoundingClientRect().top;
+      if (top - line < 160) return below;
+    }
+    for (var j = targets.length - 1; j >= 0; j--) {
+      if (targets[j].getBoundingClientRect().top <= line) return targets[j].id;
+    }
+    return below;
+  }
+
+  function applyCurrent(id) {
+    if (id === currentId) return;
+    currentId = id;
+    var matched = false;
     for (var i = 0; i < links.length; i++) {
-      if (links[i].getAttribute('data-sec') === id) links[i].classList.add('is-current');
-      else links[i].classList.remove('is-current');
+      var on = links[i].getAttribute('data-sec') === id;
+      if (on) {
+        matched = true;
+        links[i].classList.add('is-current');
+        links[i].setAttribute('aria-current', 'true');
+      } else {
+        links[i].classList.remove('is-current');
+        links[i].removeAttribute('aria-current');
+      }
     }
-  }
-  function sync() {
-    var id = hashSection();
-    if (id) {
-      openById(id);
-      var el = document.getElementById(id);
-      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start' });
+    /* Above the first section the only thing that can be current is "Top". */
+    if (home) {
+      if (matched) home.removeAttribute('aria-current');
+      else home.setAttribute('aria-current', 'true');
     }
-    highlight();
+    if (curLabel) curLabel.textContent = (id && labelById[id]) || '';
   }
+
+  function syncCurrent() { applyCurrent(detectCurrent()); }
+
+  /* IntersectionObserver drives the state; the layout probe inside the callback
+     makes it insensitive to how many sections share the viewport band. */
+  var spy = null;
+  function armSpy() {
+    if (!window.IntersectionObserver) return;
+    if (spy) spy.disconnect();
+    spy = new IntersectionObserver(function () { syncCurrent(); }, {
+      rootMargin: '-' + Math.round(nav.getBoundingClientRect().height) + 'px 0px -40% 0px',
+      threshold: 0
+    });
+    for (var i = 0; i < targets.length; i++) spy.observe(targets[i]);
+  }
+  armSpy();
+
+  /* Scroll work runs synchronously: requestAnimationFrame never fires in a
+     background tab, and the spy has to stay correct when nothing is painted.
+     One pass over 25 boxes per scroll event, and DOM writes only on a change. */
+  var lastY = -1;
+  function onScroll() {
+    lastY = window.scrollY;
+    var compact = lastY > 40;
+    if (document.body.classList.contains('nav-compact') !== compact) {
+      document.body.classList.toggle('nav-compact', compact);
+      syncNavHeight();
+    }
+    syncCurrent();
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  /* A background tab gets neither scroll events nor animation frames, so also
+     sample the offset five times a second. The sample is a number compare; the
+     measuring pass only runs when the page really moved. */
+  setInterval(function () {
+    if (window.scrollY === lastY) return;
+    onScroll();
+  }, 200);
+  /* Opening or closing a section moves everything below it. */
+  document.addEventListener('toggle', function () { syncCurrent(); }, true);
+
+  /* Mobile: the bar is one row until it is opened, and it says where you are. */
+  var toggle = document.querySelector('.nav-toggle');
+  function setOpen(open) {
+    nav.classList.toggle('is-open', open);
+    if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    syncNavHeight();
+  }
+  if (toggle) {
+    toggle.addEventListener('click', function () { setOpen(!nav.classList.contains('is-open')); });
+  }
+
   document.addEventListener('click', function (ev) {
     var a = ev.target && ev.target.closest ? ev.target.closest('.navlink') : null;
     if (!a) return;
     var sec = a.getAttribute('data-sec');
-    if (sec) openById(sec);
+    var el = sec ? document.getElementById(sec) : null;
+    if (!el) return;
+    ev.preventDefault();
+    el.open = true;
+    jumpTo(el);
+    setOpen(false);
+    if (history.replaceState) history.replaceState(null, '', '#' + sec);
   });
-  window.addEventListener('hashchange', sync);
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', sync);
-  else sync();
+
+  function syncFromHash() {
+    var h = location.hash.replace(/^#/, '');
+    if (!/^Section-[0-9]+$/.test(h)) { syncCurrent(); return; }
+    var el = document.getElementById(h);
+    if (el) {
+      el.open = true;
+      jumpTo(el);
+    }
+    currentId = null;
+    syncCurrent();
+  }
+  window.addEventListener('hashchange', syncFromHash);
+  syncFromHash();
+  }
+  /* This block runs while <head> is parsed, so it must wait for the body. */
+  function safeInit() {
+    try { init(); } catch (e) { window.__ssmatInitError = (e && e.name) + ': ' + (e && e.message); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', safeInit);
+  else safeInit();
 })();
 
 /* Decode every deduplicated-string holder once the body exists. The per-section

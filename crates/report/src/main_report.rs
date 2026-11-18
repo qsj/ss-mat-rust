@@ -169,18 +169,56 @@ fn plain_text(fragment: &str) -> String {
             _ => {}
         }
     }
-    let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Headings carry entities such as &nbsp;; the sidebar shows plain text.
-    joined
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    decode_entities(&out)
+}
+
+/// Resolve every entity the report emits, with or without the trailing semicolon.
+/// Section headings carry "&nbsp;Overhead 12.3% (...)&nbsp;", and a label that
+/// keeps the ampersand is machine junk in the index.
+fn decode_entities(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '&' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut name = String::new();
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '#') && name.len() < 8 {
+            name.push(chars[j]);
+            j += 1;
+        }
+        if name.is_empty() {
+            out.push('&');
+            i += 1;
+            continue;
+        }
+        let had_semicolon = j < chars.len() && chars[j] == ';';
+        let replacement = match name.trim_start_matches('#') {
+            "nbsp" | "160" => " ",
+            "amp" | "38" => "&",
+            "lt" | "60" => "<",
+            "gt" | "62" => ">",
+            "quot" | "34" => "\"",
+            "apos" | "39" => "'",
+            _ => " ",
+        };
+        out.push_str(replacement);
+        i = if had_semicolon { j + 1 } else { j };
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Escape a value for a double-quoted HTML attribute. The DOM resolves these back,
+/// so the attribute value a reader (or a test) sees carries no markup.
+fn attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Navigation entries harvested from the generated body, so labels always match
@@ -198,21 +236,32 @@ fn harvest_sections(body: &str) -> Vec<(u32, String)> {
             Some(o) => {
                 let t = &tail[o + "<summary>".len()..];
                 let close = t.find("</summary>").unwrap_or(t.len());
-                let text = plain_text(&t[..close]);
-                // Drop the leading "9. " numbering the summary already carries.
-                match text.find(". ") { Some(d) if d < 4 => text[d + 2..].to_string(), _ => text }
+                let inner = &t[..close];
+                // The title lives in the <h2>; the overhead badge beside it is a
+                // figure, not a name, and it must not leak into the index.
+                let heading = match inner.find("<h2") {
+                    Some(h) => match inner[h..].find('>') {
+                        Some(gt) => {
+                            let body = &inner[h + gt + 1..];
+                            &body[..body.find("</h2>").unwrap_or(body.len())]
+                        }
+                        None => inner,
+                    },
+                    None => inner,
+                };
+                let mut text = plain_text(heading);
+                // Drop the leading "9. " numbering the heading carries.
+                if let Some(d) = text.find(". ") {
+                    if d < 4 { text = text[d + 2..].to_string(); }
+                }
+                text
             }
             None => String::new(),
         };
-        // The summary line also carries indicator numbers; the sidebar only needs
-        // enough label to recognise the section, and a long bar would defeat it.
-        let mut short = label;
-        if let Some(cut) = short.find(" (") { short.truncate(cut); }
-        if short.chars().count() > 22 {
-            short = short.chars().take(21).collect::<String>();
-            short.push('\u{2026}');
-        }
-        out.push((num, short));
+        // The full title is kept: two truncations used to make different
+        // sections render identical labels ("3. Where Memory Goes, by..."). The
+        // index clamps the line with CSS and exposes the whole title in "title".
+        out.push((num, label));
         rest = tail;
     }
     out.sort_by_key(|(n, _)| *n);
@@ -230,6 +279,79 @@ fn nav_group(number: u32) -> usize {
     }
 }
 const NAV_GROUPS: [&str; 5] = ["Overview", "Memory used", "Problems and waste", "Runtime", "Environment"];
+
+/// Boundary between two colour ranks. Every overhead figure in the report is
+/// ranked by these two numbers and nothing else, so two sections with the same
+/// percentage can never disagree about their tone.
+const TONE_HIGH_PCT: f64 = 6.0;
+const TONE_MED_PCT: f64 = 2.0;
+
+fn tone_rank(pct: f64) -> u8 {
+    if pct >= TONE_HIGH_PCT { 2 } else if pct >= TONE_MED_PCT { 1 } else { 0 }
+}
+
+fn tone_class(rank: u8) -> &'static str {
+    match rank {
+        2 => "OvhdColorHigh",
+        1 => "OvhdColorMed",
+        _ => "OvhdColorLow",
+    }
+}
+
+/// KPI tone names, derived from the same rank as the section badges.
+fn kpi_tone(pct: f64) -> &'static str {
+    match tone_rank(pct) {
+        2 => "high",
+        1 => "med",
+        _ => "low",
+    }
+}
+
+/// The one overhead badge. Every section header goes through this function.
+fn overhead_badge(pct: f64, bytes: i64) -> String {
+    format!(
+        "<font class=\"{}\">&nbsp;Overhead {:.1}%&nbsp ( {} )&nbsp;</font>",
+        tone_class(tone_rank(pct)),
+        pct,
+        format_bytes(bytes)
+    )
+}
+
+/// Live-to-garbage balance is a heap ratio, not a defect: it is reported in the
+/// neutral or amber band and never takes the danger tone that belongs to the
+/// wasted-memory sections (8-18).
+const BALANCE_MED_PCT: f64 = 20.0;
+
+fn balance_class(pct: f64) -> &'static str {
+    if pct >= BALANCE_MED_PCT { "OvhdColorMed" } else { "OvhdColorNeutral" }
+}
+
+fn balance_badge(label: &str, pct: f64, bytes: i64) -> String {
+    format!(
+        "<font class=\"{}\">&nbsp;{} {:.1}% ({})&nbsp;</font>",
+        balance_class(pct),
+        label,
+        pct,
+        format_bytes(bytes)
+    )
+}
+
+/// KPI tone for a balance figure, derived from its own value.
+fn kpi_balance_tone(pct: f64) -> &'static str {
+    if pct >= BALANCE_MED_PCT { "med" } else { "neutral" }
+}
+
+/// Same badge for percentages not called "overhead" (off-heap share); the label
+/// differs, the defect tone scale does not.
+fn pct_badge(label: &str, pct: f64, bytes: i64) -> String {
+    format!(
+        "<font class=\"{}\">&nbsp;{} {:.1}% ({})&nbsp;</font>",
+        tone_class(tone_rank(pct)),
+        label,
+        pct,
+        format_bytes(bytes)
+    )
+}
 
 impl MainReportGenerator {
     pub fn new(heap: Arc<HeapDump>, stats: Arc<StatsEngine>, dump_file_name: String) -> Self {
@@ -591,20 +713,31 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         } else {
             0.0
         };
+        // Each card carries a tone derived from its own number, through the same
+        // rank function the section badges use.
         let kpis = format!(
             "<div class=\"kpis\">\
-             <div class=\"kpi\"><span class=\"kpi-k\">Heap total</span><span class=\"kpi-v\">{}</span></div>\
-             <div class=\"kpi\"><span class=\"kpi-k\">Garbage</span><span class=\"kpi-v\">{} <em>{:.1}%</em></span></div>\
-             <div class=\"kpi\"><span class=\"kpi-k\">Objects</span><span class=\"kpi-v\">{}</span></div>\
-             <div class=\"kpi\"><span class=\"kpi-k\">Classes</span><span class=\"kpi-v\">{}</span></div>\
+             <div class=\"kpi kpi--neutral\"><span class=\"kpi-k\">Heap total</span><span class=\"kpi-v\">{}</span></div>\
+             <div class=\"kpi kpi--{}\"><span class=\"kpi-k\">Garbage</span><span class=\"kpi-v\">{} <em>{:.1}%</em></span></div>\
+             <div class=\"kpi kpi--neutral\"><span class=\"kpi-k\">Objects</span><span class=\"kpi-v\">{}</span></div>\
+             <div class=\"kpi kpi--neutral\"><span class=\"kpi-k\">Classes</span><span class=\"kpi-v\">{}</span></div>\
              </div>\n",
             kb_text(heap_total),
+            kpi_balance_tone(garbage_pct),
             kb_text(garbage_total),
             garbage_pct,
             group_digits(self.heap.total_object_count as i64),
             group_digits(self.heap.classes.len() as i64),
         );
-        let mut nav = String::from("<nav class=\"secnav\" aria-label=\"Report sections\"><a class=\"nav-home\" href=\"#top\">Top</a>");
+        // The index carries the full section titles; CSS clamps the line and the
+        // `title` attribute keeps the whole title reachable on hover.
+        let mut nav = String::from(
+            "<nav class=\"secnav\" aria-label=\"Report sections\"><div class=\"nav-bar\">\
+             <a class=\"nav-home\" href=\"#top\">Top</a>\
+             <span class=\"nav-cur\" id=\"nav-cur\"></span>\
+             <button type=\"button\" class=\"nav-toggle\" aria-expanded=\"false\" aria-controls=\"nav-body\">Sections</button>\
+             </div><div class=\"nav-body\" id=\"nav-body\">",
+        );
         let sections = harvest_sections(&body);
         for (group, name) in NAV_GROUPS.iter().enumerate() {
             let members: Vec<&(u32, String)> = sections.iter().filter(|(n, _)| nav_group(*n) == group).collect();
@@ -612,15 +745,29 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
                 continue;
             }
             nav.push_str(&format!("<div class=\"navgrp\"><span class=\"navgrp-t\">{}</span>", name));
+            if group == 0 {
+                // The advisor summary is the first thing a reader lands on, so it
+                // belongs in the index and in the scroll-spy like any section.
+                nav.push_str(
+                    "<a class=\"navlink\" data-sec=\"summary-section\" href=\"#summary-section\" \
+                     title=\"MOST IMPORTANT ISSUES\">MOST IMPORTANT ISSUES</a>",
+                );
+            }
             for (num, label) in members {
+                let full = format!("{}. {}", num, label);
                 nav.push_str(&format!(
-                    "<a class=\"navlink\" data-sec=\"Section-{}\" href=\"#Section-{}\">{}. {}</a>",
-                    num, num, num, label
+                    "<a class=\"navlink\" data-sec=\"Section-{n}\" href=\"#Section-{n}\" title=\"{t}\"><span class=\"navnum\">{n}.</span> <span class=\"navtext\">{l}</span></a>",
+                    n = num,
+                    t = attr_escape(&full),
+                    l = attr_escape(label),
                 ));
+            }
+            if group == 0 {
+                nav.push_str("<a class=\"nav-home nav-home-inline\" href=\"#top\">Top</a>");
             }
             nav.push_str("</div>");
         }
-        nav.push_str("</nav>\n");
+        nav.push_str("</div></nav>\n");
         doc.push_str(&kpis);
         doc.push_str(&nav);
         doc.push_str("<div class=\"report-body\">\n");
@@ -644,13 +791,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         } else {
             format!(" {}", indicator)
         };
-        let header = format_section_header(
-            &format!("{}{}{}", self.section_numbered_title(), title, indicator_str),
-            None,
-        );
+        // A real heading gives the document an outline (skim reading, in-page
+        // search, screen readers). The words are the same ones the old
+        // <font class="SecHdr"> line carried, so text extraction is unchanged.
         html.append_raw(&format!(
-            "<details {} id=\"{}\">\n<summary>{}</summary><br>\n",
-            open_attr, id, header
+            "<details {} id=\"{}\">\n<summary><h2 class=\"sec-h2\"><span class=\"sec-num\">{}. </span><span class=\"sec-title\">{}</span></h2>{}</summary>\n",
+            open_attr, id, self.section_count, title, indicator_str
         ));
     }
 
@@ -867,12 +1013,14 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         self.begin_section(html, "Where Memory Goes, by Class", false, "");
 
         // Section description (matching Java JXRay)
-        html.append_raw("Instances of some class(es) take up a big percentage of memory.<br>\n");
-        html.append_raw("That can happen when the number of instances is very high, or their size<br>\n");
-        html.append_raw("is very large (e.g. for arrays). Depending on whether all these instances<br>\n");
-        html.append_raw("are really necessary or not, and also whether they are live or garbage,<br>\n");
-        html.append_raw("this may or may not be a problem. See other report sections for more details<br>\n");
-        html.append_raw("about these objects.<br>\n");
+        html.append_raw(
+            "<p class=\"intro\">Instances of some class(es) take up a big percentage of memory. \
+That can happen when the number of instances is very high, or their size \
+is very large (e.g. for arrays). Depending on whether all these instances \
+are really necessary or not, and also whether they are live or garbage, \
+this may or may not be a problem. See other report sections for more details \
+about these objects.</p>\n",
+        );
 
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
 
@@ -1101,9 +1249,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let garbage_pct = calc_percent(garbage_bytes, total_bytes);
 
         let indicator = if garbage_pct > 30.0 {
-            severity_med(&format!("Garbage size {:.1}% ({})", garbage_pct, format_bytes(garbage_bytes)))
+            balance_badge("Garbage size", garbage_pct, garbage_bytes)
         } else if garbage_bytes > 0 {
-            severity_low(&format!("Garbage size {:.1}% ({})", garbage_pct, format_bytes(garbage_bytes)))
+            balance_badge("Garbage size", garbage_pct, garbage_bytes)
         } else {
             String::new()
         };
@@ -1200,7 +1348,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let overhead_pct = calc_percent(overhead_bytes, total_bytes);
 
         let indicator = if overhead_pct > 10.0 {
-            severity_med(&format!("Overhead {:.1}% ({})", overhead_pct, format_bytes(overhead_bytes)))
+            overhead_badge(overhead_pct, overhead_bytes)
         } else {
             String::new()
         };
@@ -1333,9 +1481,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let pct = calc_percent(report.wasted_bytes, total_bytes);
 
         let indicator = if report.wasted_bytes > 0 && pct > 1.0 {
-            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else if report.wasted_bytes > 0 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else {
             String::new()
         };
@@ -1379,18 +1527,18 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         // "What can I do to fix?" panel
         if report.wasted_bytes > 0 {
-            html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
-            html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
-                The overhead (waste) of all duplicate strings is <b>");
-            html.append_raw(&format_with_percent(report.wasted_bytes, total_bytes));
-            html.append_raw("</b>. That's how much memory you could save if there were no duplicate strings.<br><br>\
-                <b>How to fix:</b><br>\
-                - Use <code>String.intern()</code> for frequently duplicated strings (but be aware of PermGen/Metaspace implications)<br>\
-                - Enable <code>-XX:+UseStringDeduplication</code> with G1 GC (Java 8u20+)<br>\
-                - Consider using static final constants for known duplicate values<br>\
-                - For SQL statements, use PreparedStatement pooling instead of string concatenation\
-                </font></td></tr></table>\n");
-            html.append_raw("</div>\n</details>\n");
+            html.append_raw(&format!(
+                "<details class=\"fix\"><summary><b>What can I do to fix?</b></summary>\n<div class=\"fix-body\">\
+<p>The overhead (waste) of all duplicate strings is <b>{}</b>. That's how much memory you could save if there were no duplicate strings.</p>\
+<p><b>How to fix:</b></p>\
+<ul class=\"fix-list\">\
+<li>Use <code>String.intern()</code> for frequently duplicated strings (but be aware of PermGen/Metaspace implications)</li>\
+<li>Enable <code>-XX:+UseStringDeduplication</code> with G1 GC (Java 8u20+)</li>\
+<li>Consider using static final constants for known duplicate values</li>\
+<li>For SQL statements, use PreparedStatement pooling instead of string concatenation</li>\
+</ul></div>\n</details>\n",
+                format_with_percent(report.wasted_bytes, total_bytes)
+            ));
         }
 
         // Typical reference paths for java.lang.String (uses per-class ref_chains data).
@@ -1460,9 +1608,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         let pct = calc_percent(total_collection_bytes, total_bytes);
         let indicator = if total_collection_bytes > 0 && pct >= 2.0 {
-            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_collection_bytes)))
+            overhead_badge(pct, total_collection_bytes)
         } else if total_collection_bytes > 0 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_collection_bytes)))
+            overhead_badge(pct, total_collection_bytes)
         } else {
             String::new()
         };
@@ -1527,22 +1675,22 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             }
 
             // Fix panel
-            html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
-            html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
-                Collections can waste memory in several ways:<br>\
-                <br><b>1. Empty collections:</b> Many applications create thousands of empty HashMap/ArrayList instances. \
-                Consider using <code>Collections.emptyMap()</code>, <code>Collections.emptyList()</code>, \
-                or lazy initialization (create the collection only when first needed).<br>\
-                <br><b>2. Oversized collections:</b> A HashMap with default initial capacity 16 but only 1-2 entries \
-                wastes the backing array space. Use constructors with initial capacity hints: \
-                <code>new HashMap<>(expectedSize)</code>. For ArrayList, use <code>new ArrayList<>(size)</code> \
-                when the approximate size is known.<br>\
-                <br><b>3. HashMap node overhead:</b> Each HashMap entry creates a Node object (32+ bytes). \
-                For small maps, consider <code>EnumMap</code>, <code>RegularImmutableMap</code>, or plain arrays.<br>\
-                <br><b>Note:</b> Detailed per-collection overhead analysis (empty vs sparsely-filled) \
-                requires container walker integration which is planned for a future release.\
-                </font></td></tr></table>\n");
-            html.append_raw("</div>\n</details>\n");
+            html.append_raw(
+                "<details class=\"fix\"><summary><b>What can I do to fix?</b></summary>\n<div class=\"fix-body\">\
+<p>Collections can waste memory in several ways:</p>\
+<p><b>1. Empty collections:</b> Many applications create thousands of empty HashMap/ArrayList instances. \
+Consider using <code>Collections.emptyMap()</code>, <code>Collections.emptyList()</code>, \
+or lazy initialization (create the collection only when first needed).</p>\
+<p><b>2. Oversized collections:</b> A HashMap with default initial capacity 16 but only 1-2 entries \
+wastes the backing array space. Use constructors with initial capacity hints: \
+<code>new HashMap<>(expectedSize)</code>. For ArrayList, use <code>new ArrayList<>(size)</code> \
+when the approximate size is known.</p>\
+<p><b>3. HashMap node overhead:</b> Each HashMap entry creates a Node object (32+ bytes). \
+For small maps, consider <code>EnumMap</code>, <code>RegularImmutableMap</code>, or plain arrays.</p>\
+<p><b>Note:</b> Detailed per-collection overhead analysis (empty vs sparsely-filled) \
+requires container walker integration which is planned for a future release.</p>\
+</div>\n</details>\n"
+            );
 
             // Per-instance ref chain for top collection class.
             if let Some((top_name, _, _)) = entries.first() {
@@ -1640,7 +1788,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let total_bad_bytes = empty_bytes + single_bytes + all_null_bytes + one_nonnull_bytes + sparse_bytes;
 
         let indicator = if total_bad > 0 && calc_percent(total_bad_bytes, total_bytes) >= 1.0 {
-            severity_med(&format!("Overhead {:.1}% ({})", calc_percent(total_bad_bytes, total_bytes), format_bytes(total_bad_bytes)))
+            overhead_badge(calc_percent(total_bad_bytes, total_bytes), total_bad_bytes)
         } else if total_bad > 0 {
             severity_low(&format!("{}", format_bytes(total_bad_bytes)))
         } else {
@@ -1696,16 +1844,16 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             }
             html.end_table();
 
-            html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
-            html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
-                Empty and all-null object arrays waste memory because each array still has an object header. \
-                Consider using null references instead of empty arrays, or reuse shared empty array instances \
-                (e.g., <code>Collections.emptyList().toArray()</code>).<br>\
-                Single-element and one-non-null arrays should ideally be replaced with direct object references when possible.<br>\
-                Sparse arrays indicate underutilized backing arrays, common in hash tables with low load factors or \
-                pre-allocated collections that were never filled.\
-                </font></td></tr></table>\n");
-            html.append_raw("</div>\n</details>\n");
+            html.append_raw(
+                "<details class=\"fix\"><summary><b>What can I do to fix?</b></summary>\n<div class=\"fix-body\">\
+<p>Empty and all-null object arrays waste memory because each array still has an object header. \
+Consider using null references instead of empty arrays, or reuse shared empty array instances \
+(e.g., <code>Collections.emptyList().toArray()</code>).</p>\
+<p>Single-element and one-non-null arrays should ideally be replaced with direct object references when possible.</p>\
+<p>Sparse arrays indicate underutilized backing arrays, common in hash tables with low load factors or \
+pre-allocated collections that were never filled.</p>\
+</div>\n</details>\n"
+            );
 
             // Per-instance ref chain for sample bad object arrays: the first live
             // bad arrays, collected with the aggregates above.
@@ -1806,11 +1954,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             .sum();
 
         let indicator = if total_bad > 0 && calc_percent(total_bad_bytes, total_bytes) >= 1.0 {
-            severity_low(&format!(
-                "Overhead {:.1}% ({})",
-                calc_percent(total_bad_bytes, total_bytes),
-                format_bytes(total_bad_bytes)
-            ))
+            overhead_badge(calc_percent(total_bad_bytes, total_bytes), total_bad_bytes)
         } else if total_bad > 0 {
             severity_low(&format!("{}", format_bytes(total_bad_bytes)))
         } else {
@@ -1859,16 +2003,16 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.end_table();
             html.append_raw("</div></details>");
 
-            html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
-            html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
-                Empty primitive arrays waste memory due to object headers. Use null references or shared empty arrays.<br>\
-                Trailing-zero arrays (where more than the configured share of elements at the end are zero) indicate \
-                that the array was allocated larger than needed. Consider sizing arrays more precisely, or using data \
-                structures that compress or sparse-encode the data.<br>\
-                Arrays with many zero elements or unused high bits can often be replaced by sparse structures or \
-                smaller element types.\
-                </font></td></tr></table>\n");
-            html.append_raw("</div>\n</details>\n");
+            html.append_raw(
+                "<details class=\"fix\"><summary><b>What can I do to fix?</b></summary>\n<div class=\"fix-body\">\
+<p>Empty primitive arrays waste memory due to object headers. Use null references or shared empty arrays.</p>\
+<p>Trailing-zero arrays (where more than the configured share of elements at the end are zero) indicate \
+that the array was allocated larger than needed. Consider sizing arrays more precisely, or using data \
+structures that compress or sparse-encode the data.</p>\
+<p>Arrays with many zero elements or unused high bits can often be replaced by sparse structures or \
+smaller element types.</p>\
+</div>\n</details>\n"
+            );
 
             // Per-instance reference chains for the largest problem arrays.
             self.render_instance_ref_chains(
@@ -1909,11 +2053,11 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let pct = calc_percent(total_overhead, total_bytes);
 
         let indicator = if total_overhead > 0 && pct >= 2.0 {
-            severity_high(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_overhead)))
+            overhead_badge(pct, total_overhead)
         } else if total_overhead > 0 && pct >= 0.5 {
-            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_overhead)))
+            overhead_badge(pct, total_overhead)
         } else if total_overhead > 0 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_overhead)))
+            overhead_badge(pct, total_overhead)
         } else {
             String::new()
         };
@@ -2031,16 +2175,18 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_raw("<br><i>These classes have many small instances (1,000+ and instance size &le; 64 bytes). \
                 They may contain duplicate values — further investigation via reference chain analysis is recommended.</i>");
 
-            html.append_raw("<details><summary><b>What can I do to fix?</b></summary>\n<div>\n");
-            html.append_raw("<table class=\"dt\"><tr><td class=\"TAL\"><font class=\"Bigger\">\
-                If these objects hold identical data, consider:<br>\
-                - Using a flyweight/canonical object pattern (similar to String.intern())<br>\
-                - Caching frequently-created instances in an Enum or static final set<br>\
-                - Using value types (Java 16+ records or Project Valhalla value classes in the future)<br>\
-                - Reducing unnecessary object creation in hot loops<br>\
-                <br>Note: Full duplicate object detection requires reference chain analysis which is planned for a future release.\
-                </font></td></tr></table>\n");
-            html.append_raw("</div>\n</details>\n");
+            html.append_raw(
+                "<details class=\"fix\"><summary><b>What can I do to fix?</b></summary>\n<div class=\"fix-body\">\
+<p>If these objects hold identical data, consider:</p>\
+<ul class=\"fix-list\">\
+<li>Using a flyweight/canonical object pattern (similar to String.intern())</li>\
+<li>Caching frequently-created instances in an Enum or static final set</li>\
+<li>Using value types (Java 16+ records or Project Valhalla value classes in the future)</li>\
+<li>Reducing unnecessary object creation in hot loops</li>\
+</ul>\
+<p>Note: Full duplicate object detection requires reference chain analysis which is planned for a future release.</p>\
+</div>\n</details>\n"
+            );
 
             // Typical reference paths for the top candidate class.
             if let Some((name, _, _, _)) = candidates.first() {
@@ -2083,9 +2229,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let pct = calc_percent(report.wasted_bytes, total_bytes);
 
         let indicator = if report.wasted_bytes > 0 && pct >= 2.0 {
-            severity_high(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else if report.wasted_bytes > 0 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else {
             String::new()
         };
@@ -2168,9 +2314,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let pct = calc_percent(report.wasted_bytes, total_bytes);
 
         let indicator = if report.wasted_bytes > 0 && pct >= 2.0 {
-            severity_high(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else if report.wasted_bytes > 0 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(report.wasted_bytes)))
+            overhead_badge(pct, report.wasted_bytes)
         } else {
             String::new()
         };
@@ -2275,9 +2421,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let total_size: i64 = entries.iter().map(|(_, _, b)| *b).sum();
         let pct = calc_percent(total_size, total_bytes);
         let indicator = if pct >= 2.0 {
-            severity_med(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_size)))
+            overhead_badge(pct, total_size)
         } else if pct >= 0.5 {
-            severity_low(&format!("Overhead {:.1}% ({})", pct, format_bytes(total_size)))
+            overhead_badge(pct, total_size)
         } else {
             String::new()
         };
@@ -2402,10 +2548,13 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         let indicator = if report.total_capacity > 0 {
             let pct = calc_percent(report.total_capacity, total_heap);
-            if pct >= 5.0 {
-                severity_high(&format!("Off-heap {} ({:.1}% of heap)", format_bytes(report.total_capacity), pct))
-            } else if pct >= 2.0 {
-                severity_med(&format!("Off-heap {} ({:.1}% of heap)", format_bytes(report.total_capacity), pct))
+            if pct >= TONE_MED_PCT {
+                format!(
+                    "<font class=\"{}\">&nbsp;Off-heap {} ({:.1}% of heap)&nbsp;</font>",
+                    tone_class(tone_rank(pct)),
+                    format_bytes(report.total_capacity),
+                    pct
+                )
             } else {
                 severity_low(&format!("Off-heap {}", format_bytes(report.total_capacity)))
             }
@@ -2438,12 +2587,12 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             // Unreachable (garbage) DirectByteBuffers — the easy-to-fix subset.
             if unreachable_capacity > 0 {
                 let pct = calc_percent(unreachable_capacity, total_heap);
-                let sev = if pct >= 5.0 { severity_high } else if pct >= 2.0 { severity_med } else { severity_low };
+                let sev = |text: &str| format!("<font class=\"{}\">&nbsp;{}&nbsp;</font>", tone_class(tone_rank(pct)), text);
                 html.append_raw(&format!(
-                    "<details><summary>{}</summary><div><table class=\"dt\"><br>\
-                     <tr class=\"C_02\"><td class=\"TAL\">DirectByteBuffer objects that are unreachable \
-                     (garbage) but still hold native (off-heap) memory: <b>{}</b> &nbsp;({:.1}% of used heap)</td></tr>\
-                     </table></div></details><br>",
+                    "<details class=\"fix\"><summary>{}</summary><div class=\"fix-body\">\
+                     <p>DirectByteBuffer objects that are unreachable \
+(garbage) but still hold native (off-heap) memory: <b>{}</b> &nbsp;({:.1}% of used heap)</p>\
+                     </div></details>",
                     sev(&format!("unreachable DirectByteBuffers holding off-heap memory. Overhead: {} ({:.1}% of heap).", format_bytes(unreachable_capacity), pct)),
                     format_bytes(unreachable_capacity), pct,
                 ));
@@ -2532,13 +2681,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         let overhead_pct = calc_percent(total_overhead, total_bytes);
         let indicator = if total_overhead > 0 {
-            let color = if overhead_pct >= 6.0 { "OvhdColorHigh" } else if overhead_pct >= 2.0 { "OvhdColorMed" } else { "OvhdColorLow" };
-            format!(
-                "<font class=\"{}\">&nbsp;Overhead {:.1}%&nbsp ( {} )&nbsp;</font>",
-                color,
-                overhead_pct,
-                format_bytes(total_overhead)
-            )
+            overhead_badge(overhead_pct, total_overhead)
         } else {
             String::new()
         };
@@ -2555,9 +2698,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             ));
         }
         html.append_raw(
-            "Note that the overhead (wasted memory) below is IN ADDITION to the Used Memory<br>\
-             which we give throughout this report. That is, Humongous objects use more memory<br>\
-             than their useful workload requires.<br>"
+            "<p class=\"intro\">Note that the overhead (wasted memory) below is IN ADDITION to the Used Memory \
+which we give throughout this report. That is, Humongous objects use more memory \
+than their useful workload requires.</p>"
         );
 
         // Summary table: Total humongous objects, Total size, Total overhead
@@ -2596,7 +2739,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
 
         // Reference chains for humongous objects
         if total_count > 0 {
-            html.append_raw("<br><font class=\"SecHdr\">Reference Chains for humongous objects</font><br><br>");
+            html.append_raw("<h3 class=\"sub-h3\">Reference Chains for humongous objects</h3>\n");
 
             // Use humongous-specific ref chains (not class-level)
             let ref_chains = self.stats.ref_chains.lock().unwrap();
@@ -3125,18 +3268,16 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         advices.sort_by_key(|a| (a.category.order(), a.order_hint));
 
         let mut summary = String::with_capacity(8192);
-        summary.push_str(&format!(
-            "<details open id=\"summary-section\">\n<summary>{}</summary><br>\n",
-            format_section_header("MOST IMPORTANT ISSUES", Some("#most_important_issues"))
-        ));
+        summary.push_str(
+            "<details open id=\"summary-section\">\n<summary><h2 class=\"sec-h2\"><span class=\"sec-title\" id=\"most_important_issues\">MOST IMPORTANT ISSUES</span></h2></summary>\n",
+        );
         summary.push_str("<font class=\"Bigger\">");
-        summary.push_str("We found some problems in this heap dump.<br>\n");
+        summary.push_str("<p class=\"intro\">We found some problems in this heap dump. ");
         summary.push_str(&format!(
-            "For each problem where possible we report {}: how much memory you would save<br>\n",
+            "For each problem where possible we report {}: how much memory you would save \
+(in Kbytes and as a percentage of used memory) if you get rid of this problem.</p>\n",
             bold("overhead")
         ));
-        summary.push_str("(in Kbytes and as a percentage of used memory) if you get rid of this problem.<br>\n");
-        summary.push_str("<br>\n");
 
         // Easy-to-fix panel
         let easy: Vec<&Advice> = advices.iter()
@@ -3184,7 +3325,11 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             summary.push_str(&format!(
                 "<tr class=\"C_02\"><td class=\"TAL\"><font class=\"Bigger\">{}: Large amount of garbage objects {}</font></td></tr>\n",
                 bold("Problem"),
-                severity_med(&format!("found - {:.1}% garbage", garbage_pct))
+                format!(
+                    "<font class=\"{}\">&nbsp;found - {:.1}% garbage&nbsp;</font>",
+                    balance_class(garbage_pct),
+                    garbage_pct
+                )
             ));
             summary.push_str(&format!(
                 "<tr class=\"C_03\"><td class=\"TAL\"><font class=\"Bigger\"><details><summary>Details</summary><div><table class=\"dt\">\
@@ -3370,30 +3515,36 @@ fn categorize_flag(upper: &str) -> (FlagCategory, &'static str) {
 }
 
 /// Render a single advice as a collapsible panel (used in the Easy-to-fix area).
-fn render_advice_panel(advice: &Advice, _total_bytes: i64) -> String {
-    let color_class = match advice.severity {
-        AdviceSeverity::High => "OvhdColorHigh",
-        AdviceSeverity::Med | AdviceSeverity::Low => "OvhdColorMed",
+fn render_advice_panel(advice: &Advice, total_bytes: i64) -> String {
+    // Good news is not an alarm: the easy-to-fix panel wears the success tone,
+    // the problem panels keep the danger/warning scale.
+    let good = advice.category == AdviceCategory::EasyToFix;
+    let color_class = if good {
+        "OvhdColorGood"
+    } else {
+        match advice.severity {
+            AdviceSeverity::High => "OvhdColorHigh",
+            AdviceSeverity::Med | AdviceSeverity::Low => "OvhdColorMed",
+        }
     };
+    let panel_class = if good { "adv tone-good" } else { "adv" };
     let overhead_suffix = match advice.overhead_bytes {
-        Some(b) => format!("&nbsp;&nbsp;Overhead: <b>{}</b>.", format_with_percent(b, _total_bytes.max(1))),
+        Some(b) => format!("&nbsp;&nbsp;Overhead: <b>{}</b>.", format_with_percent(b, total_bytes.max(1))),
         None => String::new(),
     };
     format!(
-        "<details>\n\
-         <summary><font class=\"{}\">&nbsp;<font class=\"Bigger\"><b>{} {}{}</b></font>&nbsp;</font></summary>\n\
-         <div>\n<table class=\"dt\"><br>\n\
-         <tr class=\"C_02\">\n<td class=\"TAL\"><font class=\"Bigger\"><br>\n\
-         {}<br>\n<br>\n\
-         For full details, go to <button onclick=\"openSection('{}');\">Section {}</button><br>\n\
-         </font><br>\n</td></tr>\n</table><br>\n</div>\n\n</details>",
-        color_class,
+        "<details class=\"{panel}\">\n<summary><span class=\"adv-k {cls}\">{} {title}{suffix}</span></summary>\n\
+         <div class=\"adv-body\">\n<div class=\"adv-text\">{body}</div>\n\
+         <p class=\"adv-more\">For full details, go to <button onclick=\"openSection('{sec}');\">Section {num}</button></p>\n\
+         </div>\n</details>",
         advice.category.prefix(),
-        advice.title,
-        overhead_suffix,
-        advice.body_html,
-        advice.section_id,
-        advice.section_id.trim_start_matches("Section-"),
+        title = advice.title,
+        suffix = overhead_suffix,
+        body = advice.body_html,
+        sec = advice.section_id,
+        num = advice.section_id.trim_start_matches("Section-"),
+        panel = panel_class,
+        cls = color_class,
     )
 }
 
