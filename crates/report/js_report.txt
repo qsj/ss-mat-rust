@@ -1,6 +1,216 @@
-function openSection(id){var el=document.getElementById(id);el.open=true;el.scrollIntoView({behavior:'smooth',block:'start'})}
-var curModal;
-function openModal(mid,ev,nl){var m=document.getElementById(mid);curModal=m;var y=ev.clientY+20;var ys=nl*15+90;if(y+ys>window.innerHeight)y=window.innerHeight-ys;if(y<0)y=0;m.style.paddingTop=y+'px';m.style.display='block'}
-function closeModal(mid){document.getElementById(mid).style.display='none'}
-window.onclick=function(e){if(e.target==curModal)curModal.style.display='none'};
-function sortTable(tid,col){var t=document.getElementById('Table-'+tid),sw=true,dir='desc',sc=0;while(sw){sw=false;var rows=t.rows;for(var i=1;i<rows.length-2;i+=2){var s=false,xs=rows[i].getElementsByTagName('TD')[col].innerText,ys=rows[i+2].getElementsByTagName('TD')[col].innerText;var x=parseInt(xs.replace(/,/g,'')),y=parseInt(ys.replace(/,/g,''));if(xs.indexOf('Kb')!=-1)x*=1024;if(ys.indexOf('Kb')!=-1)y*=1024;if(isNaN(x))x=0;if(isNaN(y))y=0;if(dir=='asc'){if(x>y){s=true;break}}else{if(x<y){s=true;break}}}}if(s){rows[i].parentNode.insertBefore(rows[i+2],rows[i]);rows[i+1].parentNode.insertBefore(rows[i+3],rows[i+1]);sw=true;sc++}else if(sc==0&&dir=='asc'){dir='desc';sw=true}}}
+/* ---- SS-Mat report behaviour ----
+   Rebuilt because the previous file was truncated inside openModal(), which made the
+   whole inline script fail to parse: openSection, sortTable and the modal handlers
+   were dead and the encoded-string decoder never ran.
+
+   Table shape (observed in the generator): optional leading rows (totals, header),
+   then repeating pairs of (data row with N cells, detail row with a single spanning
+   cell). Sorting and filtering therefore detect that structure instead of assuming a
+   fixed offset. */
+function openSection(id) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.open = true;
+  var summary = el.querySelector('summary');
+  if (summary && summary.scrollIntoView) summary.scrollIntoView({ block: 'start' });
+}
+
+var curModal = null;
+function openModal(mid, ev, nl) {
+  var m = document.getElementById(mid);
+  if (!m) return;
+  curModal = m;
+  var y = (ev && ev.clientY ? ev.clientY : 0) + 20;
+  var ys = nl * 15 + 90;
+  if (y + ys > window.innerHeight) y = Math.max(0, window.innerHeight - ys);
+  m.style.paddingTop = Math.max(0, y) + 'px';
+  m.style.display = 'block';
+}
+function closeModal(mid) {
+  var m = document.getElementById(mid);
+  if (m) m.style.display = 'none';
+}
+window.addEventListener('click', function (e) {
+  if (curModal && e.target === curModal) {
+    curModal.style.display = 'none';
+    curModal = null;
+  }
+});
+
+/* Group a report table into (data, detail) pairs, keeping leading rows in place. */
+function ssmatTableGroups(table) {
+  var body = table.tBodies && table.tBodies.length ? table.tBodies[0] : table;
+  var rows = Array.prototype.slice.call(body.rows);
+  var start = -1;
+  for (var i = 0; i + 1 < rows.length; i++) {
+    if (rows[i].cells.length > 1 && rows[i + 1].cells.length === 1) { start = i; break; }
+  }
+  if (start < 0) return { body: body, leading: rows, groups: [] };
+  var leading = rows.slice(0, start);
+  var groups = [];
+  for (var j = start; j < rows.length; j++) {
+    var row = rows[j];
+    var next = rows[j + 1];
+    if (row.cells.length > 1) {
+      if (next && next.cells.length === 1 && next.parentNode === body) {
+        groups.push([row, next]);
+        j++;
+      } else {
+        groups.push([row]);
+      }
+    } else if (groups.length) {
+      groups[groups.length - 1].push(row);
+    } else {
+      leading.push(row);
+    }
+  }
+  return { body: body, leading: leading, groups: groups };
+}
+
+function ssmatCellValue(text) {
+  if (!text) return 0;
+  var t = text.trim();
+  var mult = 1;
+  if (/[Kk]b?$/.test(t)) mult = 1024;
+  else if (/[Mm]b?$/.test(t)) mult = 1024 * 1024;
+  else if (/[Gg]b?$/.test(t)) mult = 1024 * 1024 * 1024;
+  var n = parseFloat(t.replace(/,/g, ''));
+  return isNaN(n) ? 0 : n * mult;
+}
+
+function sortTable(tid, col) {
+  var table = document.getElementById('Table-' + tid);
+  if (!table) return;
+  var parts = ssmatTableGroups(table);
+  if (parts.groups.length < 2) return;
+  var ascending = table.getAttribute('data-sort-dir') !== 'asc';
+  table.setAttribute('data-sort-dir', ascending ? 'asc' : 'desc');
+  var keyed = parts.groups.map(function (g, i) {
+    var cell = g[0].cells[col];
+    return { key: cell ? ssmatCellValue(cell.textContent) : 0, index: i, rows: g };
+  });
+  keyed.sort(function (a, b) {
+    if (a.key === b.key) return a.index - b.index;
+    return ascending ? a.key - b.key : b.key - a.key;
+  });
+  for (var i = 0; i < keyed.length; i++) {
+    for (var r = 0; r < keyed[i].rows.length; r++) parts.body.appendChild(keyed[i].rows[r]);
+  }
+}
+
+/* ---- phase 2: table filter + aria-current ---- */
+(function () {
+  var MIN_ROWS_FOR_FILTER = 20;
+
+  function attachFilter(table) {
+    if (table.getAttribute('data-filter-ready') === '1') return;
+    var parts = ssmatTableGroups(table);
+    if (parts.groups.length < MIN_ROWS_FOR_FILTER) return;
+    table.setAttribute('data-filter-ready', '1');
+
+    var tools = document.createElement('div');
+    tools.className = 'table-tools';
+    var input = document.createElement('input');
+    input.type = 'search';
+    input.placeholder = 'Filter rows by class, field or value…';
+    input.setAttribute('aria-label', 'Filter table rows');
+    var count = document.createElement('span');
+    count.className = 'count';
+    tools.appendChild(input);
+    tools.appendChild(count);
+    var host = table.closest('.scroll-wrap') || table;
+    host.parentNode.insertBefore(tools, host);
+
+    function apply() {
+      var needle = input.value.trim().toLowerCase();
+      var shown = 0;
+      for (var g = 0; g < parts.groups.length; g++) {
+        var text = '';
+        for (var r = 0; r < parts.groups[g].length; r++) text += parts.groups[g][r].textContent + ' ';
+        var hit = needle === '' || text.toLowerCase().indexOf(needle) !== -1;
+        for (var k = 0; k < parts.groups[g].length; k++) {
+          parts.groups[g][k].classList.toggle('is-filtered', !hit);
+        }
+        if (hit) shown++;
+      }
+      count.textContent = needle === '' ? parts.groups.length + ' rows' : shown + ' / ' + parts.groups.length + ' rows';
+    }
+    input.addEventListener('input', apply);
+    apply();
+  }
+
+  function markCurrent() {
+    var links = document.querySelectorAll('.navlink');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].classList.contains('is-current')) links[i].setAttribute('aria-current', 'true');
+      else links[i].removeAttribute('aria-current');
+    }
+  }
+
+  function boot() {
+    var tables = document.querySelectorAll('table.dt');
+    for (var i = 0; i < tables.length; i++) {
+      try { attachFilter(tables[i]); } catch (e) { /* one bad table must not stop the rest */ }
+    }
+    markCurrent();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  window.addEventListener('hashchange', function () { setTimeout(markCurrent, 0); });
+})();
+
+/* ---- diagnostic shell: deep links and current-section highlight ---- */
+(function () {
+  function openById(id) {
+    var el = document.getElementById(id);
+    if (!el) return false;
+    el.open = true;
+    return true;
+  }
+  function hashSection() {
+    var h = location.hash.replace(/^#/, '');
+    return /^Section-[0-9]+$/.test(h) ? h : '';
+  }
+  function highlight() {
+    var id = hashSection();
+    var links = document.querySelectorAll('.navlink');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].getAttribute('data-sec') === id) links[i].classList.add('is-current');
+      else links[i].classList.remove('is-current');
+    }
+  }
+  function sync() {
+    var id = hashSection();
+    if (id) {
+      openById(id);
+      var el = document.getElementById(id);
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start' });
+    }
+    highlight();
+  }
+  document.addEventListener('click', function (ev) {
+    var a = ev.target && ev.target.closest ? ev.target.closest('.navlink') : null;
+    if (!a) return;
+    var sec = a.getAttribute('data-sec');
+    if (sec) openById(sec);
+  });
+  window.addEventListener('hashchange', sync);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', sync);
+  else sync();
+})();
+
+/* Decode every deduplicated-string holder once the body exists. The per-section
+   replEncStrs(n) calls fire while the section is still being parsed, so they never
+   found their target and left tokens raw. */
+(function () {
+  function decodeAll() {
+    if (typeof rplRec !== 'function') return;
+    var nodes = document.querySelectorAll('[id^="sd-"]');
+    for (var i = 0; i < nodes.length; i++) {
+      try { rplRec(nodes[i]); } catch (e) { /* one broken subtree must not stop the rest */ }
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', decodeAll);
+  else decodeAll();
+})();

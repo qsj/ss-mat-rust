@@ -65,3 +65,57 @@ button:active{transform:scale(.98)}
 .close:hover{color:var(--text-main)}
 .report-footer{text-align:center;padding:40px 0;color:var(--text-muted);font-size:13px;border-top:1px solid var(--border);margin-top:40px}
 @media(max-width:768px){body{padding:16px}.report-header{padding:24px;border-radius:12px}.report-header h1{font-size:20px}summary{padding:14px 18px;font-size:14px}table.dt th,table.dt td{padding:10px 12px;font-size:13px}}
+
+/* ---- diagnostic shell: KPI strip, grouped navigation, hash deep links ---- */
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 12px}
+.kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.kpi-k{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.kpi-v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.kpi-v em{font-size:13px;font-weight:500;font-style:normal;color:var(--muted)}
+.secnav{position:sticky;top:0;z-index:40;display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;
+  background:var(--card);border:1px solid var(--border);border-radius:10px;padding:6px 10px;margin-bottom:12px;
+  font-size:12px;line-height:1.5}
+.nav-home{font-weight:600;padding:2px 8px;border-radius:6px;text-decoration:none;background:var(--accent-soft,#eef2ff)}
+.navgrp{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;border-left:1px solid var(--border);padding-left:12px}
+.navgrp:first-of-type{border-left:0;padding-left:0}
+.navgrp-t{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-right:2px}
+.navlink{font-size:12px;text-decoration:none;color:inherit;padding:2px 6px;border-radius:6px;white-space:nowrap}
+.navlink:hover{background:var(--accent-soft,#eef2ff)}
+.navlink.is-current{background:var(--accent-soft,#eef2ff);font-weight:600}
+.report-body{display:block}
+details[id^="Section-"]:target>summary{outline:2px solid var(--accent,#2563eb);outline-offset:2px;border-radius:6px}
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:768px){
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .kpi-v{font-size:18px}
+  .secnav{position:static;max-height:none;overflow:visible}
+  .navgrp{border-left:0;padding-left:0}
+}
+@media (prefers-reduced-motion:reduce){.secnav,.navlink{transition:none}}
+
+/* Anchored sections must not hide under the sticky navigation. */
+details[id^="Section-"], #summary-section { scroll-margin-top: 132px; }
+details[id^="Section-"] > summary { scroll-margin-top: 132px; }
+@media (max-width:768px){ details[id^="Section-"], #summary-section { scroll-margin-top: 16px; } }
+
+/* ---- phase 2: readable evidence ----
+   Deep reference chains used to indent 10px per level up to 24 levels, which pushed
+   content off-screen; cap the indent and let the container scroll instead. */
+[class^="rc_tab"]{margin-left:10px}
+rc_tab7,rc_tab8,rc_tab9,rc_tab10,rc_tab11,rc_tab12,rc_tab13,rc_tab14,rc_tab15,rc_tab16,
+rc_tab17,rc_tab18,rc_tab19,rc_tab20,rc_tab21,rc_tab22,rc_tab23,rc_tab24{margin-left:62px;padding-left:6px}
+.scroll-wrap{overflow:auto}
+table.dt{min-width:520px}
+@media (max-width:768px){ table.dt{min-width:420px} }
+/* Keyboard focus must stay visible now that summary rows are interactive. */
+summary:focus-visible,.navlink:focus-visible,.nav-home:focus-visible{
+  outline:2px solid var(--primary);outline-offset:2px;border-radius:6px}
+.navlink[aria-current="true"]{background:var(--accent-soft,#eef2ff);font-weight:600}
+/* Per-table filter: only rendered for tables large enough to need it. */
+.table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 4px;font-size:12px;color:var(--text-muted)}
+.table-tools input{flex:1 1 220px;max-width:320px;padding:6px 10px;border:1px solid var(--border);
+  border-radius:8px;font-size:13px;font-family:inherit;background:var(--card);color:inherit}
+.table-tools input:focus{outline:2px solid var(--primary);outline-offset:1px}
+.table-tools .count{font-variant-numeric:tabular-nums}
+tr.is-filtered{display:none}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}

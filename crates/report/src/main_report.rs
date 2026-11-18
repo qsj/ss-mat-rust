@@ -138,6 +138,99 @@ pub struct MainReportGenerator {
     hprof_path: Option<PathBuf>,
 }
 
+
+/// Thousands-separated integer, e.g. 178326 -> "178,326".
+fn group_digits(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if value < 0 { format!("-{}", out) } else { out }
+}
+
+/// Kilobytes with a thousands separator, the unit every report figure uses.
+fn kb_text(bytes: i64) -> String {
+    format!("{} KB", group_digits((bytes.max(0) as f64 / 1024.0).round() as i64))
+}
+
+/// Strip tags and collapse whitespace, for navigation labels built from rendered headings.
+fn plain_text(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut in_tag = false;
+    for ch in fragment.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => { in_tag = false; out.push(' ') }
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Headings carry entities such as &nbsp;; the sidebar shows plain text.
+    joined
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Navigation entries harvested from the generated body, so labels always match
+/// the rendered headings and no second list has to be maintained by hand.
+fn harvest_sections(body: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find(r#"id="Section-"#) {
+        let after = &rest[pos + r#"id="Section-"#.len()..];
+        let num_end = after.find('"').unwrap_or(0);
+        let Ok(num) = after[..num_end].parse::<u32>() else { rest = &after[num_end..]; continue };
+        let tail = &after[num_end..];
+        let summary_open = tail.find("<summary>");
+        let label = match summary_open {
+            Some(o) => {
+                let t = &tail[o + "<summary>".len()..];
+                let close = t.find("</summary>").unwrap_or(t.len());
+                let text = plain_text(&t[..close]);
+                // Drop the leading "9. " numbering the summary already carries.
+                match text.find(". ") { Some(d) if d < 4 => text[d + 2..].to_string(), _ => text }
+            }
+            None => String::new(),
+        };
+        // The summary line also carries indicator numbers; the sidebar only needs
+        // enough label to recognise the section, and a long bar would defeat it.
+        let mut short = label;
+        if let Some(cut) = short.find(" (") { short.truncate(cut); }
+        if short.chars().count() > 22 {
+            short = short.chars().take(21).collect::<String>();
+            short.push('\u{2026}');
+        }
+        out.push((num, short));
+        rest = tail;
+    }
+    out.sort_by_key(|(n, _)| *n);
+    out
+}
+
+/// Group label for a section number; keeps the sidebar to five buckets.
+fn nav_group(number: u32) -> usize {
+    match number {
+        1 => 0,
+        3..=6 | 18..=20 => 1,
+        7..=17 => 2,
+        2 | 21 | 22 => 3,
+        _ => 4,
+    }
+}
+const NAV_GROUPS: [&str; 5] = ["Overview", "Memory used", "Problems and waste", "Runtime", "Environment"];
+
 impl MainReportGenerator {
     pub fn new(heap: Arc<HeapDump>, stats: Arc<StatsEngine>, dump_file_name: String) -> Self {
         Self {
@@ -486,10 +579,53 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             .unwrap_or("N/A");
 
         doc.push_str(&format!(
-            "<header class=\"report-header\"><h1>SS-Mat {} Heap Dump Report</h1><div class=\"meta\">{}<br>Created on {} &middot; JVM {}</div></header>\n",
+            "<header class=\"report-header\" id=\"top\"><h1>SS-Mat {} Heap Dump Report</h1><div class=\"meta\">{}<br>Created on {} &middot; JVM {}</div></header>\n",
             "0.1.0 (Rust)", self.dump_file_name, date_str, jvm_version
         ));
+        // Diagnostic strip: the headline numbers first, so the reader knows whether the
+        // dump is healthy before scrolling into 24 collapsible sections.
+        let heap_total = self.stats.total_shallow_size.load(Relaxed);
+        let garbage_total = self.stats.total_garbage_bytes.load(Relaxed);
+        let garbage_pct = if heap_total > 0 {
+            garbage_total as f64 * 100.0 / heap_total as f64
+        } else {
+            0.0
+        };
+        let kpis = format!(
+            "<div class=\"kpis\">\
+             <div class=\"kpi\"><span class=\"kpi-k\">Heap total</span><span class=\"kpi-v\">{}</span></div>\
+             <div class=\"kpi\"><span class=\"kpi-k\">Garbage</span><span class=\"kpi-v\">{} <em>{:.1}%</em></span></div>\
+             <div class=\"kpi\"><span class=\"kpi-k\">Objects</span><span class=\"kpi-v\">{}</span></div>\
+             <div class=\"kpi\"><span class=\"kpi-k\">Classes</span><span class=\"kpi-v\">{}</span></div>\
+             </div>\n",
+            kb_text(heap_total),
+            kb_text(garbage_total),
+            garbage_pct,
+            group_digits(self.heap.total_object_count as i64),
+            group_digits(self.heap.classes.len() as i64),
+        );
+        let mut nav = String::from("<nav class=\"secnav\" aria-label=\"Report sections\"><a class=\"nav-home\" href=\"#top\">Top</a>");
+        let sections = harvest_sections(&body);
+        for (group, name) in NAV_GROUPS.iter().enumerate() {
+            let members: Vec<&(u32, String)> = sections.iter().filter(|(n, _)| nav_group(*n) == group).collect();
+            if members.is_empty() {
+                continue;
+            }
+            nav.push_str(&format!("<div class=\"navgrp\"><span class=\"navgrp-t\">{}</span>", name));
+            for (num, label) in members {
+                nav.push_str(&format!(
+                    "<a class=\"navlink\" data-sec=\"Section-{}\" href=\"#Section-{}\">{}. {}</a>",
+                    num, num, num, label
+                ));
+            }
+            nav.push_str("</div>");
+        }
+        nav.push_str("</nav>\n");
+        doc.push_str(&kpis);
+        doc.push_str(&nav);
+        doc.push_str("<div class=\"report-body\">\n");
         doc.push_str(&body);
+        doc.push_str("</div>\n");
         doc.push_str("\n<footer class=\"report-footer\">SS-Mat Heap Dump Analyzer (Rust)</footer>\n</div>\n</body>\n</html>");
 
         Ok(doc)
