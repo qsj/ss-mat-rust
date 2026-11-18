@@ -145,10 +145,21 @@ pub fn parse_hprof_with_config(path: &Path, cfg: &ObjDirConfig) -> Result<HeapDu
             eprintln!("  Object directory ready in {:.2}s", started.elapsed().as_secs_f64());
             heap.obj_dir = Some(dir);
         }
-        Err(e) => eprintln!(
-            "Warning: object directory unavailable ({}); falling back to in-memory indexes",
-            e
-        ),
+        Err(e) => {
+            // The in-memory fallback is an O(objects) address set. On a large dump
+            // that is exactly what the memory budget forbids, so refuse the run
+            // rather than silently allocate it; the escape hatch is explicit.
+            if std::env::var_os("SS_MAT_ALLOW_MEMORY_FALLBACK").is_some() {
+                eprintln!(
+                    "Warning: object directory unavailable ({}); falling back to in-memory indexes because SS_MAT_ALLOW_MEMORY_FALLBACK is set",
+                    e
+                );
+            } else {
+                return Err(e).with_context(|| {
+                    "the object directory is required to keep memory bounded; fix the temporary-disk budget or space instead of disabling it (SS_MAT_ALLOW_MEMORY_FALLBACK=1 restores the unbounded fallback)"
+                });
+            }
+        }
     }
     Ok(heap)
 }

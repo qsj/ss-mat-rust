@@ -143,28 +143,6 @@ impl<'a> PacedBodies<'a> {
     }
 }
 
-/// The two bodies one duplicate-array equality check needs: from the group's
-/// gather when it fitted the buffer, otherwise from the mapping at a paced rate.
-fn paced_bodies<'b, 'a: 'b>(
-    gathered: bool,
-    arena: &'b BodyRun,
-    paced: &mut PacedBodies<'a>,
-    recs: [&DupSpill; 2],
-    members: [usize; 2],
-) -> (&'b [u8], &'b [u8]) {
-    if gathered {
-        (arena.bytes(members[0]), arena.bytes(members[1]))
-    } else {
-        let width = |r: &DupSpill| {
-            r.length as usize * prim_type_size(PRIM_TYPE_ORDER[r.type_idx as usize])
-        };
-        (
-            paced.body(recs[0].body_off, width(recs[0])),
-            paced.body(recs[1].body_off, width(recs[1])),
-        )
-    }
-}
-
 /// Interval at which a running pass hands the dump mapping's pages back.
 const SWEEP_INTERVAL_MS: u64 = 100;
 
@@ -453,9 +431,8 @@ impl<'a> WindowCursor<'a> {
 // The aggregation passes used to keep one record per primitive array, per String
 // and per duplicate candidate for the whole scan, which costs hundreds of
 // megabytes once a dump holds tens of millions of objects. Each walk now spills
-// fixed-width records into a small set of bucket files and every aggregation
-// reads one bucket back at a time, so the resident set is one bucket plus the
-// report's aggregates instead of a per-object payload.
+// fixed-width records into bucket files. External sorting and disk-backed
+// collision state bound replay working memory; result vectors remain separate.
 
 /// Fixed width of one spilled primitive-array record: the array's identity and
 /// hashes plus the Section 11 result, in the narrowest fixed layout that holds
@@ -467,7 +444,7 @@ const STR_SPILL_REC: usize = 32;
 const S8_SPILL_REC: usize = 48;
 /// Fixed width of one duplicate-primitive-array candidate.
 const DUP_SPILL_REC: usize = 32;
-/// Buckets a spill is partitioned into; one bucket is resident at a time.
+/// Routing partitions; skewed partitions are externally sorted.
 const SPILL_BUCKETS: usize = 64;
 
 /// Java's primitive type order (boolean, byte, char, short, int, float, long,
@@ -555,10 +532,6 @@ impl SpillSet {
         &self.paths[bucket]
     }
 
-    /// Whole-bucket read: the bucket is the unit of residency.
-    fn read(&self, bucket: usize) -> std::io::Result<Vec<u8>> {
-        std::fs::read(&self.paths[bucket])
-    }
 }
 
 impl Drop for SpillSet {
@@ -632,12 +605,12 @@ struct JoinOut {
     /// Java's claim order for Sections 11 and 14.
     claim: StringClaim,
     /// Section 11 records (the arrays the scan classifies as bad).
-    bad_prim: Vec<ss_stats::problem_types::BadPrimArrayRecord>,
+    bad_prim: ss_stats::problem_types::RecordStore<ss_stats::problem_types::BadPrimArrayRecord>,
     /// Arrays that entered each duplicate accumulator, per type.
     per_type_total2: [u32; 8],
     per_type_total1: [u32; 8],
     /// The forensic array dump, filled only under SS_MAT_DEBUG_DIR.
-    debug_tsv: Vec<u8>,
+    debug_tsv: std::path::PathBuf,
 }
 
 /// Deterministic pairing of the two spills.
@@ -676,32 +649,37 @@ fn join_prim_and_strings(
     str_spill.flush()?;
     let mut out = JoinOut {
         claim: StringClaim::new(prim_count),
-        bad_prim: Vec::new(),
+        bad_prim: ss_stats::problem_types::RecordStore::new()?,
         per_type_total2: [0u32; 8],
         per_type_total1: [0u32; 8],
-        debug_tsv: Vec::new(),
+        debug_tsv: prim_spill.path(0).with_extension("backing-tsv"),
     };
-    if debug_enabled {
-        out.debug_tsv.extend_from_slice(b"obj_id_hex\tlength\tbuilder\n");
-    }
+    let mut debug_writer = if debug_enabled { Some(std::io::BufWriter::new(std::fs::File::create(&out.debug_tsv)?)) } else { None };
+    if let Some(writer) = &mut debug_writer { writer.write_all(b"obj_id_hex\tlength\tbuilder\n")?; }
+    let mut claimed_arrays = vec![0u64; prim_count.div_ceil(64)];
     let mut body_reads = 0usize;
     for bucket in 0..SPILL_BUCKETS {
-        let prim_raw = prim_spill.read(bucket)?;
-        let mut prims: Vec<PrimSpill> =
-            prim_raw.chunks_exact(PRIM_SPILL_REC).map(PrimSpill::decode).collect();
-        drop(prim_raw);
-        prims.sort_unstable_by_key(|r| r.obj_id);
-
-        // Strings first: they decide every claim bit of this bucket's arrays, and
-        // a bucket holds all users of an array, so the bits are final afterwards.
-        let str_raw = str_spill.read(bucket)?;
-        let mut claimed_arrays: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for raw in str_raw.chunks_exact(STR_SPILL_REC) {
-            let rec = StrSpill::decode(raw);
-            let Ok(pos) = prims.binary_search_by_key(&rec.array_id, |r| r.obj_id) else {
-                continue;
-            };
-            let arr = prims[pos];
+        let sorted = prim_spill.path(bucket).with_extension("sorted");
+        let count = ss_support::external_sort::ExternalSorter::new(PRIM_SPILL_REC, SCAN_SORT_BYTES)
+            .sort_file(prim_spill.path(bucket), &sorted, |r| le_u64(r, 0))?;
+        let prim_file = std::fs::File::open(&sorted)?;
+        let mut strings = std::io::BufReader::new(std::fs::File::open(str_spill.path(bucket))?);
+        while let Some(raw) = scan_record::<STR_SPILL_REC>(&mut strings)? {
+            let rec = StrSpill::decode(&raw);
+            let (mut left, mut right) = (0, count);
+            let mut found = None;
+            while left < right {
+                let middle = left + (right - left) / 2;
+                let mut raw = [0u8; PRIM_SPILL_REC];
+                read_exact_at(&prim_file, &mut raw, middle * PRIM_SPILL_REC as u64)?;
+                let arr = PrimSpill::decode(&raw);
+                match arr.obj_id.cmp(&rec.array_id) {
+                    std::cmp::Ordering::Less => left = middle + 1,
+                    std::cmp::Ordering::Greater => right = middle,
+                    std::cmp::Ordering::Equal => { found = Some(arr); break; }
+                }
+            }
+            let Some(arr) = found else { continue };
             set_bit(&mut out.claim.backing, arr.order);
             if rec.kind == STR_REF_BUILDER {
                 set_bit(&mut out.claim.builder, arr.order);
@@ -739,7 +717,8 @@ fn join_prim_and_strings(
             let hash = java_hash_str_content(&content, body);
             let backing = content.backing_size(body_len, header_sz);
             // Java claimedArrays.add(): true exactly once per backing array.
-            let claimed = claimed_arrays.insert(rec.array_id);
+            let claimed = !get_bit(&claimed_arrays, arr.order);
+            set_bit(&mut claimed_arrays, arr.order);
             if debug_coll && (rec.array_id == 0x7ffe00870 || rec.array_id == 0x7ffe00900) {
                 eprintln!(
                     "OWNERDBG array=0x{:x} owner=0x{:x} indexed=true",
@@ -760,11 +739,9 @@ fn join_prim_and_strings(
             };
             s8_spill.push(spill_bucket(hash as u32 as u64), &spill.encode())?;
         }
-        drop(str_raw);
-
-        // Then every array of the bucket: the Section 11 record and the
-        // duplicate candidate, both of which need this bucket's claim bits.
-        for arr in &prims {
+        let mut prims = std::io::BufReader::new(prim_file);
+        while let Some(raw) = scan_record::<PRIM_SPILL_REC>(&mut prims)? {
+            let arr = PrimSpill::decode(&raw);
             let owned = out.claim.owns(arr.order);
             let builder_owned = out.claim.is_builder(arr.order);
             if !(owned
@@ -786,7 +763,7 @@ fn join_prim_and_strings(
                         kind: arr.bad_kind,
                         size,
                         waste: arr.bad_waste,
-                    });
+                    })?;
                 }
             }
             let key = ((arr.hash as u32 as u64) << 32) | arr.order as u64;
@@ -810,12 +787,13 @@ fn join_prim_and_strings(
                 dup2_spill.push(bucket, &dup.encode())?;
             }
             if debug_enabled && owned {
-                out.debug_tsv.extend_from_slice(
+                debug_writer.as_mut().unwrap().write_all(
                     format!("0x{:x}\t{}\t{}\n", arr.obj_id, arr.length, builder_owned).as_bytes(),
-                );
+                )?;
             }
         }
     }
+    if let Some(writer) = &mut debug_writer { writer.flush()?; }
     Ok(out)
 }
 
@@ -826,6 +804,7 @@ fn join_prim_and_strings(
 /// bodies first and reading them in ascending offset turns its reads into forward
 /// runs, and every comparison after that reads this buffer instead of faulting
 /// the mapping once more per candidate.
+#[cfg(test)]
 struct BodyRun {
     /// One buffer holding a group's bodies back to back.
     buf: Vec<u8>,
@@ -840,16 +819,21 @@ struct BodyRun {
 
 /// Bytes of group bodies one fill may hold. A group that does not fit keeps the
 /// streaming path, so the buffer never grows with the group.
+#[cfg(test)]
 const GROUP_RUN_BYTES: u64 = 4 << 20;
 /// Longest read a fill issues: bodies that follow close enough share one read.
+#[cfg(test)]
 const GROUP_READ_BYTES: u64 = 256 << 10;
 /// Members one group must stay under for the gather to be worth its span table.
 /// A larger group is the empty-array chain, whose bodies are all empty anyway.
+#[cfg(test)]
 const GROUP_MEMBERS: usize = 1 << 16;
 /// Group body bytes read before the mapping's pages are handed back, the same
 /// pace the streaming path used so resident memory stays put.
+#[cfg(test)]
 const MAPPING_RELEASE_BYTES: u64 = 32 << 20;
 
+#[cfg(test)]
 impl BodyRun {
     fn new() -> Self {
         Self { buf: Vec::new(), spans: Vec::new(), plan: Vec::new(), active: false }
@@ -948,6 +932,24 @@ struct DupStringAcc {
 
 /// Replay Java's StringContentDeduplicator over the spilled candidates.
 ///
+impl ss_stats::problem_types::StoredRecord for DupStringAcc {
+    const WIDTH: usize = 80;
+    fn encode(&self, r: &mut [u8]) {
+        let values = [self.create_order as u64, self.count as u64, self.backing_count as u64,
+            self.backing_bytes as u64, self.wasted as u64, self.body_off, self.obj_id,
+            self.start as u64 | ((self.take as u64) << 32), self.array_len as u64,
+            self.enc as u64 | ((self.elem as u64) << 8)];
+        for (chunk, value) in r.chunks_exact_mut(8).zip(values) { chunk.copy_from_slice(&value.to_le_bytes()); }
+    }
+    fn decode(r: &[u8]) -> Self { Self {
+        create_order: le_u64(r,0) as u32, count: le_u64(r,8) as u32,
+        backing_count: le_u64(r,16) as u32, backing_bytes: le_u64(r,24) as i64,
+        wasted: le_u64(r,32) as i64, body_off: le_u64(r,40), obj_id: le_u64(r,48),
+        start: le_u64(r,56) as u32, take: (le_u64(r,56)>>32) as u32,
+        array_len: le_u64(r,64) as u32, enc: r[72], elem: r[73],
+    } }
+}
+
 /// The candidates are bucketed and sorted by (content hash, dump order), so every
 /// hash group is contiguous and in heap order. Java's pending map and content-map
 /// bucket are per hash, so replaying one hash group at a time reproduces it
@@ -960,47 +962,115 @@ fn replay_dup_strings(
     spill: &SpillSet,
     header_sz: i64,
     string_body_size: i64,
-    out: &mut Vec<DupStringAcc>,
+    out: &mut ss_stats::problem_types::RecordStore<DupStringAcc>,
 ) -> std::io::Result<u64> {
-    let mut arena = BodyRun::new();
-    // Bodies come from the arena now, so the mapping is only read by the fallback;
-    // its pages are still handed back at the same pace as before.
-    let mut gathered = 0u64;
-    let mut unique_total = 0u64;
+    let mut unique_total = 0;
+    let mut paced = PacedBodies { data, map: mmap, reads: 0 };
     for bucket in 0..SPILL_BUCKETS {
-        let raw = spill.read(bucket)?;
-        let mut recs: Vec<&[u8]> = raw.chunks_exact(S8_SPILL_REC).collect();
-        recs.sort_unstable_by_key(|r| le_u64(r, 0));
-        let mut first = 0usize;
-        while first < recs.len() {
-            let hash = le_u64(recs[first], 0) >> 32;
-            let mut end = first + 1;
-            while end < recs.len() && le_u64(recs[end], 0) >> 32 == hash {
-                end += 1;
+        let path = spill.path(bucket).with_extension("sorted");
+        ss_support::external_sort::ExternalSorter::new(S8_SPILL_REC, SCAN_SORT_BYTES)
+            .sort_file(spill.path(bucket), &path, |r| le_u64(r, 0))?;
+        let mut input = std::io::BufReader::new(std::fs::File::open(path)?);
+        let state_path = spill.path(bucket).with_extension("state");
+        let state = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(state_path)?;
+        let mut hash = None;
+        let mut nodes = 0u64;
+        let mut pending = None;
+        while let Some(raw) = scan_record::<S8_SPILL_REC>(&mut input)? {
+            let cur = S8Spill::decode(&raw);
+            let cur_hash = cur.key >> 32;
+            if hash != Some(cur_hash) {
+                emit_string_nodes(&state, nodes, string_body_size, out)?;
+                unique_total += nodes;
+                state.set_len(0)?;
+                nodes = 0;
+                pending = None;
+                hash = Some(cur_hash);
             }
-            unique_total += replay_dup_string_group(
-                &recs[first..end],
-                data,
-                mmap,
-                file,
-                &mut arena,
-                header_sz,
-                string_body_size,
-                out,
-            );
-            gathered += arena.buf.len() as u64;
-            if gathered >= MAPPING_RELEASE_BYTES {
-                release_mapped_pages(mmap);
-                gathered = 0;
+            let mut found = None;
+            for index in (0..nodes).rev() {
+                if pending == Some(index) { continue; }
+                let node = read_string_node(&state, index)?;
+                if str_content_eq(&node.rec.content(), paced.body(node.rec.body_off, node.rec.body_len()),
+                    &cur.content(), paced.body(cur.body_off, cur.body_len())) {
+                    found = Some(index); break;
+                }
             }
-            first = end;
+            if let Some(index) = pending.take() {
+                let mut node = read_string_node(&state, index)?;
+                let equal = str_content_eq(&node.rec.content(), paced.body(node.rec.body_off, node.rec.body_len()),
+                    &cur.content(), paced.body(cur.body_off, cur.body_len()));
+                node.backing_count = 1;
+                node.backing_bytes = node.rec.backing(header_sz);
+                if equal {
+                    node.count = 2;
+                    if cur.claimed != 0 { node.backing_count += 1; node.backing_bytes += cur.backing(header_sz); }
+                    write_string_node(&state, index, &node)?;
+                    continue;
+                }
+                write_string_node(&state, index, &node)?;
+                if found.is_none() {
+                    let claimed = cur.claimed != 0;
+                    write_string_node(&state, nodes, &StringNode { rec: cur, count: 1,
+                        backing_count: u32::from(claimed), backing_bytes: if claimed { cur.backing(header_sz) } else { 0 } })?;
+                    nodes += 1;
+                    continue;
+                }
+            } else if found.is_none() {
+                write_string_node(&state, nodes, &StringNode { rec: cur, count: 1, backing_count: 0, backing_bytes: 0 })?;
+                pending = Some(nodes);
+                nodes += 1;
+                continue;
+            }
+            if let Some(index) = found {
+                let mut node = read_string_node(&state, index)?;
+                node.count += 1;
+                if cur.claimed != 0 { node.backing_count += 1; node.backing_bytes += cur.backing(header_sz); }
+                write_string_node(&state, index, &node)?;
+            }
         }
+        emit_string_nodes(&state, nodes, string_body_size, out)?;
+        unique_total += nodes;
     }
+    let _ = file;
     Ok(unique_total)
+}
+
+struct StringNode { rec: S8Spill, count: u32, backing_count: u32, backing_bytes: i64 }
+
+fn read_string_node(file: &std::fs::File, index: u64) -> std::io::Result<StringNode> {
+    let mut raw = [0u8; 64];
+    read_exact_at(file, &mut raw, index * 64)?;
+    Ok(StringNode { rec: S8Spill::decode(&raw), count: le_u32(&raw, 48), backing_count: le_u32(&raw, 52), backing_bytes: le_u64(&raw, 56) as i64 })
+}
+
+fn write_string_node(file: &std::fs::File, index: u64, node: &StringNode) -> std::io::Result<()> {
+    let mut raw = [0u8; 64];
+    raw[..48].copy_from_slice(&node.rec.encode());
+    raw[48..52].copy_from_slice(&node.count.to_le_bytes());
+    raw[52..56].copy_from_slice(&node.backing_count.to_le_bytes());
+    raw[56..64].copy_from_slice(&node.backing_bytes.to_le_bytes());
+    file.write_all_at(&raw, index * 64)
+}
+
+fn emit_string_nodes(file: &std::fs::File, count: u64, body_size: i64, out: &mut ss_stats::problem_types::RecordStore<DupStringAcc>) -> std::io::Result<()> {
+    for index in 0..count {
+        let node = read_string_node(file, index)?;
+        if node.count <= 1 { continue; }
+        let rec = node.rec;
+        let mut wasted = (node.count - 1) as i64 * body_size;
+        if node.backing_count > 1 { wasted += node.backing_bytes / node.backing_count as i64 * (node.backing_count - 1) as i64; }
+        out.push(DupStringAcc { create_order: rec.key as u32, count: node.count,
+            backing_count: node.backing_count, backing_bytes: node.backing_bytes, wasted,
+            body_off: rec.body_off, obj_id: rec.obj_id, start: rec.start, take: rec.take,
+            array_len: rec.array_len, enc: rec.enc, elem: rec.elem })?;
+    }
+    Ok(())
 }
 
 /// Replay one hash group of Java's StringContentDeduplicator; returns the number
 /// of groups it created.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn replay_dup_string_group(
     members: &[&[u8]],
@@ -1210,7 +1280,20 @@ struct PrimHash0Node {
     rep: DupSpill,
     count: u32,
     /// Arrays folded into this node with their dump order (forensic dump only).
-    members: Vec<(u64, u32)>,
+    members: Option<u64>,
+}
+
+impl ss_stats::problem_types::StoredRecord for PrimHash0Node {
+    const WIDTH: usize = 48;
+    fn encode(&self, raw: &mut [u8]) {
+        raw[..32].copy_from_slice(&self.rep.encode());
+        raw[32..36].copy_from_slice(&self.count.to_le_bytes());
+        raw[40..48].copy_from_slice(&self.members.unwrap_or(u64::MAX).to_le_bytes());
+    }
+    fn decode(raw: &[u8]) -> Self {
+        let offset = le_u64(raw,40);
+        Self { rep:DupSpill::decode(raw),count:le_u32(raw,32),members:if offset==u64::MAX {None} else {Some(offset)} }
+    }
 }
 
 /// Compare two duplicate-primitive-array candidates the way Java's accumulator
@@ -1243,143 +1326,191 @@ fn replay_dup_prim(
     debug: bool,
     per_type_distinct: &mut [u32; 8],
     pending_groups: &mut u64,
-    hash0: &mut Vec<PrimHash0Node>,
+    hash0: &mut ss_stats::problem_types::RecordStore<PrimHash0Node>,
 ) -> std::io::Result<()> {
-    let mut arena = BodyRun::new();
-    // The mapping is only read by the fallback for an oversized group, at a pace
-    // that keeps its pages from accumulating.
     let mut paced = PacedBodies { data, map: mmap, reads: 0 };
-    let mut gathered = 0u64;
     for bucket in 0..SPILL_BUCKETS {
-        let raw = spill.read(bucket)?;
-        let mut recs: Vec<&[u8]> = raw.chunks_exact(DUP_SPILL_REC).collect();
-        recs.sort_unstable_by_key(|r| le_u64(r, 0));
-        let mut first = 0usize;
-        while first < recs.len() {
-            let hash = le_u64(recs[first], 0) >> 32;
-            let mut end = first + 1;
-            while end < recs.len() && le_u64(recs[end], 0) >> 32 == hash {
-                end += 1;
-            }
-            let group = &recs[first..end];
-            first = end;
-            if group.len() == 1 {
-                // A hash seen once keeps Java's pending entry and creates no node.
-                let only = DupSpill::decode(group[0]);
-                per_type_distinct[only.type_idx as usize] += 1;
-                *pending_groups += 1;
-                continue;
-            }
-            // The bodies this group compares, read in ascending dump offset. The
-            // records are decoded where they are used, so a group of empty arrays
-            // (the hash-0 chain) gathers and allocates nothing.
-            arena.plan.clear();
-            for (i, raw) in group.iter().enumerate() {
-                let rec = DupSpill::decode(raw);
-                let elem = prim_type_size(PRIM_TYPE_ORDER[rec.type_idx as usize]) as u64;
-                let len = rec.length as u64 * elem;
-                if len == 0 {
-                    continue;
-                }
-                arena.plan.push((rec.body_off, len as u32, i as u32));
-            }
-            let has_bodies = !arena.plan.is_empty();
-            arena.fill(file, group.len());
-            let gathered_group = arena.active();
-            if has_bodies && !gathered_group {
-                // The group kept the streaming path, so hand its pages back after.
-                release_mapped_pages(mmap);
-            }
-            gathered += arena.buf.len() as u64;
-            if gathered >= MAPPING_RELEASE_BYTES {
-                release_mapped_pages(mmap);
-                gathered = 0;
-            }
-            // (member index, count, members) per node, in creation order.
-            let mut nodes: Vec<(usize, u32, Vec<(u64, u32)>)> = Vec::new();
-            let mut pending: Option<usize> = None;
-            let mut materialised = false;
-            for index in 0..group.len() {
-                let cur = DupSpill::decode(group[index]);
-                let cur_order = (cur.key & 0xffff_ffff) as u32;
-                if pending.is_none() && !materialised {
-                    // First array with this hash: remembered, no node yet.
-                    pending = Some(index);
-                    per_type_distinct[cur.type_idx as usize] += 1;
-                    continue;
-                }
-                if let Some(pi) = pending.take() {
-                    let first_rec = DupSpill::decode(group[pi]);
-                    let first_order = (first_rec.key & 0xffff_ffff) as u32;
-                    let (first_body, cur_body) =
-                        paced_bodies(gathered_group, &arena, &mut paced, [&first_rec, &cur], [pi, index]);
-                    if dup_spill_eq(&first_rec, first_body, &cur, cur_body, prim_class_id) {
-                        nodes.push((
-                            index,
-                            2,
-                            if debug { vec![(cur.obj_id, cur_order), (first_rec.obj_id, first_order)] } else { Vec::new() },
-                        ));
+        let sorted = spill.path(bucket).with_extension("sorted");
+        ss_support::external_sort::ExternalSorter::new(DUP_SPILL_REC, SCAN_SORT_BYTES)
+            .sort_file(spill.path(bucket), &sorted, |r| le_u64(r, 0))?;
+        let mut input = std::io::BufReader::new(std::fs::File::open(sorted)?);
+        let state = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true)
+            .open(spill.path(bucket).with_extension("state"))?;
+        let member_path = spill.path(bucket).with_extension("members");
+        let mut members = std::io::BufWriter::new(std::fs::File::create(&member_path)?);
+        let mut member_sequence = 0u64;
+        let mut next = scan_record::<DUP_SPILL_REC>(&mut input)?;
+        while let Some(raw) = next.take() {
+            let first = DupSpill::decode(&raw);
+            let hash = first.key >> 32;
+            let mut pending = Some(first);
+            let mut nodes = 0u64;
+            per_type_distinct[first.type_idx as usize] += 1;
+            loop {
+                next = scan_record::<DUP_SPILL_REC>(&mut input)?;
+                let Some(raw) = &next else { break };
+                let cur = DupSpill::decode(raw);
+                if cur.key >> 32 != hash { break; }
+                let mut chosen = None;
+                if let Some(first) = pending.take() {
+                    if dup_spill_eq(&first, paced.body(first.body_off, first.body(data).len()),
+                        &cur, paced.body(cur.body_off, cur.body(data).len()), prim_class_id) {
+                        write_prim_node(&state, 0, &cur, 2)?;
+                        if debug && hash == 0 { write_prim_member(&mut members, &mut member_sequence, 0, &cur)?; write_prim_member(&mut members, &mut member_sequence, 0, &first)?; }
+                        nodes = 1;
                     } else {
-                        nodes.push((
-                            pi,
-                            1,
-                            if debug { vec![(first_rec.obj_id, first_order)] } else { Vec::new() },
-                        ));
-                        nodes.push((
-                            index,
-                            1,
-                            if debug { vec![(cur.obj_id, cur_order)] } else { Vec::new() },
-                        ));
+                        write_prim_node(&state, 0, &first, 1)?;
+                        write_prim_node(&state, 1, &cur, 1)?;
+                        if debug && hash == 0 { write_prim_member(&mut members, &mut member_sequence, 0, &first)?; write_prim_member(&mut members, &mut member_sequence, 1, &cur)?; }
+                        nodes = 2;
                         per_type_distinct[cur.type_idx as usize] += 1;
                     }
-                    materialised = true;
                     continue;
                 }
-                // Materialised: walk this hash's node chain, then append.
-                let mut matched: Option<usize> = None;
-                for (slot, node) in nodes.iter().enumerate() {
-                    let rep_rec = DupSpill::decode(group[node.0]);
-                    let (rep_body, cur_body) = paced_bodies(
-                        gathered_group,
-                        &arena,
-                        &mut paced,
-                        [&rep_rec, &cur],
-                        [node.0, index],
-                    );
-                    if dup_spill_eq(&rep_rec, rep_body, &cur, cur_body, prim_class_id) {
-                        matched = Some(slot);
+                for index in 0..nodes {
+                    let (rep, count) = read_prim_node(&state, index)?;
+                    if dup_spill_eq(&rep, paced.body(rep.body_off, rep.body(data).len()),
+                        &cur, paced.body(cur.body_off, cur.body(data).len()), prim_class_id) {
+                        write_prim_node(&state, index, &rep, count + 1)?;
+                        chosen = Some(index);
                         break;
                     }
                 }
-                match matched {
-                    Some(slot) => {
-                        nodes[slot].1 += 1;
-                        if debug {
-                            nodes[slot].2.push((cur.obj_id, cur_order));
-                        }
-                    }
-                    None => {
-                        nodes.push((
-                            index,
-                            1,
-                            if debug { vec![(cur.obj_id, cur_order)] } else { Vec::new() },
-                        ));
-                        per_type_distinct[cur.type_idx as usize] += 1;
-                    }
-                }
+                let index = if let Some(index) = chosen { index } else {
+                    let index = nodes;
+                    write_prim_node(&state, index, &cur, 1)?;
+                    nodes += 1;
+                    per_type_distinct[cur.type_idx as usize] += 1;
+                    index
+                };
+                if debug && hash == 0 { write_prim_member(&mut members, &mut member_sequence, index, &cur)?; }
             }
+            if pending.is_some() { *pending_groups += 1; }
             if hash == 0 {
-                for (rep, count, node_members) in nodes {
-                    hash0.push(PrimHash0Node {
-                        rep: DupSpill::decode(group[rep]),
-                        count,
-                        members: node_members,
-                    });
+                members.flush()?;
+                let sorted_members = member_path.with_extension("ordered-members");
+                if debug {
+                    ss_support::external_sort::ExternalSorter::new(24, SCAN_SORT_BYTES)
+                        .sort_file(&member_path, &sorted_members, |r| le_u64(r, 0))?;
+                }
+                let mut offset = 0;
+                for index in 0..nodes {
+                    let (rep, count) = read_prim_node(&state, index)?;
+                    hash0.push(PrimHash0Node { rep, count,
+                        members: if debug { Some(offset) } else { None } })?;
+                    offset += count as u64 * 24;
                 }
             }
         }
     }
+    let _ = file;
     Ok(())
+}
+
+fn read_prim_node(file: &std::fs::File, index: u64) -> std::io::Result<(DupSpill, u32)> {
+    let mut raw = [0u8; 40];
+    read_exact_at(file, &mut raw, index * 40)?;
+    Ok((DupSpill::decode(&raw), le_u32(&raw, 32)))
+}
+
+fn write_prim_node(file: &std::fs::File, index: u64, rep: &DupSpill, count: u32) -> std::io::Result<()> {
+    let mut raw = [0u8; 40];
+    raw[..32].copy_from_slice(&rep.encode());
+    raw[32..36].copy_from_slice(&count.to_le_bytes());
+    file.write_all_at(&raw, index * 40)
+}
+
+fn write_prim_member(writer: &mut impl std::io::Write, sequence: &mut u64, node: u64, rec: &DupSpill) -> std::io::Result<()> {
+    let key = node.checked_shl(32).filter(|_| node <= u32::MAX as u64)
+        .and_then(|n| if *sequence <= u32::MAX as u64 { Some(n | *sequence) } else { None })
+        .ok_or_else(|| std::io::Error::other("S14 membership order exceeds u32"))?;
+    *sequence += 1;
+    writer.write_all(&key.to_le_bytes())?;
+    writer.write_all(&rec.obj_id.to_le_bytes())?;
+    writer.write_all(&(rec.key as u32 as u64).to_le_bytes())
+}
+
+fn sort_member_addresses(input: &Path, output: &Path) -> std::io::Result<()> {
+    let by_address = output.with_extension("by-address");
+    let ties = output.with_extension("ties");
+    let ties_sorted = output.with_extension("ties-sorted");
+    let sorter = ss_support::external_sort::ExternalSorter::new(24, SCAN_SORT_BYTES);
+    sorter.sort_file(input, &by_address, |r| le_u64(r, 0))?;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(by_address)?);
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(output)?);
+    let mut next = scan_record::<24>(&mut reader)?;
+    while let Some(first) = next.take() {
+        next = scan_record::<24>(&mut reader)?;
+        if !next.as_ref().is_some_and(|r| le_u64(r, 0) == le_u64(&first, 0)) {
+            writer.write_all(&first)?;
+            continue;
+        }
+        let mut tie_writer = std::io::BufWriter::new(std::fs::File::create(&ties)?);
+        tie_writer.write_all(&first)?;
+        while next.as_ref().is_some_and(|r| le_u64(r, 0) == le_u64(&first, 0)) {
+            tie_writer.write_all(&next.take().unwrap())?;
+            next = scan_record::<24>(&mut reader)?;
+        }
+        tie_writer.flush()?;
+        sorter.sort_file(&ties, &ties_sorted, |r| le_u64(r, 16))?;
+        std::io::copy(&mut std::fs::File::open(&ties_sorted)?, &mut writer)?;
+    }
+    writer.flush()
+}
+
+const SCAN_SORT_BYTES: usize = 8 << 20;
+
+fn scan_record<const N: usize>(reader: &mut impl std::io::Read) -> std::io::Result<Option<[u8; N]>> {
+    let mut record = [0u8; N];
+    let mut n = 0;
+    while n < N {
+        match reader.read(&mut record[n..]) {
+            Ok(0) if n == 0 => return Ok(None),
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "partial scan record")),
+            Ok(read) => n += read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(record))
+}
+
+/// Join every non-null S10 reference against the address-ordered directory,
+/// then sort matched owner ordinals back into dump order. Multiplicity is kept.
+fn s10_membership(
+    scratch: &ScanScratch,
+    directory: Option<&ss_support::obj_dir::ObjDir>,
+    fallback: &Option<std::collections::HashSet<u64>>,
+) -> std::io::Result<std::io::BufReader<std::fs::File>> {
+    let sorted = scratch.path("s10-addresses");
+    ss_support::external_sort::ExternalSorter::new(16, SCAN_SORT_BYTES)
+        .sort_file(&scratch.path("s10-refs"), &sorted, |r| le_u64(r, 0))?;
+    let mut refs = std::io::BufReader::new(std::fs::File::open(sorted)?);
+    let matched = scratch.path("s10-matched");
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&matched)?);
+    let mut index = 0;
+    let mut current = match directory {
+        Some(dir) if !dir.is_empty() => Some(dir.get(0)?),
+        _ => None,
+    };
+    while let Some(record) = scan_record::<16>(&mut refs)? {
+        let addr = le_u64(&record, 0);
+        let found = if let Some(set) = fallback {
+            set.contains(&addr)
+        } else if let Some(dir) = directory {
+            while current.as_ref().is_some_and(|r| r.addr < addr) {
+                index += 1;
+                current = if index < dir.len() { Some(dir.get(index)?) } else { None };
+            }
+            current.as_ref().is_some_and(|r| r.addr == addr && r.kind != DI_KIND_CLASS)
+        } else { false };
+        if found { writer.write_all(&record[8..16])?; }
+    }
+    writer.flush()?;
+    let counts = scratch.path("s10-owner-order");
+    ss_support::external_sort::ExternalSorter::new(8, SCAN_SORT_BYTES)
+        .sort_file(&matched, &counts, |r| le_u64(r, 0))?;
+    Ok(std::io::BufReader::new(std::fs::File::open(counts)?))
 }
 
 /// One primitive array, as spilled by the first walk and read back by the join.
@@ -1815,14 +1946,7 @@ impl LinearScanCoordinator {
         let mut str_order: u32 = 0;
         // Collection records are one per collection instance; the per-class
         // instance counts are already known, so the vector never doubles.
-        let mut collection_estimate = 0usize;
-        for pc in &self.stats.per_class {
-            if is_collection_class_name(&pc.class_name) {
-                collection_estimate += pc.instance_count.load(Relaxed) as usize;
-            }
-        }
-        let mut bad_collection_records: Vec<BadCollectionRecord> =
-            Vec::with_capacity(collection_estimate);
+        let mut bad_collection_records=ss_stats::problem_types::RecordStore::<BadCollectionRecord>::new()?;
         let debug_coll = std::env::var("SS_MAT_DEBUG_COLL").is_ok();
 
         let mut walked_instances: u64 = 0;
@@ -2064,7 +2188,7 @@ impl LinearScanCoordinator {
                             waste,
                             kind: ss_stats::problem_types::COLLECTION_KIND_NONE,
                             body: 0,
-                        });
+                        })?;
                     }
                 }
             }
@@ -2106,8 +2230,8 @@ impl LinearScanCoordinator {
         drop(str_spill);
         let bad_prim_array_records = joined.bad_prim;
         if let Some(dir) = ss_stats::debug_dump::debug_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join("string_backing.tsv"), &joined.debug_tsv);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::copy(&joined.debug_tsv, dir.join("string_backing.tsv"))?;
         }
         mark("scan-joined");
 
@@ -2120,7 +2244,7 @@ impl LinearScanCoordinator {
             .and_then(|idx| class_aligned.get(idx as usize).copied())
             .unwrap_or(24);
         s8_spill.flush()?;
-        let mut s8_acc: Vec<DupStringAcc> = Vec::new();
+        let mut s8_acc = ss_stats::problem_types::RecordStore::<DupStringAcc>::new()?;
         let unique_count = replay_dup_strings(
             data,
             &mmap,
@@ -2144,16 +2268,32 @@ impl LinearScanCoordinator {
         // remaining groups only contribute their count and waste: their content is
         // decoded here exactly when the report can show it. The list itself stays
         // in Java's group-creation order, which is the tie-breaker the ranking uses.
-        s8_acc.sort_unstable_by_key(|g| g.create_order);
-        let mut ranked: Vec<u32> = (0..s8_acc.len() as u32).collect();
-        ranked.sort_by(|a, b| {
-            s8_acc[*b as usize].wasted.cmp(&s8_acc[*a as usize].wasted).then(a.cmp(b))
-        });
-        let rendered: std::collections::HashSet<u32> = ranked.iter().take(200).copied().collect();
-        let mut groups: Vec<ss_stats::duplicate_strings::DupStringGroup> =
-            Vec::with_capacity(s8_acc.len());
-        for (index, g) in s8_acc.iter().enumerate() {
-            let (content, sample_obj_ids) = if rendered.contains(&(index as u32)) {
+        let mut best: Vec<(i64, u32)> = Vec::with_capacity(201);
+        for g in s8_acc.iter() {
+            let g = g?;
+            let key = (-g.wasted, g.create_order);
+            let pos = best.partition_point(|k| *k <= key);
+            if pos < 200 { best.insert(pos, key); best.truncate(200); }
+        }
+        let rendered: std::collections::HashSet<u32> = best.iter().map(|g| g.1).collect();
+        let ordered_path = scratch.path("s8-result-order");
+        let mut ordered_writer = std::io::BufWriter::new(std::fs::File::create(&ordered_path)?);
+        use ss_stats::problem_types::StoredRecord;
+        for g in s8_acc.iter() {
+            let mut raw = [0u8; 80]; g?.encode(&mut raw); ordered_writer.write_all(&raw)?;
+        }
+        ordered_writer.flush()?;
+        let ordered_result = scratch.path("s8-result-sorted");
+        ss_support::external_sort::ExternalSorter::new(80, SCAN_SORT_BYTES)
+            .sort_file(&ordered_path, &ordered_result, |r| le_u64(r,0))?;
+        let mut ordered_reader = std::io::BufReader::new(std::fs::File::open(ordered_result)?);
+        let mut groups: Vec<ss_stats::duplicate_strings::DupStringGroup> = Vec::new();
+        let mut debug_strings = if debug_enabled { Some(ss_stats::debug_dump::StringDebugStore::new()?) } else { None };
+        let group_count = s8_acc.len() as usize;
+        let mut total_waste = 0i64;
+        while let Some(raw) = scan_record::<80>(&mut ordered_reader)? {
+            let g = DupStringAcc::decode(&raw);
+            let (content, sample_obj_ids) = if rendered.contains(&g.create_order) {
                 let body_len = g.array_len as usize * g.elem as usize;
                 let off = g.body_off as usize;
                 let content = StrContent {
@@ -2169,29 +2309,25 @@ impl LinearScanCoordinator {
             } else {
                 (String::new(), Vec::new())
             };
-            groups.push(ss_stats::duplicate_strings::DupStringGroup {
+            let group = ss_stats::duplicate_strings::DupStringGroup {
                 content,
                 count: g.count as usize,
                 wasted_bytes: g.wasted,
                 backing_array_count: g.backing_count as usize,
                 sample_obj_ids,
-            });
+            };
+            total_waste += group.wasted_bytes;
+            if let Some(store) = &mut debug_strings { store.push(&group)?; }
+            if rendered.contains(&g.create_order) { groups.push(group); }
         }
+        groups.sort_by(|a,b| b.wasted_bytes.cmp(&a.wasted_bytes));
+        if let Some(store) = debug_strings { ss_stats::debug_dump::record_dup_string_store(store); }
         drop(s8_acc);
 
-        // Accumulate duplicate string bytes.
-        for g in &groups {
-            if let Some(idx) = str_idx {
-                if let Some(pc) = self.stats.get_per_class(idx) {
-                    pc.duplicate_string_bytes.fetch_add(g.wasted_bytes, Relaxed);
-                }
-            }
+        if let Some(idx) = str_idx {
+            if let Some(pc) = self.stats.get_per_class(idx) { pc.duplicate_string_bytes.fetch_add(total_waste, Relaxed); }
         }
-
-        // Store results in StatsEngine.
-        self.stats
-            .string_dup
-            .set_results(string_total, unique_count as usize, groups);
+        self.stats.string_dup.set_streamed_results(string_total, unique_count as usize, group_count, total_waste, groups);
         self.stats.string_dup.set_string_body_size(string_body_size);
 
         // DirectByteBuffer off-heap analysis.
@@ -2205,16 +2341,13 @@ impl LinearScanCoordinator {
         let stats_ref = &self.stats;
         // ------------------------------------------------------------------
         let oop_sz = self.heap.oop_size as i32;
-        let mut bad_array_records: Vec<BadArrayRecord> = Vec::new();
+        let mut bad_array_records = ss_stats::problem_types::RecordStore::<BadArrayRecord>::new()?;
         let mut obj_recs: Vec<ObjArrRec> = Vec::new();
         let mut walked_obj_arrays: u64 = 0;
         // Java's readElementIndices() -> HeapDump.resolveIndex() counts an element
         // only when the parser indexed it: class-dump targets stay null (the Java
         // bug replicated) and dangling references do not count.
-        let indexed = |addr: u64| match &fallback_addresses {
-            Some(set) => set.contains(&addr),
-            None => self.heap.contains_object(addr),
-        };
+        let mut s10_refs = std::io::BufWriter::new(std::fs::File::create(scratch.path("s10-refs"))?);
         walk_heap(&mmap, data, walk_id_size, |obj| {
             let RawObj::ObjArray { obj_id, class_ref, len, body_off, body_len } = obj else {
                 return Ok(());
@@ -2252,43 +2385,52 @@ impl LinearScanCoordinator {
             // counts as non-null only if its address is in addressToIndexMap.
             // ClassDump addresses are NOT in that map, so e.g. Class[] elements
             // all look null (Java bug replicated).
-            let non_null_count = if length <= 1 {
-                0i32
-            } else {
-                let mut count = 0i32;
+            if length > 1 {
                 let elements = &data[body_off..body_off + body_len];
-                for i in 0..len as usize {
-                    let o = i * id_bytes;
+                for raw in elements.chunks_exact(id_bytes) {
                     let id = if id_bytes == 8 {
-                        u64::from_be_bytes(elements[o..o + 8].try_into().unwrap())
+                        u64::from_be_bytes(raw.try_into().unwrap())
                     } else {
-                        u32::from_be_bytes(elements[o..o + 4].try_into().unwrap()) as u64
+                        u32::from_be_bytes(raw.try_into().unwrap()) as u64
                     };
-                    if id != 0 && indexed(id) {
-                        count += 1;
+                    if id != 0 {
+                        s10_refs.write_all(&id.to_le_bytes())?;
+                        s10_refs.write_all(&(obj_recs.len() as u64 - 1).to_le_bytes())?;
                     }
-                }
-                count
-            };
-            // Java counts both live and garbage passes; the report filters later.
-            if length == 0 {
-                bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 0, size });
-            } else if length == 1 {
-                bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 1, size });
-            } else {
-                let null_count = length - non_null_count;
-                if non_null_count == 0 {
-                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 2, size });
-                } else if non_null_count == 1 {
-                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 3, size });
-                } else if null_count as f64 > (self.config.min_sparse_zeroes_percent / 100.0) * length as f64 {
-                    // >70% null elements (SPARSE): waste = null slots x refSize.
-                    let waste = null_count as i64 * oop_sz as i64;
-                    bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind: 4, size: waste });
                 }
             }
             Ok(())
         })?;
+        s10_refs.flush()?;
+        drop(s10_refs);
+        let mut matched = s10_membership(&scratch, self.heap.obj_dir.as_ref(), &fallback_addresses)?;
+        let mut next = scan_record::<8>(&mut matched)?;
+        for (order, rec) in obj_recs.iter().enumerate() {
+            let mut non_null_count = 0i32;
+            while next.as_ref().is_some_and(|r| le_u64(r, 0) == order as u64) {
+                non_null_count += 1;
+                next = scan_record::<8>(&mut matched)?;
+            }
+            let class_idx = rec.class_idx;
+            if class_idx >= self.heap.classes.len() as u32
+                || stats_ref.get_per_class(class_idx).is_none()
+                || is_primitive_array_class_name(self.heap.classes[class_idx as usize].name.as_ref()) {
+                continue;
+            }
+            let obj_id = rec.obj_id;
+            let length = rec.length as i32;
+            let size = array_shallow_size(length, oop_sz, header_sz);
+            let kind = if length == 0 { Some(0) }
+                else if length == 1 { Some(1) }
+                else if non_null_count == 0 { Some(2) }
+                else if non_null_count == 1 { Some(3) }
+                else if (length - non_null_count) as f64 > (self.config.min_sparse_zeroes_percent / 100.0) * length as f64 { Some(4) }
+                else { None };
+            if let Some(kind) = kind {
+                let size = if kind == 4 { (length - non_null_count) as i64 * oop_sz as i64 } else { size };
+                bad_array_records.push(BadArrayRecord { obj_id, class_idx, kind, size })?;
+            }
+        }
         // The walk visits exactly the records the parser indexed, so these counts
         // are expected to agree. They are reconciled rather than trusted silently:
         // a report that quietly drops objects is worse than a warning.
@@ -2366,8 +2508,9 @@ impl LinearScanCoordinator {
         };
 
         let mut weak_table_entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for rec in &bad_collection_records {
-            if class_name_of(rec) == "java/util/WeakHashMap" && rec.backing_array_id != 0 {
+        for rec in bad_collection_records.iter() {
+            let rec=rec?;
+            if class_name_of(&rec) == "java/util/WeakHashMap" && rec.backing_array_id != 0 {
                 if let Some(arec) = objs.find(rec.backing_array_id) {
                     let mut stack: Vec<u64> = objs.elems(arec);
                     while let Some(id) = stack.pop() {
@@ -2509,14 +2652,16 @@ impl LinearScanCoordinator {
         let mut record_by_id: std::collections::HashMap<u64, usize> =
             std::collections::HashMap::with_capacity(wrapper_inner.len());
         for (i, rec) in bad_collection_records.iter().enumerate() {
+            let rec=rec?;
             if wrapper_inner.contains(&rec.obj_id) {
                 record_by_id.insert(rec.obj_id, i);
             }
         }
         // Java ConcurrentSkipListMapIterator.getSize(): start at head.node.next,
         // count non-null values along the base-level chain.
-        for rec in bad_collection_records.iter_mut() {
-            let class_name = class_name_of(rec);
+        for index in 0..bad_collection_records.len() {
+            let mut rec=bad_collection_records.get(index)?;
+            let class_name = class_name_of(&rec);
             if class_name == "java/util/concurrent/ConcurrentHashMap" && rec.counter_cells != 0 {
                 rec.size += counter_cells_sum(rec.counter_cells) as i32;
             }
@@ -2541,27 +2686,27 @@ impl LinearScanCoordinator {
                 }
                 rec.size = size;
             }
+            bad_collection_records.set(index,rec)?;
         }
-        let mut body_by_idx: Vec<i64> = vec![0; bad_collection_records.len()];
-        let mut cap_by_idx: Vec<i32> = vec![0; bad_collection_records.len()];
-        for (i, rec) in bad_collection_records.iter().enumerate() {
-            objs.pace(i);
-            let (body, cap) = compute_body(rec, class_name_of(rec));
-            body_by_idx[i] = body;
-            cap_by_idx[i] = cap;
+        let mut body_caps=ss_stats::problem_types::RecordStore::<(i64,i32)>::new()?;
+        for (i,rec) in bad_collection_records.iter().enumerate(){
+            let rec=rec?;objs.pace(i);
+            body_caps.push(compute_body(&rec,class_name_of(&rec)))?;
         }
         let mut dbg_printed = 0usize;
-        for (i, rec) in bad_collection_records.iter_mut().enumerate() {
-            let class_name = class_name_of(rec);
+        for i in 0..bad_collection_records.len() {
+            let mut rec=bad_collection_records.get(i)?;
+            let (body_value,cap_value)=body_caps.get(i)?;
+            let class_name = class_name_of(&rec);
             let overhead_cap = if class_name == "java/util/IdentityHashMap" {
-                cap_by_idx[i] / 2
+                cap_value / 2
             } else {
-                cap_by_idx[i]
+                cap_value
             };
-            rec.body = body_by_idx[i];
+            rec.body = body_value;
             let (kind, waste) = classify(
                 rec.size,
-                body_by_idx[i],
+                body_value,
                 overhead_cap,
                 is_collection_iterator(class_name),
                 category_count(class_name),
@@ -2578,19 +2723,21 @@ impl LinearScanCoordinator {
             {
                 eprintln!(
                     "COLLDBG obj=0x{:x} class={} size={} cap={} body={} waste={} backing=0x{:x}",
-                    rec.obj_id, class_name, rec.size, cap_by_idx[i], body_by_idx[i], waste,
+                    rec.obj_id, class_name, rec.size, cap_value, body_value, waste,
                     rec.backing_array_id
                 );
                 dbg_printed += 1;
             }
             rec.kind = kind;
             rec.waste = waste;
+            bad_collection_records.set(i,rec)?;
         }
 
         // Java LinkedListMapIterator counts null items; MANY_NULLS when
         // nullCount > size/4, waste = nullCount * refSize * categoryCount (1).
-        for rec in bad_collection_records.iter_mut() {
-            if class_name_of(rec) == "java/util/LinkedList" && rec.size > 4 && rec.chain_head != 0 {
+        for index in 0..bad_collection_records.len() {
+            let mut rec=bad_collection_records.get(index)?;
+            if class_name_of(&rec) == "java/util/LinkedList" && rec.size > 4 && rec.chain_head != 0 {
                 let mut cur = rec.chain_head;
                 let mut nulls: i64 = 0;
                 let mut steps = 0usize;
@@ -2606,6 +2753,7 @@ impl LinearScanCoordinator {
                     rec.waste = nulls * ref_sz;
                 }
             }
+            bad_collection_records.set(index,rec)?;
         }
 
         // Wrapped collections: Java counts the wrapper object and its inner map's
@@ -2616,11 +2764,11 @@ impl LinearScanCoordinator {
             let Some(&inner_idx) = record_by_id.get(&wrapper.inner_id) else {
                 continue;
             };
-            let inner_size = bad_collection_records[inner_idx].size;
-            let inner_body = body_by_idx[inner_idx];
-            let inner_cap = cap_by_idx[inner_idx];
-            bad_collection_records[inner_idx].kind = ss_stats::problem_types::COLLECTION_KIND_NONE;
-            bad_collection_records[inner_idx].waste = 0;
+            let mut inner=bad_collection_records.get(inner_idx as u64)?;
+            let inner_size=inner.size;
+            let (inner_body,inner_cap)=body_caps.get(inner_idx as u64)?;
+            inner.kind=ss_stats::problem_types::COLLECTION_KIND_NONE;inner.waste=0;
+            bad_collection_records.set(inner_idx as u64,inner)?;
             let body = wrapper.container_bytes + inner_body;
             let (kind, waste) = classify(inner_size, body, inner_cap, wrapper.is_collection, 1);
             bad_collection_records.push(BadCollectionRecord {
@@ -2636,7 +2784,7 @@ impl LinearScanCoordinator {
                 waste,
                 kind,
                 body,
-            });
+            })?;
         }
         mark("run-collagg");
 
@@ -2647,8 +2795,8 @@ impl LinearScanCoordinator {
         let mut dup1_distinct = [0u32; 8];
         let mut dup2_pending: u64 = 0;
         let mut dup1_pending: u64 = 0;
-        let mut hash0_pass2: Vec<PrimHash0Node> = Vec::new();
-        let mut hash0_pass1: Vec<PrimHash0Node> = Vec::new();
+        let mut hash0_pass2 = ss_stats::problem_types::RecordStore::<PrimHash0Node>::new()?;
+        let mut hash0_pass1 = ss_stats::problem_types::RecordStore::<PrimHash0Node>::new()?;
         dup2_spill.flush()?;
         dup1_spill.flush()?;
         replay_dup_prim(
@@ -2670,13 +2818,14 @@ impl LinearScanCoordinator {
         let chains = [&hash0_pass2, &hash0_pass1];
         let mut per_class_entries: Vec<ss_stats::duplicate_arrays::DupArrayClassEntry> = Vec::new();
         let mut top_groups: Vec<ss_stats::duplicate_arrays::DupArrayGroup> = Vec::new();
-        let mut debug_groups: Vec<ss_stats::debug_dump::DupPrimGroupDebug> = Vec::new();
+        let mut debug_group_count = 0usize;
         let mut iterated_nodes: usize = 0;
         let mut arrays_in_groups: usize = 0;
         let mut waste_total: i64 = 0;
         for pass in 0..2 {
             let mut type_waste = [0i64; 8];
-            for node in chains[pass] {
+            for node in chains[pass].iter() {
+                let node = node?;
                 iterated_nodes += 1;
                 if node.count <= 1 {
                     continue;
@@ -2694,26 +2843,39 @@ impl LinearScanCoordinator {
                 type_waste[type_idx] += wasted;
                 let class_name = prim_type_display_name(PRIM_TYPE_ORDER[type_idx]).to_string();
                 if debug_on {
-                    debug_groups.push(ss_stats::debug_dump::DupPrimGroupDebug {
-                        class_name: class_name.clone(),
-                        array_length: rep.length as i32,
+                    let offset = node.members.expect("debug membership spill");
+                    let name = if pass == 0 { "dup2" } else { "dup1" };
+                    let path = scratch.dir.join(format!("{name}-{:03}", spill_bucket(0))).with_extension("ordered-members");
+                    let source = std::fs::File::open(path)?;
+                    let member_input = scratch.path("s14-node-members");
+                    let mut writer = std::io::BufWriter::new(std::fs::File::create(&member_input)?);
+                    for index in 0..node.count as u64 {
+                        let mut raw = [0u8; 24];
+                        read_exact_at(&source, &mut raw, offset + index * 24)?;
+                        writer.write_all(&raw[8..24])?;
+                        writer.write_all(&(le_u64(&raw, 0) as u32 as u64).to_le_bytes())?;
+                    }
+                    writer.flush()?;
+                    let member_sorted = scratch.path("s14-node-sorted");
+                    sort_member_addresses(&member_input, &member_sorted)?;
+                    let mut reader = std::io::BufReader::new(std::fs::File::open(member_sorted)?);
+                    let members = ss_stats::debug_dump::DupPrimMemberStore::create((0..node.count).map(|_| {
+                        let raw = scan_record::<24>(&mut reader)?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "S14 member missing"))?;
+                        let obj_id = le_u64(&raw, 0);
+                        Ok(ss_stats::debug_dump::DupPrimMemberDebug {
+                            obj_id, string_backing: joined.claim.owns(le_u64(&raw, 8) as u32),
+                            container_backing: container_backing_ids.contains(&obj_id),
+                        })
+                    }))?;
+                    ss_stats::debug_dump::record_dup_prim_group_store(ss_stats::debug_dump::DupPrimGroupDebug {
+                        class_name: class_name.clone(), array_length: rep.length as i32,
                         element_size: prim_type_size(PRIM_TYPE_ORDER[type_idx]) as i32,
-                        body_size: body,
-                        count: node.count as usize,
-                        wasted_bytes: wasted,
-                        content_hash: ss_stats::debug_dump::fnv1a64(rep.body(data)),
-                        members: node
-                            .members
-                            .iter()
-                            .map(|(obj_id, order)| ss_stats::debug_dump::DupPrimMemberDebug {
-                                obj_id: *obj_id,
-                                string_backing: joined.claim.owns(*order),
-                                container_backing: container_backing_ids.contains(obj_id),
-                            })
-                            .collect(),
-                    });
+                        body_size: body, count: node.count as usize, wasted_bytes: wasted,
+                        content_hash: ss_stats::debug_dump::fnv1a64(rep.body(data)), members: Vec::new(),
+                    }, members)?;
+                    debug_group_count += 1;
                 }
-                top_groups.push(ss_stats::duplicate_arrays::DupArrayGroup {
+                let group = ss_stats::duplicate_arrays::DupArrayGroup {
                     class_name,
                     count: node.count as usize,
                     wasted_bytes: wasted,
@@ -2722,7 +2884,9 @@ impl LinearScanCoordinator {
                     representative_obj_id: rep.obj_id,
                     description: format!("{}[{}]", PRIM_TYPE_DISPLAY[type_idx].trim_end_matches("[]"), rep.length),
                     sample_obj_ids: vec![rep.obj_id],
-                });
+                };
+                let pos = top_groups.partition_point(|g| g.wasted_bytes >= group.wasted_bytes);
+                if pos < 100 { top_groups.insert(pos, group); top_groups.truncate(100); }
             }
             // Java's DuplicateClassEntry.instanceCount is the class' total instance
             // count, available to both accumulators; only types with
@@ -2762,11 +2926,11 @@ impl LinearScanCoordinator {
                 scanned_arrays: total_processed,
                 eligible_arrays: total_processed,
                 arrays_in_groups,
-                groups: debug_groups.len(),
+                groups: debug_group_count,
                 waste_bytes: waste_total,
                 unique_count,
             });
-            ss_stats::debug_dump::record_dup_prim_groups(debug_groups);
+
         }
 
         self.stats
@@ -2805,9 +2969,9 @@ impl LinearScanCoordinator {
         mark("run-dup");
 
         // Stash the records the report reads after BFS.
-        *self.stats.bad_array_records.lock().unwrap() = bad_array_records;
-        *self.stats.bad_prim_array_records.lock().unwrap() = bad_prim_array_records;
-        *self.stats.bad_collection_records.lock().unwrap() = bad_collection_records;
+        *self.stats.bad_array_store.lock().unwrap() = Some(bad_array_records);
+        *self.stats.bad_prim_array_store.lock().unwrap() = Some(bad_prim_array_records);
+        *self.stats.bad_collection_store.lock().unwrap() = Some(bad_collection_records);
         *self.stats.container_backing_ids.lock().unwrap() = container_backing_ids;
 
         // Update totals.
@@ -5998,6 +6162,102 @@ pub fn resolve_field_values(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sorted_members_keep_equal_address_sequence_and_flags() {
+        use super::*;
+        let scratch = ScanScratch::new().unwrap();
+        let input = scratch.path("input"); let output = scratch.path("output");
+        let mut writer = std::fs::File::create(&input).unwrap();
+        for (address, order) in [(7u64, 4u64), (3, 3), (7, 1), (3, 2), (7, 0)] {
+            writer.write_all(&address.to_le_bytes()).unwrap();
+            writer.write_all(&(order + 100).to_le_bytes()).unwrap();
+            writer.write_all(&order.to_le_bytes()).unwrap();
+        }
+        sort_member_addresses(&input, &output).unwrap();
+        let mut reader = std::fs::File::open(output).unwrap();
+        for (address, order) in [(3, 2), (3, 3), (7, 0), (7, 1), (7, 4)] {
+            let raw = scan_record::<24>(&mut reader).unwrap().unwrap();
+            assert_eq!((le_u64(&raw, 0), le_u64(&raw, 8), le_u64(&raw, 16)), (address, order + 100, order));
+        }
+        assert!(scan_record::<24>(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn sorted_s10_join_preserves_multiplicity_and_filters_class_and_missing() {
+        use super::*;
+        use ss_support::obj_dir::{ObjDirBuilder, ObjRec};
+        let scratch = ScanScratch::new().unwrap();
+        let mut builder = ObjDirBuilder::new(&scratch.dir).unwrap();
+        for (addr, kind) in [(20, 0), (30, 3), (40, 1)] {
+            builder.push(ObjRec { addr, kind, ..Default::default() }).unwrap();
+        }
+        let directory = builder.finish(&scratch.path("directory"), 1 << 20).unwrap();
+        let mut writer = std::fs::File::create(scratch.path("s10-refs")).unwrap();
+        for (addr, owner) in [(40u64, 2u64),(20,0),(30,0),(99,1),(20,0),(0,1),(20,2)] {
+            writer.write_all(&addr.to_le_bytes()).unwrap(); writer.write_all(&owner.to_le_bytes()).unwrap();
+        }
+        let mut reader = s10_membership(&scratch, Some(&directory), &None).unwrap();
+        for owner in [0,0,2,2] { assert_eq!(le_u64(&scan_record::<8>(&mut reader).unwrap().unwrap(),0),owner); }
+        assert!(scan_record::<8>(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn disk_string_collision_replay_matches_original_state_machine() {
+        use super::*;
+        let scratch = ScanScratch::new().unwrap();
+        let path = scratch.path("bodies");
+        std::fs::write(&path, b"abacabad").unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let map = unsafe { Mmap::map(&file).unwrap() };
+        for variant in 0..4 {
+            let mut spill = SpillSet::create(&scratch.dir, "test-s8").unwrap();
+            let mut encoded = Vec::new();
+            for i in 0..32u32 {
+                let offset = (i as usize * (variant + 1)) % 8;
+                let record = S8Spill { key: (7u64 << 32) | i as u64, body_off: offset as u64,
+                    obj_id: i as u64, start: 0, take: 1, array_len: 1, enc: STR_ENC_BYTE_LATIN1,
+                    elem: 1, claimed: u8::from((i + variant as u32) % 3 == 0) }.encode();
+                spill.push(spill_bucket(7), &record).unwrap();
+                encoded.push(record);
+            }
+            spill.flush().unwrap();
+            let refs: Vec<_> = encoded.iter().map(|r| r.as_slice()).collect();
+            let mut expected = Vec::new();
+            let expected_unique = replay_dup_string_group(&refs, &map, &map, &file,
+                &mut BodyRun::new(), 12, 24, &mut expected);
+            let mut actual = ss_stats::problem_types::RecordStore::new().unwrap();
+            let actual_unique = replay_dup_strings(&map, &map, &file, &spill, 12, 24, &mut actual).unwrap();
+            assert_eq!(actual_unique, expected_unique);
+            let snapshot = |v: &[DupStringAcc]| v.iter().map(|g| (g.create_order,g.count,g.backing_count,g.backing_bytes,g.wasted,g.obj_id)).collect::<Vec<_>>();
+            let actual: Vec<_> = actual.iter().collect::<std::io::Result<_>>().unwrap();
+            assert_eq!(snapshot(&actual), snapshot(&expected));
+        }
+    }
+
+    #[test]
+    fn disk_primitive_empty_skew_preserves_all_members_and_second_representative() {
+        use super::*;
+        let scratch = ScanScratch::new().unwrap();
+        let path = scratch.path("body");
+        std::fs::write(&path, [0u8]).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let map = unsafe { Mmap::map(&file).unwrap() };
+        let mut spill = SpillSet::create(&scratch.dir, "test-prim").unwrap();
+        let count = GROUP_MEMBERS as u32 + 1;
+        for order in 0..count {
+            spill.push(spill_bucket(0), &DupSpill { key: order as u64, obj_id: 99,
+                body_off: 0, length: 0, type_idx: 1 }.encode()).unwrap();
+        }
+        spill.flush().unwrap();
+        let mut distinct = [0; 8]; let mut pending = 0; let mut nodes = ss_stats::problem_types::RecordStore::new().unwrap();
+        replay_dup_prim(&map, &map, &file, &spill, &[1;8], true,
+            &mut distinct, &mut pending, &mut nodes).unwrap();
+        assert_eq!(nodes.len(), 1); let node = nodes.get(0).unwrap(); assert_eq!(node.count, count);
+        assert_eq!(node.rep.key, 1); assert_eq!(pending, 0);
+        let path = spill.path(spill_bucket(0)).with_extension("ordered-members");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), count as u64 * 24);
+    }
+
     use super::*;
 
     // ---- array_shallow_size: must match Java's array getBodySize ----

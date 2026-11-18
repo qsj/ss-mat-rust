@@ -67,6 +67,12 @@ impl StringDupCollector {
         r.top_groups = sorted.into_iter().take(200).collect();
     }
 
+    pub fn set_streamed_results(&self, total: usize, unique: usize, count: usize, wasted: i64, top: Vec<DupStringGroup>) {
+        let mut r = self.inner.lock().unwrap();
+        r.total_strings=total; r.unique_strings=unique; r.duplicate_group_count=count;
+        r.wasted_bytes=wasted; r.top_groups=top;
+    }
+
     pub fn get_report(&self) -> StringDupReport {
         let r = self.inner.lock().unwrap();
         StringDupReport {
@@ -82,5 +88,23 @@ impl StringDupCollector {
     /// Record the aligned String body size used by the waste formula.
     pub fn set_string_body_size(&self, size: i64) {
         self.inner.lock().unwrap().string_body_size = size;
+    }
+}
+
+#[cfg(test)]
+mod streamed_tests {
+    use super::*;
+    #[test]
+    fn streamed_totals_are_not_limited_to_rendered_prefix() {
+        for count in [0usize, 201, 10000] {
+            let collector=StringDupCollector::new();
+            let top=(0..count.min(200)).map(|_| DupStringGroup { content:String::new(),count:2,
+                wasted_bytes:7,backing_array_count:1,sample_obj_ids:Vec::new() }).collect();
+            collector.set_streamed_results(count*2,count,count,(count*7) as i64,top);
+            let report=collector.get_report();
+            assert_eq!(report.duplicate_group_count,count);
+            assert_eq!(report.wasted_bytes,(count*7) as i64);
+            assert_eq!(report.top_groups.len(),count.min(200));
+        }
     }
 }

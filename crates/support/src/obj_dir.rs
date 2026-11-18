@@ -30,8 +30,8 @@ pub const BLOCK_BYTES: usize = BLOCK_RECS as usize * OBJ_REC_SIZE;
 
 const MAGIC: u64 = 0x5353_4f42_4a44_4952;
 
-/// Build bucket count; buckets are selected by the high byte of the address.
-const BUCKETS: usize = 256;
+/// Sort data/permutation/I/O budget; fixed metadata and paths are additional.
+const SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ObjRec {
@@ -143,7 +143,10 @@ impl ObjDir {
         }
         let blocks = n.div_ceil(BLOCK_RECS);
         let coarse_bytes = blocks * 8;
-        if file_len < 16 + coarse_bytes {
+        let expected = n.checked_mul(OBJ_REC_SIZE as u64)
+            .and_then(|bytes| bytes.checked_add(coarse_bytes))
+            .and_then(|bytes| bytes.checked_add(16));
+        if expected != Some(file_len) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir truncated"));
         }
         let coarse_off = file_len - 16 - coarse_bytes;
@@ -266,176 +269,164 @@ impl ObjDir {
     }
 }
 
-/// Building side: records spill to one sequential file, then a sample of the
-/// addresses picks 256 range boundaries so every bucket holds roughly the same
-/// number of records. Bucketing by the high address byte is not usable here —
-/// JVM heaps keep every object inside a narrow address range, so one bucket would
-/// swallow the whole dump.
+/// Spills records, externally sorts, and streams coarse anchors.
 pub struct ObjDirBuilder {
     dir: PathBuf,
     spill: Option<BufWriter<File>>,
     pushed: u64,
-    sample: Vec<u64>,
-    sample_stride: u64,
 }
-
-const SAMPLE_TARGET: usize = 8192;
-
 impl ObjDirBuilder {
     pub fn new(temp_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(temp_dir)?;
         let dir = temp_dir.join(format!("objdir-{}-{}", std::process::id(), now_nanos()));
-        std::fs::create_dir_all(&dir)?;
-        let spill = File::create(dir.join("spill"))?;
-        Ok(Self {
-            dir,
-            spill: Some(BufWriter::new(spill)),
-            pushed: 0,
-            sample: Vec::with_capacity(SAMPLE_TARGET),
-            sample_stride: 1,
-        })
+        std::fs::create_dir(&dir)?;
+        let mut b = Self { dir, spill: None, pushed: 0 };
+        b.spill = Some(BufWriter::new(File::create(b.dir.join("spill"))?));
+        Ok(b)
     }
-
-    /// Append one record to the spill file and feed the address sample.
     pub fn push(&mut self, rec: ObjRec) -> io::Result<()> {
-        let w = self.spill.as_mut().expect("spill writer");
-        w.write_all(&rec.to_bytes())?;
+        self.spill.as_mut().expect("spill writer").write_all(&rec.to_bytes())?;
         self.pushed += 1;
         Ok(())
     }
-
-    pub fn len(&self) -> u64 {
-        self.pushed
+    pub fn len(&self) -> u64 { self.pushed }
+    pub fn is_empty(&self) -> bool { self.pushed == 0 }
+    pub fn finish(self, out: &Path, cache: usize) -> io::Result<ObjDir> {
+        self.finish_with_sort_budget(out, cache, SORT_BUFFER_BYTES)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.pushed == 0
-    }
-
-    /// Address sample taken uniformly by record position over the spill file.
-    ///
-    /// The push-time reservoir thinned with a growing stride, which is wrong as soon
-    /// as addresses are monotone (a real dump is): the retained sample covered only
-    /// the first fraction of the range, every quantile bound collapsed onto the same
-    /// value, and one bucket absorbed the whole dump. Position-uniform sampling has
-    /// no such bias.
-    fn uniform_sample(&self, spill: &Path) -> io::Result<Vec<u64>> {
-        if self.pushed == 0 {
-            return Ok(Vec::new());
-        }
-        let stride = (self.pushed / SAMPLE_TARGET as u64).max(1);
-        let mut out: Vec<u64> = Vec::with_capacity(SAMPLE_TARGET + 1);
-        let mut reader = std::io::BufReader::new(File::open(spill)?);
-        let mut rec = [0u8; OBJ_REC_SIZE];
-        let mut i: u64 = 0;
-        loop {
-            match reader.read_exact(&mut rec) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+    /// Override buffer capacity; fixed sorter/path overhead is additional.
+    #[doc(hidden)]
+    pub fn finish_with_sort_budget(mut self, out: &Path, cache: usize, budget: usize) -> io::Result<ObjDir> {
+        let result = (|| {
+            if let Some(mut w) = self.spill.take() { w.flush()?; }
+            let spill = self.dir.join("spill");
+            let expected = self.pushed.checked_mul(OBJ_REC_SIZE as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "objdir count overflow"))?;
+            if std::fs::metadata(&spill)?.len() != expected {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir spill length/count mismatch"));
             }
-            if i % stride == 0 {
-                out.push(ObjRec::from_bytes(&rec).addr);
+            let sorted = self.dir.join("sorted");
+            let count = crate::external_sort::ExternalSorter::new(OBJ_REC_SIZE, budget)
+                .sort_file(&spill, &sorted, |r| ObjRec::from_bytes(r).addr)?;
+            if count != self.pushed || std::fs::metadata(&sorted)?.len() != expected {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir sorted length/count mismatch"));
             }
-            i += 1;
-        }
-        Ok(out)
-    }
-
-    fn boundaries_from(&self, mut s: Vec<u64>) -> Vec<u64> {
-        if s.is_empty() {
-            return vec![0; BUCKETS + 1];
-        }
-        s.sort_unstable();
-        let mut out = Vec::with_capacity(BUCKETS + 1);
-        for i in 0..=BUCKETS {
-            let pos = (i * s.len()) / BUCKETS;
-            out.push(if pos == 0 { 0 } else { s[(pos - 1).min(s.len() - 1)] });
-        }
-        out
-    }
-
-    fn bucket_of(bounds: &[u64], addr: u64) -> usize {
-        match bounds.binary_search(&addr) {
-            Ok(i) => i.min(BUCKETS - 1),
-            Err(i) => i.saturating_sub(1).min(BUCKETS - 1),
-        }
-    }
-
-    /// Partition, sort and concatenate, then open the finished directory.
-    pub fn finish(mut self, out_path: &Path, cache_bytes: usize) -> io::Result<ObjDir> {
-        if let Some(mut w) = self.spill.take() {
-            w.flush()?;
-        }
-        let spill_path = self.dir.join("spill");
-        let bounds = self.boundaries_from(self.uniform_sample(&spill_path)?);
-
-        // 1. Range-partition the spill file.
-        let mut writers: Vec<Option<BufWriter<File>>> = (0..BUCKETS).map(|_| None).collect();
-        let mut counts = vec![0u64; BUCKETS];
-        {
-            let mut input = std::io::BufReader::new(File::open(&spill_path)?);
-            let mut rec = [0u8; OBJ_REC_SIZE];
-            loop {
-                match input.read_exact(&mut rec) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
+            let anchors = self.dir.join("anchors");
+            {
+                let mut input = std::io::BufReader::new(File::open(&sorted)?);
+                let mut coarse = BufWriter::new(File::create(&anchors)?);
+                let mut bytes = [0; OBJ_REC_SIZE];
+                let mut previous = None;
+                for i in 0..count {
+                    input.read_exact(&mut bytes)?;
+                    let addr = ObjRec::from_bytes(&bytes).addr;
+                    if previous == Some(addr) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            format!("objdir duplicate address 0x{addr:016x}")));
+                    }
+                    if previous.is_some_and(|p| p > addr) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir addresses out of order"));
+                    }
+                    previous = Some(addr);
+                    if i % BLOCK_RECS == 0 { coarse.write_all(&addr.to_le_bytes())?; }
                 }
-                let addr = ObjRec::from_bytes(&rec).addr;
-                let b = Self::bucket_of(&bounds, addr);
-                if writers[b].is_none() {
-                    writers[b] = Some(BufWriter::new(File::create(self.dir.join(format!("b{:03}", b)))?));
+                if input.read(&mut bytes[..1])? != 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir sorted trailing bytes"));
                 }
-                writers[b].as_mut().expect("bucket writer").write_all(&rec)?;
-                counts[b] += 1;
+                coarse.flush()?;
             }
-        }
-        for w in writers.iter_mut().flatten() {
-            w.flush()?;
-        }
-        drop(writers);
-        let _ = std::fs::remove_file(&spill_path);
-
-        // 2. Sort each bucket in memory (one bucket at a time) and concatenate.
-        let mut out = BufWriter::new(File::create(out_path)?);
-        let mut coarse: Vec<u64> = Vec::with_capacity((self.pushed / BLOCK_RECS) as usize + 2);
-        let mut written: u64 = 0;
-        for bucket in 0..BUCKETS {
-            if counts[bucket] == 0 {
-                continue;
+            {
+                let mut output = BufWriter::new(std::fs::OpenOptions::new().append(true).open(&sorted)?);
+                let mut input = File::open(&anchors)?;
+                let mut buf = [0; 8192];
+                loop { let n = input.read(&mut buf)?; if n == 0 { break; } output.write_all(&buf[..n])?; }
+                output.write_all(&count.to_le_bytes())?;
+                output.write_all(&MAGIC.to_le_bytes())?;
+                output.flush()?;
             }
-            let path = self.dir.join(format!("b{:03}", bucket));
-            let mut raw = Vec::with_capacity(counts[bucket] as usize * OBJ_REC_SIZE);
-            File::open(&path)?.read_to_end(&mut raw)?;
-            if raw.len() % OBJ_REC_SIZE != 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "bucket size not a multiple of record size"));
-            }
-            let mut recs: Vec<ObjRec> = raw.chunks_exact(OBJ_REC_SIZE).map(ObjRec::from_bytes).collect();
-            raw = Vec::new();
-            recs.sort_unstable_by_key(|r| r.addr);
-            let mut buf: Vec<u8> = Vec::with_capacity(recs.len() * OBJ_REC_SIZE);
-            for rec in &recs {
-                if written % BLOCK_RECS == 0 {
-                    coarse.push(rec.addr);
-                }
-                buf.extend_from_slice(&rec.to_bytes());
-                written += 1;
-            }
-            out.write_all(&buf)?;
-            drop(recs);
-            let _ = std::fs::remove_file(&path);
+            publish_directory(&sorted, out)?;
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(&self.dir);
+        match (result, cleanup) {
+            (Err(original), Err(cleanup)) => return Err(io::Error::new(original.kind(),
+                CleanupError { original, cleanup, path: self.dir.clone() })),
+            (Err(original), _) => return Err(original),
+            (_, Err(cleanup)) => return Err(io::Error::new(cleanup.kind(),
+                format!("objdir output published but scratch cleanup failed at {}: {cleanup}", self.dir.display()))),
+            _ => {}
         }
-
-        for addr in &coarse {
-            out.write_all(&addr.to_le_bytes())?;
-        }
-        out.write_all(&written.to_le_bytes())?;
-        out.write_all(&MAGIC.to_le_bytes())?;
-        out.flush()?;
+        ObjDir::open(out, cache)
+    }
+}
+impl Drop for ObjDirBuilder {
+    fn drop(&mut self) {
+        self.spill.take();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
-        ObjDir::open(out_path, cache_bytes)
+#[derive(Debug)]
+struct CleanupError { original: io::Error, cleanup: io::Error, path: PathBuf }
+impl std::fmt::Display for CleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; objdir cleanup failed at {}: {}", self.original, self.path.display(), self.cleanup)
+    }
+}
+impl std::error::Error for CleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.original) }
+}
+
+fn publish_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    match std::fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => stage_directory(source, destination, |src, dst| {
+            let mut buf = [0; 8192];
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 { break; }
+                dst.write_all(&buf[..n])?;
+            }
+            Ok(())
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+struct Staging(PathBuf);
+impl Drop for Staging {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+fn stage_directory(source: &Path, destination: &Path,
+    copy: impl FnOnce(&mut File, &mut File) -> io::Result<()>) -> io::Result<()> {
+    let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let (staging, mut output) = loop {
+        let path = parent.join(format!(".objdir-stage-{}-{}", std::process::id(), now_nanos()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break (Staging(path), file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        let mut input = File::open(source)?;
+        let expected = input.metadata()?.len();
+        copy(&mut input, &mut output)?;
+        output.flush()?;
+        if output.metadata()?.len() != expected || input.metadata()?.len() != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "objdir publication length changed"));
+        }
+        drop(output);
+        std::fs::rename(&staging.0, destination)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(original) => match std::fs::remove_file(&staging.0) {
+            Ok(()) => Err(original),
+            Err(cleanup) => Err(io::Error::new(original.kind(), CleanupError {
+                original, cleanup, path: staging.0.clone()
+            })),
+        },
     }
 }
 
@@ -460,6 +451,27 @@ mod tests {
             elem: 1,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn staged_publication_preserves_old_output_and_cleans_failures() {
+        let dir = std::env::temp_dir().join(format!("objdir-stage-test-{}-{}", std::process::id(), now_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source"); let out = dir.join("out");
+        std::fs::write(&source, b"new directory").unwrap();
+        std::fs::write(&out, b"old directory").unwrap();
+        let err = stage_directory(&source, &out, |_, dst| {
+            dst.write_all(b"partial")?;
+            Err(io::Error::new(io::ErrorKind::Other, "injected copy failure"))
+        }).unwrap_err();
+        assert!(err.to_string().contains("injected copy failure"));
+        assert_eq!(std::fs::read(&out).unwrap(), b"old directory");
+        assert!(stage_directory(&source, &out, |_, dst| dst.write_all(b"short")).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"old directory");
+        stage_directory(&source, &out, |src, dst| { io::copy(src, dst)?; Ok(()) }).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new directory");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".objdir-stage-")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

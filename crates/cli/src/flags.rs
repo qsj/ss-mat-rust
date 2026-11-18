@@ -44,8 +44,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 8)]
     pub cache_mb: u64,
 
-    /// Temporary-disk budget in GB, checked before the run starts (default: 4)
-    #[arg(long, default_value_t = 4)]
+    /// Temporary-disk budget in GB (default: 0 = auto from object count and free space)
+    #[arg(long, default_value_t = 0)]
     pub disk_budget_gb: u64,
 }
 

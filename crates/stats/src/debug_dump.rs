@@ -34,6 +34,76 @@ pub struct DupPrimMemberDebug {
     pub container_backing: bool,
 }
 
+/// Disk-backed complete S14 membership. Records retain producer order and
+/// duplicate multiplicity; callers may visit repeatedly without materializing it.
+pub struct DupPrimMemberStore {
+    file: File,
+    count: u64,
+    offset: u64,
+}
+
+impl DupPrimMemberStore {
+    pub fn create(
+        members: impl IntoIterator<Item = std::io::Result<DupPrimMemberDebug>>,
+    ) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::var_os("SS_MAT_TEMP_DIR")
+            .filter(|v| !v.is_empty()).map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let (path, file) = loop {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("ss-mat-members-{}-{}", std::process::id(), serial));
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        // Only this invocation's create_new file is unlinked. The descriptor
+        // owns its lifetime, including early iterator/write failures.
+        std::fs::remove_file(path)?;
+        let mut count = 0;
+        {
+            let mut writer = BufWriter::with_capacity(64 << 10, &file);
+            for member in members {
+                let member = member?;
+                writer.write_all(&member.obj_id.to_le_bytes())?;
+                writer.write_all(&[u8::from(member.string_backing), u8::from(member.container_backing)])?;
+                count += 1;
+            }
+            writer.flush()?;
+        }
+        Ok(Self { file, count, offset: 0 })
+    }
+
+    pub fn len(&self) -> u64 { self.count }
+    pub fn is_empty(&self) -> bool { self.count == 0 }
+
+    pub fn visit(
+        &self,
+        mut f: impl FnMut(DupPrimMemberDebug) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut buffer = [0u8; 10 * 4096];
+        let mut at = 0;
+        while at < self.count {
+            let records = (self.count - at).min(4096) as usize;
+            let bytes = &mut buffer[..records * 10];
+            self.file.read_exact_at(bytes, self.offset + at * 10)?;
+            for raw in bytes.chunks_exact(10) {
+                f(DupPrimMemberDebug {
+                    obj_id: u64::from_le_bytes(raw[..8].try_into().unwrap()),
+                    string_backing: raw[8] != 0,
+                    container_backing: raw[9] != 0,
+                })?;
+            }
+            at += records as u64;
+        }
+        Ok(())
+    }
+}
+
 /// One confirmed duplicate group as seen by `detect_duplicate_prim_arrays`.
 #[derive(Clone)]
 pub struct DupPrimGroupDebug {
@@ -112,11 +182,76 @@ pub fn record_dup_obj_groups(groups: Vec<DupObjGroupDebug>) {
     *DUP_OBJ_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap() = groups;
 }
 
-static DUP_PRIM_GROUPS: OnceLock<Mutex<Vec<DupPrimGroupDebug>>> = OnceLock::new();
+struct StoredPrimGroup {
+    metadata: DupPrimGroupDebug,
+    members: DupPrimMemberStore,
+}
+
+impl std::ops::Deref for StoredPrimGroup {
+    type Target = DupPrimGroupDebug;
+    fn deref(&self) -> &Self::Target { &self.metadata }
+}
+
+struct PrimRegistry {
+    rows: crate::problem_types::RecordStore<PrimDebugRow>,
+    members: DupPrimMemberStore,
+    classes: Vec<String>,
+}
+struct PrimDebugRow([u64; 9]);
+impl crate::problem_types::StoredRecord for PrimDebugRow {
+    const WIDTH: usize = 72;
+    fn encode(&self,r:&mut [u8]) { for (raw,n) in r.chunks_exact_mut(8).zip(self.0) {raw.copy_from_slice(&n.to_le_bytes());} }
+    fn decode(r:&[u8])->Self {let mut a=[0;9]; for (n,raw) in a.iter_mut().zip(r.chunks_exact(8)){*n=u64::from_le_bytes(raw.try_into().unwrap());} Self(a)}
+}
+impl PrimRegistry {
+    fn new()->std::io::Result<Self> { Ok(Self {rows:crate::problem_types::RecordStore::new()?, members:DupPrimMemberStore::create(std::iter::empty())?,classes:Vec::new()}) }
+    fn push(&mut self, metadata:DupPrimGroupDebug, members:DupPrimMemberStore)->std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let class = if let Some(i)=self.classes.iter().position(|n| *n==metadata.class_name){i} else {self.classes.push(metadata.class_name);self.classes.len()-1};
+        let offset=self.members.count*10;
+        members.visit(|m| {
+            let mut raw=[0;10];raw[..8].copy_from_slice(&m.obj_id.to_le_bytes());raw[8]=u8::from(m.string_backing);raw[9]=u8::from(m.container_backing);
+            self.members.file.write_all_at(&raw,self.members.count*10)?; self.members.count+=1;Ok(())
+        })?;
+        self.rows.push(PrimDebugRow([class as u64,metadata.array_length as u64,metadata.element_size as u64,
+            metadata.body_size as u64,metadata.count as u64,metadata.wasted_bytes as u64,metadata.content_hash,offset,members.count]))
+    }
+    fn get(&self,index:u64)->std::io::Result<StoredPrimGroup>{
+        let r=self.rows.get(index)?.0;
+        Ok(StoredPrimGroup {metadata:DupPrimGroupDebug {class_name:self.classes[r[0] as usize].clone(),array_length:r[1] as i32,
+            element_size:r[2] as i32,body_size:r[3] as i64,count:r[4] as usize,wasted_bytes:r[5] as i64,content_hash:r[6],members:Vec::new()},
+            members:DupPrimMemberStore {file:self.members.file.try_clone()?,count:r[8],offset:r[7]}})
+    }
+}
+
+/// Add one group whose complete membership has already been spilled.
+/// Group arrival order remains the stable tie-breaker in forensic output.
+pub fn record_dup_prim_group_store(
+    metadata: DupPrimGroupDebug,
+    members: DupPrimMemberStore,
+) -> std::io::Result<()> {
+    if !metadata.members.is_empty() || metadata.count as u64 != members.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "inconsistent S14 streamed membership"));
+    }
+    let mut previous = None;
+    members.visit(|member| {
+        if previous.is_some_and(|addr| addr > member.obj_id) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "S14 member store is not address ordered"));
+        }
+        previous = Some(member.obj_id);
+        Ok(())
+    })?;
+    let mut registry=group_store().lock().unwrap();
+    if registry.is_none(){*registry=Some(PrimRegistry::new()?);}
+    registry.as_mut().unwrap().push(metadata,members)?;
+    Ok(())
+}
+
+static DUP_PRIM_GROUPS: OnceLock<Mutex<Option<PrimRegistry>>> = OnceLock::new();
 static DUP_PRIM_TOTALS: OnceLock<Mutex<DupPrimScanTotals>> = OnceLock::new();
 
-fn group_store() -> &'static Mutex<Vec<DupPrimGroupDebug>> {
-    DUP_PRIM_GROUPS.get_or_init(|| Mutex::new(Vec::new()))
+fn group_store() -> &'static Mutex<Option<PrimRegistry>> {
+    DUP_PRIM_GROUPS.get_or_init(|| Mutex::new(None))
 }
 
 fn totals_store() -> &'static Mutex<DupPrimScanTotals> {
@@ -125,10 +260,13 @@ fn totals_store() -> &'static Mutex<DupPrimScanTotals> {
 
 /// Store duplicate-group forensics. No-op unless the debug switch is on.
 pub fn record_dup_prim_groups(groups: Vec<DupPrimGroupDebug>) {
-    if groups.is_empty() {
-        return;
+    for mut metadata in groups {
+        let mut members = std::mem::take(&mut metadata.members);
+        members.sort_by_key(|m| m.obj_id);
+        let members = DupPrimMemberStore::create(members.into_iter().map(Ok))
+            .expect("spill S14 forensic members");
+        record_dup_prim_group_store(metadata, members).expect("record S14 forensic members");
     }
-    group_store().lock().unwrap().extend(groups);
 }
 
 pub fn record_dup_prim_totals(totals: DupPrimScanTotals) {
@@ -165,18 +303,31 @@ pub struct S14DumpSummary {
 pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io::Result<S14DumpSummary> {
     std::fs::create_dir_all(dir)?;
 
-    let mut groups = group_store().lock().unwrap().clone();
-    // Deterministic order: biggest waste first, then class/len/hash.
-    groups.sort_by(|a, b| {
-        b.wasted_bytes
-            .cmp(&a.wasted_bytes)
-            .then_with(|| a.class_name.cmp(&b.class_name))
-            .then_with(|| a.array_length.cmp(&b.array_length))
-            .then_with(|| a.content_hash.cmp(&b.content_hash))
-    });
+    let store = group_store().lock().unwrap();
+    let scratch=DebugScratch::new()?;
+    let input=scratch.0.join("s14-input"); let sorted=scratch.0.join("s14-sorted");
+    let group_count=store.as_ref().map_or(0,|s|s.rows.len());
+    let mut writer=BufWriter::new(File::create(&input)?);
+    if let Some(store)=store.as_ref(){
+        let mut class_order:Vec<_>=(0..store.classes.len()).collect();
+        class_order.sort_by(|a,b|store.classes[*a].cmp(&store.classes[*b]));
+        for (i,row) in store.rows.iter().enumerate(){
+            let r=row?.0;
+            let rank=class_order.iter().position(|v| *v==r[0] as usize).unwrap() as u64;
+            for n in [!(r[5]^(1u64<<63)),rank,(r[1] as i32 as i64 as u64)^(1u64<<63),r[6],i as u64]{writer.write_all(&n.to_le_bytes())?;}
+        }
+    }
+    writer.flush()?;
+    crate::problem_types::sort_record_keys(&input,&sorted,40,&[0,8,16,24,32])?;
+    let ordered=File::open(sorted)?;
+    let group_at=|i:u64|->std::io::Result<StoredPrimGroup>{
+        use std::os::unix::fs::FileExt;
+        let mut raw=[0;8];ordered.read_exact_at(&mut raw,i*40+32)?;
+        store.as_ref().unwrap().get(u64::from_le_bytes(raw))
+    };
 
     let mut summary = S14DumpSummary {
-        groups: groups.len(),
+        groups: group_count as usize,
         arrays_in_groups: 0,
         waste_bytes: 0,
         live_members: 0,
@@ -188,11 +339,12 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
         groups_all_live: 0,
     };
 
-    for g in &groups {
+    for i in 0..group_count {
+        let g=group_at(i)?;
         summary.arrays_in_groups += g.count;
         summary.waste_bytes += g.wasted_bytes;
         let mut live = 0usize;
-        for m in &g.members {
+        g.members.visit(|m| {
             if live_prim_obj_ids.contains(&m.obj_id) {
                 live += 1;
             }
@@ -202,7 +354,8 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
             if m.container_backing {
                 summary.container_backing_members += 1;
             }
-        }
+            Ok(())
+        })?;
         summary.live_members += live;
         summary.garbage_members += g.count - live;
         if live == g.count {
@@ -224,16 +377,19 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
             out,
             "group_id\tclass_name\tarray_length\telement_size\tbody_size\tcount\twaste_bytes\tcontent_hash\tmember_live\tmember_garbage\tmember_string_backing\tmember_container_backing\trep_obj_id_hex\trep_obj_id_dec\tdetector_excludes_string_backing\tdetector_excludes_container_backing"
         )?;
-        for (i, g) in groups.iter().enumerate() {
+        for i in 0..group_count {
+            let g=group_at(i)?;
             let group_id = i + 1;
-            let live = g
-                .members
-                .iter()
-                .filter(|m| live_prim_obj_ids.contains(&m.obj_id))
-                .count();
-            let string_backing = g.members.iter().filter(|m| m.string_backing).count();
-            let container_backing = g.members.iter().filter(|m| m.container_backing).count();
-            let rep = g.members.iter().map(|m| m.obj_id).min().unwrap_or(0);
+            let (mut live, mut string_backing, mut container_backing) = (0, 0, 0);
+            let mut rep = None;
+            g.members.visit(|m| {
+                live += usize::from(live_prim_obj_ids.contains(&m.obj_id));
+                string_backing += usize::from(m.string_backing);
+                container_backing += usize::from(m.container_backing);
+                rep = Some(rep.map_or(m.obj_id, |r: u64| r.min(m.obj_id)));
+                Ok(())
+            })?;
+            let rep = rep.unwrap_or(0);
             writeln!(
                 out,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t0\t0",
@@ -253,6 +409,7 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
                 rep,
             )?;
         }
+        out.flush()?;
     }
 
     {
@@ -261,11 +418,10 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
             out,
             "group_id\tobj_id_hex\tobj_id_dec\tlive\tstring_backing\tcontainer_backing\tclass_name\tarray_length\tbody_size\tcontent_hash"
         )?;
-        for (i, g) in groups.iter().enumerate() {
+        for i in 0..group_count {
+            let g=group_at(i)?;
             let group_id = i + 1;
-            let mut members: Vec<&DupPrimMemberDebug> = g.members.iter().collect();
-            members.sort_by_key(|m| m.obj_id);
-            for m in members {
+            g.members.visit(|m| {
                 writeln!(
                     out,
                     "{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:016x}",
@@ -280,8 +436,10 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
                     g.body_size,
                     g.content_hash,
                 )?;
-            }
+                Ok(())
+            })?;
         }
+        out.flush()?;
     }
 
     let totals = *totals_store().lock().unwrap();
@@ -322,10 +480,11 @@ pub fn write_s14_bundle(dir: &Path, live_prim_obj_ids: &HashSet<u64>) -> std::io
     let _ = writeln!(text, "groups_all_garbage\t{}", summary.groups_all_garbage);
     let _ = writeln!(text);
     let _ = writeln!(text, "# Per-class breakdown (groups, arrays, waste_bytes)");
-    let mut per_class: std::collections::HashMap<&str, (usize, usize, i64)> =
+    let mut per_class: std::collections::HashMap<String, (usize, usize, i64)> =
         std::collections::HashMap::new();
-    for g in &groups {
-        let e = per_class.entry(g.class_name.as_str()).or_insert((0, 0, 0));
+    for i in 0..group_count {
+        let g=group_at(i)?;
+        let e = per_class.entry(g.class_name.clone()).or_insert((0, 0, 0));
         e.0 += 1;
         e.1 += g.count;
         e.2 += g.wasted_bytes;
@@ -455,6 +614,60 @@ pub fn write_ref_chains(dir: &Path, store: &crate::ref_chain::RefChainStore) -> 
 // ---------------------------------------------------------------------------
 // Aggregate problem forensics (S8/S9/S10/S11/S12 totals per class)
 // ---------------------------------------------------------------------------
+
+struct DebugScratch(std::path::PathBuf);
+impl DebugScratch {
+    fn new() -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = std::env::temp_dir().join(format!("ss-mat-debug-sort-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+impl Drop for DebugScratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+pub struct StringDebugStore {
+    rows: crate::problem_types::RecordStore<StringDebugRow>,
+    details: Vec<DupStringGroup>,
+}
+struct StringDebugRow { count: u64, waste: i64, backing: u64, detail: u64, hash: u64 }
+impl crate::problem_types::StoredRecord for StringDebugRow {
+    const WIDTH: usize = 40;
+    fn encode(&self, raw: &mut [u8]) {
+        for (chunk, value) in raw.chunks_exact_mut(8).zip([self.count,self.waste as u64,self.backing,self.detail,self.hash]) { chunk.copy_from_slice(&value.to_le_bytes()); }
+    }
+    fn decode(raw: &[u8]) -> Self {
+        let n = |i| u64::from_le_bytes(raw[i..i+8].try_into().unwrap());
+        Self { count:n(0), waste:n(8) as i64, backing:n(16), detail:n(24), hash:n(32) }
+    }
+}
+impl StringDebugStore {
+    pub fn new() -> std::io::Result<Self> { Ok(Self { rows: crate::problem_types::RecordStore::new()?, details: Vec::new() }) }
+    pub fn push(&mut self, g: &DupStringGroup) -> std::io::Result<()> {
+        let detail = if !g.content.is_empty() || !g.sample_obj_ids.is_empty() {
+            if self.details.len() >= 200 { return Err(std::io::Error::other("S8 detail exceeds baseline top200")); }
+            self.details.push(g.clone()); self.details.len() as u64
+        } else { 0 };
+        self.rows.push(StringDebugRow { count:g.count as u64,waste:g.wasted_bytes,backing:g.backing_array_count as u64,detail,hash:fnv1a64(g.content.as_bytes()) })
+    }
+    fn group(&self, index: u64) -> std::io::Result<DupStringGroup> {
+        let row = self.rows.get(index)?;
+        Ok(if row.detail != 0 { self.details[row.detail as usize-1].clone() } else {
+            DupStringGroup { content:String::new(), count:row.count as usize,wasted_bytes:row.waste,
+                backing_array_count:row.backing as usize,sample_obj_ids:Vec::new() }
+        })
+    }
+}
+static STREAM_STRING_GROUPS: OnceLock<Mutex<Option<StringDebugStore>>> = OnceLock::new();
+pub fn record_dup_string_store(store: StringDebugStore) {
+    *STREAM_STRING_GROUPS.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(store);
+}
 
 static DUP_STRING_GROUPS: OnceLock<Mutex<Vec<DupStringGroup>>> = OnceLock::new();
 
@@ -987,7 +1200,9 @@ pub fn write_problem_bundle(
 
     {
         let records = stats.bad_collection_records.lock().unwrap();
-        for r in records.iter() {
+        let store=stats.bad_collection_store.lock().unwrap();
+        for r in store.as_ref().into_iter().flat_map(|s|s.iter()).chain(records.iter().filter(|_|store.is_none()).cloned().map(Ok)) {
+            let r=r?;
             if r.kind == COLLECTION_KIND_NONE {
                 continue;
             }
@@ -1006,18 +1221,20 @@ pub fn write_problem_bundle(
 
     // Java never runs processObjectArray() for container backing arrays; the
     // scan does, so exclude them here exactly like the report does.
-    let container_backing: HashSet<u64> = stats
-        .bad_collection_records
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| r.backing_array_id)
-        .filter(|id| *id != 0)
-        .collect();
+    let mut container_backing=HashSet::new();
+    {
+        let records=stats.bad_collection_records.lock().unwrap();
+        let store=stats.bad_collection_store.lock().unwrap();
+        for r in store.as_ref().into_iter().flat_map(|s|s.iter()).chain(records.iter().filter(|_|store.is_none()).cloned().map(Ok)) {
+            let id=r?.backing_array_id;if id!=0 {container_backing.insert(id);}
+        }
+    }
 
     {
         let records = stats.bad_array_records.lock().unwrap();
-        for r in records.iter() {
+            let store = stats.bad_array_store.lock().unwrap();
+        for r in store.as_ref().into_iter().flat_map(|s| s.iter()).chain(records.iter().filter(|_| store.is_none()).cloned().map(Ok)) {
+            let r = r?;
             if container_backing.contains(&r.obj_id) {
                 continue;
             }
@@ -1036,7 +1253,9 @@ pub fn write_problem_bundle(
 
     {
         let records = stats.bad_prim_array_records.lock().unwrap();
-        for r in records.iter() {
+            let store = stats.bad_prim_array_store.lock().unwrap();
+        for r in store.as_ref().into_iter().flat_map(|s| s.iter()).chain(records.iter().filter(|_| store.is_none()).cloned().map(Ok)) {
+            let r = r?;
             let idx = r.class_idx as usize;
             if idx >= aggs.len() {
                 continue;
@@ -1101,17 +1320,20 @@ pub fn write_problem_bundle(
             }
             writeln!(out)?;
         }
+        out.flush()?;
     }
 
     // ---- bad_collections.tsv (forensic S9 record dump) ----
     {
         let records = stats.bad_collection_records.lock().unwrap();
+        let store=stats.bad_collection_store.lock().unwrap();
         let mut out = BufWriter::with_capacity(1 << 20, File::create(dir.join("bad_collections.tsv"))?);
         writeln!(
             out,
             "class_name\tobj_index\tobj_address_hex\tkind\tsize\tbody_size\twaste\toverhead\tis_collection\tcategory_count"
         )?;
-        for r in records.iter() {
+        for r in store.as_ref().into_iter().flat_map(|s|s.iter()).chain(records.iter().filter(|_|store.is_none()).cloned().map(Ok)) {
+            let r=r?;
             if r.kind == crate::problem_types::COLLECTION_KIND_NONE {
                 continue;
             }
@@ -1127,17 +1349,36 @@ pub fn write_problem_bundle(
                 class_name, r.obj_id, kind, r.size, r.body, r.waste
             )?;
         }
+        out.flush()?;
     }
 
     // ---- s8_summary.tsv / s8_groups.tsv ----
     let report = stats.string_dup.get_report();
-    let mut groups = string_group_store().lock().unwrap().clone();
+    let streamed = STREAM_STRING_GROUPS.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    let mut groups = if streamed.is_some() { Vec::new() } else { string_group_store().lock().unwrap().clone() };
     groups.sort_by(|a, b| {
         b.wasted_bytes
             .cmp(&a.wasted_bytes)
             .then_with(|| fnv1a64(a.content.as_bytes()).cmp(&fnv1a64(b.content.as_bytes())))
             .then_with(|| b.count.cmp(&a.count))
     });
+
+    let scratch = DebugScratch::new()?;
+    let index_input = scratch.0.join("s8-index-input");
+    let index_sorted = scratch.0.join("s8-index-sorted");
+    let mut sorted_indices = None;
+    if let Some(store) = streamed.as_ref() {
+        let mut writer = BufWriter::new(File::create(&index_input)?);
+        for (index, row) in store.rows.iter().enumerate() {
+            let row = row?;
+            for value in [!(row.waste as u64 ^ (1u64<<63)), row.hash, !row.count, index as u64] {
+                writer.write_all(&value.to_le_bytes())?;
+            }
+        }
+        writer.flush()?;
+        crate::problem_types::sort_record_keys(&index_input, &index_sorted, 32, &[0,8,16,24])?;
+        sorted_indices = Some(std::io::BufReader::new(File::open(&index_sorted)?));
+    }
 
     {
         // Java schema: RefChainGroupReport(uniqueStringCount=total strings,
@@ -1153,6 +1394,7 @@ pub fn write_problem_bundle(
             "{}\t{}\t{}\t{}",
             report.total_strings, report.unique_strings, report.duplicate_group_count, report.wasted_bytes
         )?;
+        out.flush()?;
     }
 
     {
@@ -1161,7 +1403,14 @@ pub fn write_problem_bundle(
             out,
             "group_index\trepresentative_index\tobject_size\tunique_value_count\tduplicate_count\ttotal_waste\tgroup_id\trepresentative_object_group_id\trepresentative_class\trepresentative_body_size\trep_obj_id_hex\tcontent_hash\tcontent_len_chars\tcontent_preview\tsample_obj_ids_hex"
         )?;
-        for (i, g) in groups.iter().enumerate() {
+        for i in 0..streamed.as_ref().map_or(groups.len(), |s| s.rows.len() as usize) {
+            let owned;
+            let g = if let Some(store) = streamed.as_ref() {
+                use std::io::Read;
+                let mut raw = [0u8;32]; sorted_indices.as_mut().unwrap().read_exact(&mut raw)?;
+                owned = store.group(u64::from_le_bytes(raw[24..32].try_into().unwrap()))?;
+                &owned
+            } else { &groups[i] };
             let rep = g.sample_obj_ids.iter().copied().min().unwrap_or(0);
             let samples = g
                 .sample_obj_ids
@@ -1196,6 +1445,7 @@ pub fn write_problem_bundle(
                 samples,
             )?;
         }
+        out.flush()?;
     }
 
     // ---- s15_dup_obj_arrays.tsv (schema mirrors Java DebugDumper) ----
@@ -1288,6 +1538,7 @@ pub fn write_problem_bundle(
                 )?;
             }
         }
+        out.flush()?;
     }
 
     // ---- boxed_summary.tsv (schema mirrors Java DebugDumper) ----
@@ -1296,7 +1547,7 @@ pub fn write_problem_bundle(
         s8_unique_strings: report.unique_strings,
         s8_duplicate_values: report.duplicate_group_count,
         s8_wasted_bytes: report.wasted_bytes,
-        s8_groups_dumped: groups.len(),
+        s8_groups_dumped: streamed.as_ref().map_or(groups.len(), |s| s.rows.len() as usize),
         collection_total_objects: 0,
         collection_problem_count: 0,
         collection_overhead: 0,
@@ -1399,7 +1650,89 @@ pub fn write_problem_bundle(
                 )?;
             }
         }
+        out.flush()?;
     }
 
     Ok(summary)
+}
+
+#[cfg(test)]
+mod member_store_tests {
+    #[test]
+    fn truncated_debug_members_fail_without_fabricating_rows() {
+        let store=super::DupPrimMemberStore::create([Ok(super::DupPrimMemberDebug {obj_id:4,string_backing:true,container_backing:false})]).unwrap();
+        store.file.set_len(1).unwrap();
+        assert_eq!(store.visit(|_|panic!("partial member emitted")).unwrap_err().kind(),std::io::ErrorKind::UnexpectedEof);
+    }
+
+    use super::*;
+
+    #[test]
+    fn preserves_order_multiplicity_flags_and_repeated_visits() {
+        let store = DupPrimMemberStore::create((0..20000u64).map(|n| Ok(DupPrimMemberDebug {
+            obj_id: (20000 - n) / 3,
+            string_backing: n % 2 == 0,
+            container_backing: n % 5 == 0,
+        }))).unwrap();
+        assert_eq!(store.len(), 20000);
+        for _ in 0..2 {
+            let mut n = 0;
+            store.visit(|m| {
+                assert_eq!(m.obj_id, (20000 - n) / 3);
+                assert_eq!(m.string_backing, n % 2 == 0);
+                assert_eq!(m.container_backing, n % 5 == 0);
+                n += 1;
+                Ok(())
+            }).unwrap();
+            assert_eq!(n, 20000);
+        }
+    }
+
+    #[test]
+    fn handles_empty_and_propagates_producer_and_consumer_errors() {
+        let empty = DupPrimMemberStore::create(std::iter::empty()).unwrap();
+        assert!(empty.is_empty());
+        empty.visit(|_| panic!("empty store emitted a member")).unwrap();
+        assert!(DupPrimMemberStore::create([Err(std::io::Error::other("producer"))]).is_err());
+        let one = DupPrimMemberStore::create([Ok(DupPrimMemberDebug {
+            obj_id: 0, string_backing: false, container_backing: false,
+        })]).unwrap();
+        assert_eq!(one.visit(|_| Err(std::io::Error::other("consumer"))).unwrap_err().to_string(), "consumer");
+    }
+}
+
+#[cfg(test)]
+mod bundle_flush_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn empty_heap() -> ss_heap_model::heap_dump::HeapDump {
+        ss_heap_model::heap_dump::HeapDump {
+            classes:Vec::new(),class_by_name:Default::default(),roots:Vec::new(),total_object_count:0,
+            string_table:Default::default(),identifier_size:8,oop_size:4,alignment:8,header_size:12,
+            per_class_inst_count:Vec::new(),per_class_inst_bytes:Vec::new(),stack_traces:Default::default(),
+            thread_serial_map:Default::default(),thread_info:Vec::new(),timestamp_millis:0,obj_dir:None,
+        }
+    }
+
+    #[test]
+    fn empty_s14_bundle_reports_buffered_write_failures() {
+        for name in ["s14_groups.tsv", "s14_members.tsv"] {
+            let scratch=DebugScratch::new().unwrap();
+            symlink("/dev/full",scratch.0.join(name)).unwrap();
+            let error=write_s14_bundle(&scratch.0,&HashSet::new()).err().expect("flush must fail");
+            assert_eq!(error.raw_os_error(),Some(28));
+        }
+    }
+
+    #[test]
+    fn empty_problem_bundle_reports_every_buffered_write_failure() {
+        let heap=empty_heap();let stats=StatsEngine::new(&[]);
+        for name in ["problem_stats.tsv","bad_collections.tsv","s8_summary.tsv","s8_groups.tsv","s15_dup_obj_arrays.tsv","boxed_summary.tsv"] {
+            let scratch=DebugScratch::new().unwrap();
+            symlink("/dev/full",scratch.0.join(name)).unwrap();
+            let error=write_problem_bundle(&scratch.0,&stats,&heap).err().expect("flush must fail");
+            assert_eq!(error.raw_os_error(),Some(28),"{name}");
+        }
+    }
 }

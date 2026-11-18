@@ -1,139 +1,132 @@
 //! Bounded-memory external sort for fixed-size records.
 //!
-//! Records are routed to 256 bucket files by the high byte of their sort key, each
-//! bucket is sorted in memory when it fits the budget, and the buckets are
-//! concatenated in bucket order — which is globally sorted because the bucket
-//! index is the key's high byte.
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::ffi::OsString;
+//! Runs occupy consecutive ranges of two alternating scratch files. Run sizes
+//! are arithmetic, so neither file names nor run descriptors grow with input.
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Routing buckets: the bucket index is the key's high byte.
-const BUCKETS: usize = 256;
-
-/// Runs merged in one pass; bounds open handles and read buffers during a merge.
-const MAX_FANIN: usize = 32;
-
-/// Hard cap on one sort buffer, so record indices stay inside a `u32`.
-const MAX_RECORD_BUFFER: usize = 1 << 30;
-
-/// Bytes of record data currently held by the sorters of this process.
 static CUR_RECORD_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// High-water mark of `CUR_RECORD_BYTES`.
 static PEAK_RECORD_BYTES: AtomicUsize = AtomicUsize::new(0);
+static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 
-/// Peak bytes of record data held at once since the last reset.
-///
-/// Instrumentation for the memory-bound test; not part of the sorting contract.
+/// Peak live sort-buffer capacity, including permutations and I/O buffers.
 #[doc(hidden)]
-pub fn peak_buffered_record_bytes() -> usize {
-    PEAK_RECORD_BYTES.load(Ordering::Relaxed)
-}
-
-/// Forget the observed peak, so the next run measures from what is held now.
+pub fn peak_buffered_record_bytes() -> usize { PEAK_RECORD_BYTES.load(Ordering::Relaxed) }
 #[doc(hidden)]
 pub fn reset_peak_buffered_record_bytes() {
     PEAK_RECORD_BYTES.store(CUR_RECORD_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
-/// Sorts fixed-size records by a 64-bit key with bounded memory.
-pub struct ExternalSorter {
-    rec_size: usize,
-    mem_budget: usize,
-}
-
+pub struct ExternalSorter { rec_size: usize, mem_budget: usize }
 impl ExternalSorter {
-    /// `rec_size` is the fixed record width in bytes; `mem_budget` caps the
-    /// in-memory buffers used while sorting (single buckets are also capped by it).
-    pub fn new(rec_size: usize, mem_budget: usize) -> Self {
-        Self { rec_size, mem_budget }
-    }
+    /// Budget covers data, permutation and read/write buffer allocations.
+    /// Fixed stack state and a constant number of path strings are additional.
+    pub fn new(rec_size: usize, mem_budget: usize) -> Self { Self { rec_size, mem_budget } }
+    pub fn rec_size(&self) -> usize { self.rec_size }
+    pub fn mem_budget(&self) -> usize { self.mem_budget }
 
-    pub fn rec_size(&self) -> usize {
-        self.rec_size
-    }
-
-    pub fn mem_budget(&self) -> usize {
-        self.mem_budget
-    }
-
-    /// Sort `input` by the u64 key returned by `key` and write the records in
-    /// ascending key order to `out`. The sort is unstable: equal keys may appear in
-    /// any order. Returns the number of records written.
+    /// Sort by ascending key. Equal keys have an unspecified (unstable) order.
+    /// Budgets too small for two records and a permutation index are rejected.
     pub fn sort_file<K>(&self, input: &Path, out: &Path, key: K) -> io::Result<u64>
-    where
-        K: Fn(&[u8]) -> u64,
-    {
-        if self.rec_size == 0 {
-            return Err(invalid_input(
-                "ss-support: rec_size must be greater than zero",
-            ));
-        }
+    where K: Fn(&[u8]) -> u64 {
         let rec = self.rec_size;
-        let total = fs::metadata(input)?.len();
-        if total % rec as u64 != 0 {
-            return Err(invalid(format!(
-                "ss-support: input length {total} is not a multiple of rec_size {rec}"
-            )));
+        if rec == 0 || rec.checked_mul(2).and_then(|n| n.checked_add(4))
+            .is_none_or(|minimum| minimum > self.mem_budget) {
+            return Err(invalid_input("ss-support: budget must fit two records and an index"));
         }
-
-        // Every scratch file lives next to `out` and is removed when this guard drops,
-        // so a failure halfway through leaves no bucket behind.
-        let mut temps = Temps::default();
-        let mut buckets: Vec<PathBuf> = Vec::with_capacity(BUCKETS);
-        let route_cap = self.route_cap();
+        let mut input = File::open(input)?;
+        let total = input.metadata()?.len();
+        if total % rec as u64 != 0 { return Err(invalid("ss-support: truncated record")); }
+        let count = total / rec as u64;
+        let scratch = Scratch::new(out)?;
+        let result = (|| {
+        let mut source = scratch.0.join("a");
+        let mut target = scratch.0.join("b");
+        let io = (self.mem_budget / 8).min(32 * 1024);
+        let run_records = ((self.mem_budget - io) / (rec + 4)).min(u32::MAX as usize).max(1);
+        let capacity = run_records * rec;
         {
-            let bucket_cap = self.bucket_cap();
-            let mut writers: Vec<BufWriter<File>> = Vec::with_capacity(BUCKETS);
-            for index in 0..BUCKETS {
-                let path = sibling(out, &format!(".b{index:03}"));
-                temps.add(path.clone());
-                let file = File::create(&path)?;
-                buckets.push(path);
-                writers.push(BufWriter::with_capacity(bucket_cap, file));
+            let _held = Gauge::hold(capacity + run_records * 4 + io);
+            let mut buf = vec![0; capacity];
+            let mut sink = BufWriter::with_capacity(io, File::create(&source)?);
+            let mut left = count;
+            while left != 0 {
+                let n = left.min(run_records as u64) as usize;
+                input.read_exact(&mut buf[..n * rec])?;
+                emit_sorted(&buf[..n * rec], rec, &key, &mut sink)?;
+                left -= n as u64;
             }
-
-            let _held = Gauge::hold(route_cap + BUCKETS * bucket_cap);
-            let mut buf = vec![0u8; route_cap];
-            let mut src = File::open(input)?;
-            loop {
-                let read = fill(&mut src, &mut buf)?;
-                if read == 0 {
-                    break;
-                }
-                for record in buf[..read - read % rec].chunks_exact(rec) {
-                    let bucket = (key(record) >> 56) as usize;
-                    writers[bucket].write_all(record)?;
-                }
-                if read < buf.len() {
-                    break;
-                }
-            }
-            for writer in writers.iter_mut() {
-                writer.flush()?;
-            }
-        }
-
-        let mut written = 0u64;
-        {
-            let mut sink = BufWriter::with_capacity(self.io_cap(), File::create(out)?);
-            for path in &buckets {
-                if fs::metadata(path)?.len() == 0 {
-                    continue;
-                }
-                written += self.sort_bucket(path, &mut sink, &key, &mut temps)?;
-            }
+            require_eof(&mut input)?;
             sink.flush()?;
         }
-        Ok(written)
+        drop(input);
+        let mut width = run_records as u64;
+        while width < count {
+            self.merge_pass(&source, &target, width, count, &key)?;
+            std::mem::swap(&mut source, &mut target);
+            width = width.saturating_mul(self.fan_in() as u64);
+        }
+        // Publish only after all reads and merges succeed. The scratch is beside
+        // the destination, allowing rename without a second output-sized copy.
+        fs::rename(&source, out)?;
+        Ok(count)
+        })();
+        scratch.finish(result)
     }
 
+    fn fan_in(&self) -> usize {
+        (self.mem_budget / (self.rec_size + std::mem::size_of::<BufReader<File>>() + 24)).clamp(2, 32)
+    }
+
+    fn merge_pass<K>(&self, source: &Path, target: &Path, width: u64, count: u64, key: &K) -> io::Result<()>
+    where K: Fn(&[u8]) -> u64 {
+        let rec = self.rec_size;
+        let fan = self.fan_in();
+        // At tiny budgets keep descriptors on the stack and use unbuffered reads.
+        // The fixed array is stack state, not an input-sized allocation.
+        let mut readers: [Option<BufReader<File>>; 32] = std::array::from_fn(|_| None);
+        let cap = ((self.mem_budget - fan * rec) / (fan + 1)).min(32 * 1024);
+        let _held = Gauge::hold(fan * rec + (fan + 1) * cap);
+        for reader in &mut readers[..fan] {
+            *reader = Some(BufReader::with_capacity(cap, File::open(source)?));
+        }
+        let expected = count * rec as u64;
+        if fs::metadata(source)?.len() != expected { return Err(invalid("ss-support: run length changed")); }
+        let mut sink = BufWriter::with_capacity(cap, File::create(target)?);
+        let mut heads = vec![0; fan * rec];
+        let mut remaining = [0u64; 32];
+        let mut keys = [0u64; 32];
+        let mut start = 0;
+        while start < count {
+            for i in 0..fan {
+                let end = start.saturating_add(width).min(count);
+                remaining[i] = end - start;
+                let reader = readers[i].as_mut().unwrap();
+                reader.seek(SeekFrom::Start(start * rec as u64))?;
+                if remaining[i] != 0 {
+                    reader.read_exact(&mut heads[i * rec..(i + 1) * rec])?;
+                    keys[i] = key(&heads[i * rec..(i + 1) * rec]);
+                }
+                start = end;
+            }
+            loop {
+                let winner = (0..fan).filter(|&i| remaining[i] != 0).min_by_key(|&i| keys[i]);
+                let Some(i) = winner else { break };
+                let head = &mut heads[i * rec..(i + 1) * rec];
+                sink.write_all(head)?;
+                remaining[i] -= 1;
+                if remaining[i] != 0 {
+                    readers[i].as_mut().unwrap().read_exact(head)?;
+                    keys[i] = key(head);
+                }
+            }
+        }
+        sink.flush()?;
+        if fs::metadata(source)?.len() != expected { return Err(invalid("ss-support: run length changed")); }
+        Ok(())
+    }
     /// Stream an already-sorted file and call `f` once per run of equal keys with
     /// the first record of the run and the run length. Bounded memory.
     pub fn scan_groups<K, F>(&self, path: &Path, key: K, f: F) -> io::Result<()>
@@ -141,10 +134,9 @@ impl ExternalSorter {
         K: Fn(&[u8]) -> u64,
         F: FnMut(&[u8], u64),
     {
-        if self.rec_size == 0 {
-            return Err(invalid_input(
-                "ss-support: rec_size must be greater than zero",
-            ));
+        if self.rec_size == 0 || self.rec_size.checked_mul(2)
+            .is_none_or(|minimum| minimum > self.mem_budget) {
+            return Err(invalid_input("ss-support: group budget must fit two records"));
         }
         let rec = self.rec_size;
         let len = fs::metadata(path)?.len();
@@ -182,191 +174,68 @@ impl ExternalSorter {
                 run_len = 1;
             }
         }
+        require_eof(&mut reader)?;
         if run_len > 0 {
             f(&first, run_len);
         }
         Ok(())
     }
 
-    /// Read/write buffer for a single file handle.
-    fn io_cap(&self) -> usize {
-        (self.mem_budget / 32).clamp(1024, 32 * 1024)
-    }
-
-    /// Read buffer for `scan_groups`.
-    fn group_cap(&self) -> usize {
-        (self.mem_budget / 8).clamp(1024, 64 * 1024)
-    }
-
-    /// Record bytes one in-memory sort buffer may hold.
-    fn record_cap(&self) -> usize {
-        let budget = self.mem_budget.saturating_sub(2 * self.io_cap());
-        (budget.min(MAX_RECORD_BUFFER) / self.rec_size).max(1) * self.rec_size
-    }
-
-    /// Record bytes read per chunk while routing.
-    fn route_cap(&self) -> usize {
-        let cap = (self.mem_budget / 2).min(MAX_RECORD_BUFFER);
-        (cap / self.rec_size).max(1) * self.rec_size
-    }
-
-    /// Write buffer of one bucket file while routing.
-    fn bucket_cap(&self) -> usize {
-        self.mem_budget / (2 * BUCKETS)
-    }
-
-    /// Read buffer of one run during a merge.
-    fn merge_cap(&self) -> usize {
-        (self.mem_budget / (2 * MAX_FANIN)).clamp(1024, 32 * 1024)
-    }
-
-    /// Runs one merge pass may hold open: as many as half the budget feeds.
-    fn fan_in(&self) -> usize {
-        let per_run = self.rec_size + self.merge_cap();
-        (self.mem_budget / 2 / per_run.max(1)).clamp(2, MAX_FANIN)
-    }
-
-    /// Sort one bucket into `out`: in memory when it fits, otherwise as budget-sized
-    /// runs merged with a bounded fan-in. Returns the bucket's record count.
-    fn sort_bucket<W, K>(
-        &self,
-        bucket: &Path,
-        out: &mut W,
-        key: &K,
-        temps: &mut Temps,
-    ) -> io::Result<u64>
-    where
-        W: Write,
-        K: Fn(&[u8]) -> u64,
-    {
-        let rec = self.rec_size;
-        let len = fs::metadata(bucket)?.len();
-        let records = len / rec as u64;
-        let cap = self.record_cap();
-
-        if len <= cap as u64 {
-            let _held = Gauge::hold(len as usize + self.io_cap());
-            let mut buf = Vec::with_capacity(len as usize);
-            File::open(bucket)?.read_to_end(&mut buf)?;
-            emit_sorted(&buf, rec, key, out)?;
-            return Ok(records);
-        }
-
-        let mut runs: Vec<PathBuf> = Vec::new();
-        {
-            let mut reader = BufReader::with_capacity(self.io_cap(), File::open(bucket)?);
-            let mut buf = vec![0u8; cap];
-            let mut done = 0u64;
-            while done < records {
-                let want = (((records - done) as usize) * rec).min(cap);
-                let read = fill(&mut reader, &mut buf[..want])?;
-                if read == 0 {
-                    break;
-                }
-                let read = read - read % rec;
-                let run = scratch(bucket, &format!(".r{}", runs.len()));
-                {
-                    let mut writer = BufWriter::with_capacity(self.io_cap(), File::create(&run)?);
-                    {
-                        let _held = Gauge::hold(read + 2 * self.io_cap());
-                        emit_sorted(&buf[..read], rec, key, &mut writer)?;
-                    }
-                    writer.flush()?;
-                }
-                temps.add(run.clone());
-                runs.push(run);
-                done += (read / rec) as u64;
-            }
-        }
-
-        let fan_in = self.fan_in();
-        let mut pass = 0usize;
-        while runs.len() > fan_in {
-            let mut next = Vec::with_capacity(runs.len() / fan_in + 1);
-            for (group, group_runs) in runs.chunks(fan_in).enumerate() {
-                let merged = scratch(bucket, &format!(".m{pass}.{group}"));
-                {
-                    let mut writer = BufWriter::with_capacity(self.io_cap(), File::create(&merged)?);
-                    self.merge_runs(group_runs, &mut writer, key)?;
-                    writer.flush()?;
-                }
-                temps.add(merged.clone());
-                next.push(merged);
-            }
-            for stale in &runs {
-                let _ = fs::remove_file(stale);
-            }
-            runs = next;
-            pass += 1;
-        }
-        self.merge_runs(&runs, out, key)?;
-        Ok(records)
-    }
-
-    /// Merge sorted runs into `out`, holding one record per run plus bounded buffers.
-    fn merge_runs<W, K>(&self, runs: &[PathBuf], out: &mut W, key: &K) -> io::Result<()>
-    where
-        W: Write,
-        K: Fn(&[u8]) -> u64,
-    {
-        if runs.is_empty() {
-            return Ok(());
-        }
-        let rec = self.rec_size;
-        let cap = self.merge_cap();
-        let _held = Gauge::hold(runs.len() * (rec + cap) + self.io_cap());
-
-        let mut readers: Vec<BufReader<File>> = Vec::with_capacity(runs.len());
-        for path in runs {
-            readers.push(BufReader::with_capacity(cap, File::open(path)?));
-        }
-
-        let mut heads: Vec<Vec<u8>> = Vec::with_capacity(runs.len());
-        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::with_capacity(runs.len());
-        for (index, reader) in readers.iter_mut().enumerate() {
-            let mut head = vec![0u8; rec];
-            if fill_record(reader, &mut head)? {
-                heap.push(Reverse((key(&head), index)));
-            } else {
-                head.clear();
-            }
-            heads.push(head);
-        }
-
-        while let Some(Reverse((_, index))) = heap.pop() {
-            let mut head = std::mem::take(&mut heads[index]);
-            out.write_all(&head)?;
-            head.clear();
-            head.resize(rec, 0);
-            if fill_record(&mut readers[index], &mut head)? {
-                heap.push(Reverse((key(&head), index)));
-            }
-            heads[index] = head;
-        }
-        Ok(())
-    }
+    fn group_cap(&self) -> usize { (self.mem_budget - 2 * self.rec_size).min(64 * 1024) }
 }
 
-/// Scratch files removed when dropped, so buckets never outlive the sort.
-#[derive(Default)]
-struct Temps {
-    paths: Vec<PathBuf>,
-}
-
-impl Temps {
-    fn add(&mut self, path: PathBuf) {
-        self.paths.push(path);
+struct Scratch(PathBuf);
+impl Scratch {
+    fn new(out: &Path) -> io::Result<Self> {
+        let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        loop {
+            let path = parent.join(format!(".ss-sort-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
+impl Scratch {
+    fn finish<T>(self, result: io::Result<T>) -> io::Result<T> {
+        self.finish_with(result, |path| fs::remove_dir_all(path))
+    }
 
-impl Drop for Temps {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = fs::remove_file(path);
+    fn finish_with<T>(self, result: io::Result<T>, cleanup: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<T> {
+        match (result, cleanup(&self.0)) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(cleanup)) => Err(io::Error::new(cleanup.kind(), format!(
+                "ss-support: output published but scratch cleanup failed at {}: {cleanup}", self.0.display()
+            ))),
+            (Err(original), Err(cleanup)) => {
+                let kind = original.kind();
+                Err(io::Error::new(kind, SortCleanupError { original, cleanup, path: self.0.clone() }))
+            }
         }
     }
 }
 
+#[derive(Debug)]
+struct SortCleanupError { original: io::Error, cleanup: io::Error, path: PathBuf }
+impl std::fmt::Display for SortCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; additionally scratch cleanup failed at {}: {}", self.original, self.path.display(), self.cleanup)
+    }
+}
+impl std::error::Error for SortCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.original) }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+}
+fn require_eof<R: Read>(reader: &mut R) -> io::Result<()> {
+    let mut byte = [0];
+    if fill(reader, &mut byte)? != 0 { return Err(invalid("ss-support: input length changed")); }
+    Ok(())
+}
 /// Accounts record bytes held by a sorter for the lifetime of a buffer.
 struct Gauge {
     bytes: usize,
@@ -433,31 +302,36 @@ fn fill_record<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     }
 }
 
-/// Path of the scratch file named after `base` with `suffix` appended.
-fn scratch(base: &Path, suffix: &str) -> PathBuf {
-    let mut name = base.as_os_str().to_os_string();
-    name.push(suffix);
-    PathBuf::from(name)
-}
+fn invalid_input(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, message) }
+fn invalid(message: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message.into()) }
 
-/// Path of the file named after `out` with `suffix` appended, in `out`'s directory.
-fn sibling(out: &Path, suffix: &str) -> PathBuf {
-    let dir = match out.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => PathBuf::new(),
-    };
-    let mut name = match out.file_name() {
-        Some(name) => name.to_os_string(),
-        None => OsString::from("out"),
-    };
-    name.push(suffix);
-    dir.join(name)
-}
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
 
-fn invalid_input(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
+    #[test]
+    fn cleanup_failure_reports_path_and_preserves_original_error() {
+        let out = std::env::temp_dir().join("ss-sort-cleanup-test-output");
+        let scratch = Scratch::new(&out).unwrap();
+        let path = scratch.0.clone();
+        let err = scratch.finish_with::<()>(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "original read failure")), |_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected cleanup failure"))
+        }).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains(path.to_str().unwrap()));
+        let detail = err.get_ref().unwrap().downcast_ref::<SortCleanupError>().unwrap();
+        assert_eq!(detail.original.to_string(), "original read failure");
+        assert_eq!(detail.cleanup.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists(), "Drop fallback cleans the test-owned directory");
 
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
+        let scratch = Scratch::new(&out).unwrap();
+        let path = scratch.0.clone();
+        let err = scratch.finish_with(Ok(()), |_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected cleanup failure"))
+        }).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("output published"));
+        assert!(err.to_string().contains(path.to_str().unwrap()));
+        assert!(!path.exists());
+    }
 }

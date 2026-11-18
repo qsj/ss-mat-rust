@@ -337,6 +337,10 @@ impl MainReportGenerator {
 
     /// Generate the full HTML report.
     pub fn generate(&mut self) -> String {
+        self.try_generate().expect("read report result stores")
+    }
+
+    pub fn try_generate(&mut self) -> std::io::Result<String> {
         let mut html = HtmlStringBuilder::new();
 
         // Placeholder for advisor summary (prepended later)
@@ -375,15 +379,15 @@ impl MainReportGenerator {
         ss_support::mem_trace::trace("s08-dup-strings");
 
         // --- Section 9: Bad Collections ---
-        self.section_bad_collections(&mut html);
+        self.section_bad_collections(&mut html)?;
         ss_support::mem_trace::trace("s09-bad-collections");
 
         // --- Section 10: Bad Object Arrays ---
-        self.section_bad_obj_arrays(&mut html);
+        self.section_bad_obj_arrays(&mut html)?;
         ss_support::mem_trace::trace("s10-bad-obj-arrays");
 
         // --- Section 11: Bad Primitive Arrays ---
-        self.section_bad_prim_arrays(&mut html);
+        self.section_bad_prim_arrays(&mut html)?;
         ss_support::mem_trace::trace("s11-bad-prim-arrays");
 
         // --- Section 12: Boxed Numbers ---
@@ -488,7 +492,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         doc.push_str(&body);
         doc.push_str("\n<footer class=\"report-footer\">SS-Mat Heap Dump Analyzer (Rust)</footer>\n</div>\n</body>\n</html>");
 
-        doc
+        Ok(doc)
     }
 
     // ---- Section implementations ----
@@ -1273,7 +1277,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         );
     }
 
-    fn section_bad_collections(&mut self, html: &mut HtmlStringBuilder) {
+    fn section_bad_collections(&mut self, html: &mut HtmlStringBuilder) -> std::io::Result<()> {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
 
         // Java's Bad Collections overhead = wasted capacity of BAD collections
@@ -1291,7 +1295,9 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let mut total_bad_count: u64 = 0;
         {
             let records = self.stats.bad_collection_records.lock().unwrap();
-            for r in records.iter() {
+            let store=self.stats.bad_collection_store.lock().unwrap();
+            for r in store.as_ref().into_iter().flat_map(|s|s.iter()).chain(records.iter().filter(|_|store.is_none()).cloned().map(Ok)) {
+                let r=r?;
                 if r.kind == ss_stats::problem_types::COLLECTION_KIND_NONE {
                     continue;
                 }
@@ -1435,9 +1441,10 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_table_row(&["No collection instances found", ""]);
             html.end_table();
         }
+        Ok(())
     }
 
-    fn section_bad_obj_arrays(&mut self, html: &mut HtmlStringBuilder) {
+    fn section_bad_obj_arrays(&mut self, html: &mut HtmlStringBuilder) -> std::io::Result<()> {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
 
         // Java only counts bad object arrays reached during the LIVE reachability
@@ -1452,8 +1459,10 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
         let mut sample_ids: Vec<u64> = Vec::with_capacity(15);
         {
             let records = self.stats.bad_array_records.lock().unwrap();
+            let store = self.stats.bad_array_store.lock().unwrap();
             let container_backing = self.stats.container_backing_ids.lock().unwrap();
-            for r in records.iter() {
+            for r in store.as_ref().into_iter().flat_map(|s| s.iter()).chain(records.iter().filter(|_| store.is_none()).cloned().map(Ok)) {
+                let r = r?;
                 if container_backing.contains(&r.obj_id) {
                     continue;
                 }
@@ -1577,20 +1586,23 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_table_row(&["No bad object arrays found.", ""]);
             html.end_table();
         }
+        Ok(())
     }
 
-    fn section_bad_prim_arrays(&mut self, html: &mut HtmlStringBuilder) {
+    fn section_bad_prim_arrays(&mut self, html: &mut HtmlStringBuilder) -> std::io::Result<()> {
         let total_bytes = self.stats.total_shallow_size.load(Relaxed).max(1);
         // Aggregates over the per-array records, taken under the lock: there is one
         // record per bad primitive array, hundreds of millions of bytes on a large
         // dump, and a clone would keep a second copy alive for the sake of a few sums.
         let (total_bad, total_bad_bytes, categories, groups, sample_ids) = {
             let records = self.stats.bad_prim_array_records.lock().unwrap();
+            let store = self.stats.bad_prim_array_store.lock().unwrap();
             let mut kind_tally = [(0u64, 0i64); 6];
             let mut by_class: std::collections::HashMap<(u32, u8), (u64, i64)> =
                 std::collections::HashMap::new();
             let mut total_bad_bytes: i64 = 0;
-            for r in records.iter() {
+            for r in store.as_ref().into_iter().flat_map(|s| s.iter()).chain(records.iter().filter(|_| store.is_none()).cloned().map(Ok)) {
+                let r = r?;
                 total_bad_bytes += r.waste;
                 let kind = r.kind as usize;
                 if kind < kind_tally.len() {
@@ -1618,7 +1630,8 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             // waste, keeping record order among equal sizes, which is what the
             // full sort used to give.
             let mut best: Vec<(i64, u64)> = Vec::with_capacity(11);
-            for r in records.iter() {
+            for r in store.as_ref().into_iter().flat_map(|s| s.iter()).chain(records.iter().filter(|_| store.is_none()).cloned().map(Ok)) {
+                let r = r?;
                 if best.len() == 10 && r.waste <= best[9].0 {
                     continue;
                 }
@@ -1633,7 +1646,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             }
             let sample_ids: Vec<u64> = best.iter().map(|&(_, id)| id).collect();
             (
-                records.len() as u64,
+                store.as_ref().map_or(records.len() as u64, |s| s.len()),
                 total_bad_bytes,
                 categories,
                 groups,
@@ -1735,6 +1748,7 @@ function rplEl(el){var rt='',si=0,t=el.innerHTML,pi=t.indexOf(ESP);while(pi!=-1)
             html.append_table_row(&["No bad primitive arrays found.", ""]);
             html.end_table();
         }
+        Ok(())
     }
 
     fn section_boxed_numbers(&mut self, html: &mut HtmlStringBuilder) {
@@ -3392,5 +3406,40 @@ impl Drop for DepthMemo {
         if let Self::File { path, .. } = self {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+#[cfg(test)]
+mod result_store_tests {
+    use super::*;
+    #[test]
+    fn report_propagates_truncated_store_and_empty_store_overrides_legacy() {
+        use ss_stats::problem_types::{BadArrayRecord, RecordStore};
+        let heap=Arc::new(HeapDump { classes:Vec::new(),class_by_name:Default::default(),roots:Vec::new(),
+            total_object_count:0,string_table:Default::default(),identifier_size:8,oop_size:4,alignment:8,
+            header_size:12,per_class_inst_count:Vec::new(),per_class_inst_bytes:Vec::new(),stack_traces:Default::default(),
+            thread_serial_map:Default::default(),thread_info:Vec::new(),timestamp_millis:0,obj_dir:None });
+        let stats=Arc::new(StatsEngine::new(&[]));
+        stats.bad_array_records.lock().unwrap().push(BadArrayRecord {obj_id:7,class_idx:0,kind:0,size:16});
+        *stats.bad_array_store.lock().unwrap()=Some(RecordStore::new().unwrap());
+        let mut reporter=MainReportGenerator::new(heap,Arc::clone(&stats),"test".into());
+        let mut html=HtmlStringBuilder::new();
+        reporter.section_bad_obj_arrays(&mut html).unwrap();
+        let mut store=RecordStore::new().unwrap();
+        store.push(BadArrayRecord {obj_id:7,class_idx:0,kind:0,size:16}).unwrap();
+        // Locate this process-owned unlinked store descriptor, then truncate it
+        // through procfs to exercise the real read error, not a mocked callback.
+        let mut truncated=false;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let path=entry.unwrap().path();
+            let Ok(target)=std::fs::read_link(&path) else {continue};
+            if target.to_string_lossy().contains("ss-mat-results-") {
+                if let Ok(file)=std::fs::OpenOptions::new().write(true).open(path) {
+                    if file.metadata().unwrap().len()==24 {file.set_len(1).unwrap();truncated=true;}
+                }
+            }
+        }
+        assert!(truncated);
+        *stats.bad_array_store.lock().unwrap()=Some(store);
+        assert!(reporter.try_generate().is_err());
     }
 }

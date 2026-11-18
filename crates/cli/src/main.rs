@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     let obj_cfg = ss_hprof_parser::objdir_build::ObjDirConfig {
         temp_dir: workspace.path().to_path_buf(),
         cache_bytes: (flags.cache_mb.max(1) as usize) << 20,
-        disk_budget_bytes: flags.disk_budget_gb.max(1) << 30,
+        disk_budget_bytes: flags.disk_budget_gb.saturating_mul(1 << 30),
     };
 
     let heap = ss_hprof_parser::hprof_wrapper::parse_hprof_with_config(heap_dump_path, &obj_cfg)
@@ -213,7 +213,7 @@ fn main() -> Result<()> {
                 s.string_backing_members,
                 debug_dir.display()
             ),
-            Err(e) => eprintln!("Debug: failed to write S14 dump: {}", e),
+            Err(e) => return Err(e).context("write requested S14 debug dump"),
         }
         match ss_stats::debug_dump::write_problem_bundle(&debug_dir, stats_arc.as_ref(), heap_arc.as_ref()) {
             Ok(s) => eprintln!(
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
                 s.prim_array_overhead,
                 debug_dir.display()
             ),
-            Err(e) => eprintln!("Debug: failed to write problem dump: {}", e),
+            Err(e) => return Err(e).context("write requested problem debug dump"),
         }
     }
 
@@ -247,9 +247,9 @@ fn main() -> Result<()> {
         heap_dump_path.file_name().and_then(|n| n.to_str()).unwrap_or("heap_dump").to_string(),
     )
     .with_hprof_path(heap_dump_path);
-    let html = reporter.generate();
+    let html = reporter.try_generate().context("generate report from result stores")?;
 
-    std::fs::write(&report_path, &html)
+    publish_report(&report_path, html.as_bytes())
         .with_context(|| format!("Failed to write report to {}", report_path.display()))?;
 
     eprintln!("Report written to: {}", report_path.display());
@@ -611,5 +611,38 @@ fn parse_memory_flag(s: &str) -> i64 {
     match num_part.parse::<i64>() {
         Ok(v) => v * multiplier,
         Err(_) => -1,
+    }
+}
+
+fn publish_report(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let (temporary, mut file) = loop {
+        let temporary = parent.join(format!(".ss-mat-report-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| { file.write_all(bytes)?; file.sync_all()?; std::fs::rename(&temporary, path) })();
+    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    result
+}
+
+#[cfg(test)]
+mod publication_tests {
+    #[test]
+    fn failed_publication_does_not_replace_destination() {
+        let base=std::env::temp_dir().join(format!("ss-mat-publication-test-{}",std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let target=base.join("destination");std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"),b"original").unwrap();
+        assert!(super::publish_report(&target,b"new").is_err());
+        assert_eq!(std::fs::read(target.join("sentinel")).unwrap(),b"original");
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(),1);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
