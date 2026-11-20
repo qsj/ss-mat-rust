@@ -249,7 +249,18 @@ fn main() -> Result<()> {
     .with_hprof_path(heap_dump_path);
     let html = reporter.try_generate().context("generate report from result stores")?;
 
-    publish_report(&report_path, html.as_bytes())
+    // The HTML is the canonical artefact; the JSON form is derived from the very
+    // same bytes so the two can never disagree.
+    let payload = match flags.format.as_str() {
+        "html" => html.into_bytes(),
+        "json" => ss_report::json_report::render(&html).into_bytes(),
+        other => anyhow::bail!(
+            "unsupported --format {:?}; expected html or json",
+            other
+        ),
+    };
+
+    publish_report(&report_path, &payload)
         .with_context(|| format!("Failed to write report to {}", report_path.display()))?;
 
     eprintln!("Report written to: {}", report_path.display());

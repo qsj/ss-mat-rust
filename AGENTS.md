@@ -16,6 +16,30 @@ cargo run --release -- <heap_dump.hprof> [report.html]
 
 取证开关（默认关闭）：`SS_MAT_DEBUG_DIR=<dir>` 输出 roots/objects/S14/S15 TSV，以及 Java 同 schema 的 `problem_stats.tsv` / `s8_summary.tsv` / `s8_groups.tsv` / `boxed_summary.tsv`（S8–S12 聚合）、`s15_dup_obj_arrays.tsv`（S15 汇总/阈值/候选类/class/group 明细）、`bad_collections.tsv`（S9 逐实例），用于和 Java 逐对象/逐类 diff。
 
+## --format json：给 agent 读的结构化导出
+
+`ss-mat --format json <dump> <out.json>` 会把与 HTML **完全相同** 的分析结果导出为 JSON：
+HTML 仍是权威产物，JSON 由同一份渲染结果解析而来，所以两者不可能不一致（默认 `--format html`，行为与以前完全相同）。
+
+```json
+{
+  "generator": "ss-mat",
+  "title": "SS-Mat report for task_dump.hprof",
+  "kpi": [{"label": "Garbage", "value": "80,087 KB", "note": "44.9%"}],
+  "advisor": {"title": "MOST IMPORTANT ISSUES", "tables": [{"id": null, "headers": [], "rows": [["Problem: ... found"]]}]},
+  "sections": [
+    {"title": "Where Memory Goes, by Class",
+     "tables": [{"id": "Table-0",
+                "headers": ["# instances", "Shallow size", "Impl-incl. size", "Live shallow", "Class name"],
+                "rows": [["339,861", "86,401KB (48.5%)", "86,401KB (48.5%)", "30,339KB (17.0%)", "byte[]"]]}]}
+  ]
+}
+```
+
+约定：`sections` 按文档顺序排列；表格只保留数据行（跨列的证据行被折叠，不会污染数据集）；
+数值单元格保留 `86,401KB (48.5%)` 原样，便于核对人眼所见；类名等编码字符串已解码。
+实测体积：task_dump 1.5 MB（HTML 3.5 MB）、appauditd 1.9 MB（HTML 4.1 MB）。
+
 ## 架构
 
 **管线**: HPROF 文件 → 单次解析构建索引 → 重新解析提取字段 → 并行线性扫描 + BFS 遍历 → 问题检测统计 → HTML 报告

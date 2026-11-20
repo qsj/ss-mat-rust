@@ -230,7 +230,7 @@ details.adv.tone-good .adv-k{text-transform:none;letter-spacing:0;font-size:12.5
   .navgrp{display:flex;flex-wrap:nowrap;align-items:center;gap:0 4px;min-width:0;overflow:hidden;
     border-left:0;padding-left:0}
   .navgrp+.navgrp{border-top:1px solid #f1f5f9}
-  .navgrp-t{flex:0 0 112px;text-align:left;font-size:9.5px;letter-spacing:.035em;padding-right:6px;
+  .navgrp-t{flex:0 0 128px;text-align:left;font-size:9.5px;letter-spacing:0;padding-right:6px;
     margin-right:2px;border-right:1px solid var(--border);white-space:nowrap;overflow:hidden;
     text-overflow:ellipsis}
   .navlink{flex:0 1 auto;min-width:0;max-width:200px;font-size:10.5px;line-height:1.15;padding:0 3px;white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word}

@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 8)]
     pub cache_mb: u64,
 
+    /// Output format: html (default) or json for machine-readable analysis
+    #[arg(long, default_value = "html")]
+    pub format: String,
+
     /// Temporary-disk budget in GB (default: 0 = auto from object count and free space)
     #[arg(long, default_value_t = 0)]
     pub disk_budget_gb: u64,
@@ -60,6 +64,8 @@ pub struct Flags {
     pub min_unused_hi_bits_percent: f64,
     pub max_scan_threads: i32,
     pub jvm_flags_content: Option<String>,
+    /// Output format: html keeps the rendered report, json exports the same data.
+    pub format: String,
 }
 
 impl Flags {
@@ -79,6 +85,7 @@ impl Flags {
             min_unused_hi_bits_percent: cli.min_unused_hi_bits_percent,
             max_scan_threads: cli.xdebug_max_obj_graph_scan_threads,
             jvm_flags_content,
+            format: cli.format.clone(),
         }
     }
 
